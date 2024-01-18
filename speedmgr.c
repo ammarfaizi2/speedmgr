@@ -4,10 +4,12 @@
 #define _GNU_SOURCE
 #endif
 
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
+#include <assert.h>
 #include <stdio.h>
 #include <errno.h>
 
@@ -46,6 +48,7 @@ struct sockaddr_in46 {
 struct client_state {
 	int			client_fd;
 	int			target_fd;
+	uint32_t		idx;
 	struct sockaddr_in46	client_addr;
 };
 
@@ -67,6 +70,7 @@ struct server_wrk {
 	int			timeout;
 	uint32_t		idx;
 	uint32_t		nr_clients;
+	_Atomic(uint32_t)	nr_active_clients;
 	pthread_t		thread;
 	struct server_ctx	*ctx;
 	struct client_state	*clients;
@@ -673,11 +677,54 @@ static int init_clients(struct server_wrk *w)
 		return -ENOMEM;
 	}
 
-	for (i = 0; i < w->nr_clients; i++)
+	for (i = 0; i < w->nr_clients; i++) {
 		init_client_state(&clients[i]);
+		clients[i].idx = i;
+	}
 
 	w->clients = clients;
 	return 0;
+}
+
+static struct client_state *get_free_client_slot(struct server_wrk *w)
+{
+	struct client_state *c;
+	uint32_t idx;
+	int ret;
+
+	ret = pop_client_stack(w->cl_stack, &idx);
+	if (ret)
+		return NULL;
+
+	c = &w->clients[idx];
+	assert(c->client_fd == -1);
+	assert(c->target_fd == -1);
+	assert(c->idx == idx);
+	return c;
+}
+
+static void put_client_slot(struct server_wrk *w, struct client_state *c)
+{
+	int ret;
+
+	if (c->client_fd >= 0) {
+		ret = epoll_del(w, c->client_fd);
+		assert(!ret);
+		close(c->client_fd);
+		c->client_fd = -1;
+	}
+
+	if (c->target_fd >= 0) {
+		ret = epoll_del(w, c->target_fd);
+		assert(!ret);
+		close(c->target_fd);
+		c->target_fd = -1;
+	}
+
+	memset(&c->client_addr, 0, sizeof(c->client_addr));
+	ret = push_client_stack(w->cl_stack, c->idx);
+	assert(!ret);
+	(void)ret;
 }
 
 static void close_all_client_fds(struct server_wrk *w)
@@ -842,17 +889,93 @@ static int handle_accept_error(int err, struct server_wrk *w)
 	return -err;
 }
 
+static struct server_wrk *pick_worker_for_new_conn(struct server_ctx *ctx)
+{
+	uint32_t i, min = UINT32_MAX;
+	struct server_wrk *w = NULL;
+
+	for (i = 0; i < ctx->cfg.nr_workers; i++) {
+		uint32_t nr_clients = atomic_load(&ctx->workers[i].nr_active_clients);
+
+		if (nr_clients < min) {
+			min = nr_clients;
+			w = &ctx->workers[i];
+		}
+	}
+
+	return w;
+}
+
+static int install_client_fd(struct server_wrk *w, struct client_state *c)
+{
+	union epoll_data data;
+	int ret;
+
+	data.u64 = EPOLL_EV_FD_DATA;
+	ret = epoll_add(w, c->client_fd, EPOLLIN, data);
+	if (ret)
+		return ret;
+
+	return 0;
+}
+
+static int give_client_fd_to_a_worker(struct server_ctx *ctx, int fd,
+				      struct sockaddr_in46 *addr)
+{
+	struct client_state *c;
+	struct server_wrk *w;
+	int ret;
+
+	w = pick_worker_for_new_conn(ctx);
+	c = get_free_client_slot(w);
+	if (!c) {
+		pr_error("No free client slots, closing connection... (thread %u)", w->idx);
+		return 0;
+	}
+
+	c->client_fd = fd;
+	c->client_addr = *addr;
+	ret = install_client_fd(w, c);
+	if (ret) {
+		put_client_slot(w, c);
+		return ret;
+	}
+
+	atomic_fetch_add(&w->nr_active_clients, 1u);
+	return 0;
+}
+
 static int handle_accept_event(struct server_wrk *w)
 {
 	struct server_ctx *ctx = w->ctx;
 	struct sockaddr_in46 addr;
 	socklen_t len;
-	int ret;
+	int ret, fd;
 
-	len = sizeof(addr);
+	memset(&addr, 0, sizeof(addr));
+	if (ctx->cfg.bind_addr.sa.sa_family == AF_INET6)
+		len = sizeof(addr.in6);
+	else
+		len = sizeof(addr.in4);
+
 	ret = accept(ctx->tcp_fd, &addr.sa, &len);
-	if (ret < 0)
+	if (unlikely(ret < 0))
 		return handle_accept_error(errno, w);
+
+	if (unlikely(len > sizeof(addr))) {
+		pr_error("accept() returned invalid address length: %u", len);
+		close(ret);
+		return -EINVAL;
+	}
+
+	pr_debug("New connection from %s", sockaddr_to_str(&addr));
+
+	fd = ret;
+	ret = give_client_fd_to_a_worker(ctx, fd, &addr);
+	if (ret) {
+		close(fd);
+		return ret;
+	}
 
 	return 0;
 }
