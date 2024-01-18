@@ -630,7 +630,7 @@ static int init_client_stack(struct server_wrk *w)
 
 	cl_stack->sp = 0;
 	cl_stack->bp = NR_CLIENTS;
-	for (i = 100; i > 0; i--)
+	for (i = NR_CLIENTS; i > 0; i--)
 		__push_client_stack(cl_stack, i - 1);
 
 	w->cl_stack = cl_stack;
