@@ -1,0 +1,10 @@
+/.vscode/
+*.o
+*.so
+*.swo
+*.swp
+*.log
+*.tmp
+*.patch
+*.diff
+/speedmgr
