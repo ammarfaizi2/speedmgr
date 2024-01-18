@@ -21,6 +21,7 @@
 #include <signal.h>
 #include <getopt.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 #if 1
 #define pr_debug(fmt, ...) printf("debug: " fmt "\n", ##__VA_ARGS__)
@@ -30,6 +31,9 @@
 
 #define pr_error(fmt, ...) printf("error: " fmt "\n", ##__VA_ARGS__)
 #define pr_info(fmt, ...) printf("info: " fmt "\n", ##__VA_ARGS__)
+
+#define NR_EPOLL_EVENTS		64
+#define NR_CLIENTS		2048
 
 struct sockaddr_in46 {
 	union {
@@ -45,6 +49,13 @@ struct client_state {
 	struct sockaddr_in46	client_addr;
 };
 
+struct client_stack {
+	pthread_mutex_t	lock;
+	uint32_t	sp;
+	uint32_t	bp;
+	uint32_t	data[];
+};
+
 struct server_ctx;
 
 /*
@@ -53,9 +64,14 @@ struct server_ctx;
 struct server_wrk {
 	int			ep_fd;
 	int			ev_fd;
+	int			timeout;
 	uint32_t		idx;
+	uint32_t		nr_clients;
 	pthread_t		thread;
 	struct server_ctx	*ctx;
+	struct client_state	*clients;
+	struct client_stack	*cl_stack;
+	struct epoll_event	events[NR_EPOLL_EVENTS];
 };
 
 struct server_cfg {
@@ -68,6 +84,7 @@ struct server_cfg {
 
 struct server_ctx {
 	volatile bool		should_stop;
+	bool			accept_stopped;
 	int			tcp_fd;
 	struct server_wrk	*workers;
 	struct server_cfg	cfg;
@@ -314,13 +331,36 @@ out_err:
 	return ret;
 }
 
+static int set_fd_nonblock(int fd)
+{
+	int flags, ret;
+
+	flags = fcntl(fd, F_GETFL);
+	if (flags < 0) {
+		ret = -errno;
+		pr_error("Failed to get FD flags: %s", strerror(-ret));
+		return ret;
+	}
+
+	flags |= O_NONBLOCK;
+	ret = fcntl(fd, F_SETFL, flags);
+	if (ret) {
+		ret = -errno;
+		pr_error("Failed to set FD flags: %s", strerror(-ret));
+		return ret;
+	}
+
+	return 0;
+}
+
 static int init_socket(struct server_ctx *ctx)
 {
 	int tcp_fd, ret, family;
 	socklen_t len;
 
+	ctx->accept_stopped = false;
 	family = ctx->cfg.bind_addr.sa.sa_family;
-	tcp_fd = socket(family, SOCK_STREAM, 0);
+	tcp_fd = socket(family, SOCK_STREAM | SOCK_STREAM, 0);
 	if (tcp_fd < 0) {
 		pr_error("Failed to create socket: %s", strerror(errno));
 		return -errno;
@@ -431,6 +471,13 @@ static int init_epoll(struct server_wrk *w)
 		return ret;
 	}
 
+	ret = set_fd_nonblock(ev_fd);
+	if (ret) {
+		close(ev_fd);
+		close(ep_fd);
+		return ret;
+	}
+
 	w->ep_fd = ep_fd;
 	w->ev_fd = ev_fd;
 	data.u64 = EPOLL_EV_FD_DATA;
@@ -474,29 +521,45 @@ static int init_worker(struct server_wrk *w, uint32_t idx)
 	return 0;
 }
 
-static void send_event_fd(struct server_wrk *w)
+static int send_event_fd(struct server_wrk *w)
 {
 	uint64_t val = 1;
 	int ret;
 
 	ret = write(w->ev_fd, &val, sizeof(val));
-	if (ret != sizeof(val))
-		pr_error("Failed to write to event FD: %s (thread %u)", strerror(errno), w->idx);
+	if (ret != sizeof(val)) {
+		ret = errno;
+		if (ret == EAGAIN)
+			return 0;
+
+		pr_error("Failed to write to event FD: %s (thread %u)", strerror(ret), w->idx);
+		return -ret;
+	}
+
+	return 0;
 }
 
-static void consume_event_fd(struct server_wrk *w)
+static int consume_event_fd(struct server_wrk *w)
 {
 	uint64_t val;
 	int ret;
 
 	ret = read(w->ev_fd, &val, sizeof(val));
-	if (ret != sizeof(val))
-		pr_error("Failed to read from event FD: %s (thread %u)", strerror(errno), w->idx);
+	if (ret != sizeof(val)) {
+		ret = errno;
+		if (ret == EAGAIN)
+			return 0;
+
+		pr_error("Failed to read from event FD: %s (thread %u)", strerror(ret), w->idx);
+		return -ret;
+	}
+
+	return 0;
 }
 
 static void free_worker(struct server_wrk *w)
 {
-	if (w->ctx) {
+	if (w->ctx && w->idx != 0) {
 		send_event_fd(w);
 		pr_info("Joining worker thread %u...", w->idx);
 		pthread_join(w->thread, NULL);
@@ -507,6 +570,145 @@ static void free_worker(struct server_wrk *w)
 }
 
 static void *worker_func(void *data);
+
+static int __push_client_stack(struct client_stack *cs, uint32_t data)
+{
+	if (cs->sp == cs->bp)
+		return -EAGAIN;
+
+	cs->data[cs->sp++] = data;
+	return 0;
+}
+
+static int push_client_stack(struct client_stack *cs, uint32_t data)
+{
+	int ret;
+
+	pthread_mutex_lock(&cs->lock);
+	ret = __push_client_stack(cs, data);
+	pthread_mutex_unlock(&cs->lock);
+	return ret;
+}
+
+static int __pop_client_stack(struct client_stack *cs, uint32_t *data)
+{
+	if (cs->sp == 0)
+		return -EAGAIN;
+
+	*data = cs->data[--cs->sp];
+	return 0;
+}
+
+static int pop_client_stack(struct client_stack *cs, uint32_t *data)
+{
+	int ret;
+
+	pthread_mutex_lock(&cs->lock);
+	ret = __pop_client_stack(cs, data);
+	pthread_mutex_unlock(&cs->lock);
+	return ret;
+}
+
+static int init_client_stack(struct server_wrk *w)
+{
+	struct client_stack *cl_stack;
+	size_t size;
+	uint32_t i;
+	int ret;
+
+	size = sizeof(*cl_stack) + (sizeof(*cl_stack->data) * NR_CLIENTS);
+	cl_stack = malloc(size);
+	if (!cl_stack)
+		return -ENOMEM;
+
+	ret = pthread_mutex_init(&cl_stack->lock, NULL);
+	if (ret) {
+		pr_error("Failed to initialize client stack mutex: %s", strerror(ret));
+		free(cl_stack);
+		return -ret;
+	}
+
+	cl_stack->sp = NR_CLIENTS;
+	cl_stack->bp = NR_CLIENTS;
+	for (i = NR_CLIENTS; i > 0; i--)
+		__push_client_stack(cl_stack, i - 1);
+
+	w->cl_stack = cl_stack;
+	return 0;
+}
+
+static void free_client_stack(struct server_wrk *w)
+{
+	if (!w->cl_stack)
+		return;
+
+	pthread_mutex_lock(&w->cl_stack->lock);
+	pthread_mutex_unlock(&w->cl_stack->lock);
+	pthread_mutex_destroy(&w->cl_stack->lock);
+	free(w->cl_stack);
+	w->cl_stack = NULL;
+}
+
+static void init_client_state(struct client_state *c)
+{
+	c->client_fd = -1;
+	c->target_fd = -1;
+	memset(&c->client_addr, 0, sizeof(c->client_addr));
+}
+
+static int init_clients(struct server_wrk *w)
+{
+	struct client_state *clients;
+	uint32_t i;
+	int ret;
+
+	ret = init_client_stack(w);
+	if (ret)
+		return ret;
+
+	w->nr_clients = NR_CLIENTS;
+	clients = calloc(w->nr_clients, sizeof(*clients));
+	if (!clients) {
+		free_client_stack(w);
+		return -ENOMEM;
+	}
+
+	for (i = 0; i < w->nr_clients; i++)
+		init_client_state(&clients[i]);
+
+	w->clients = clients;
+	return 0;
+}
+
+static void close_all_client_fds(struct server_wrk *w)
+{
+	uint32_t i;
+
+	for (i = 0; i < w->nr_clients; i++) {
+		struct client_state *c = &w->clients[i];
+
+		if (c->client_fd >= 0) {
+			close(c->client_fd);
+			c->client_fd = -1;
+		}
+
+		if (c->target_fd >= 0) {
+			close(c->target_fd);
+			c->target_fd = -1;
+		}
+	}
+}
+
+void free_clients(struct server_wrk *w)
+{
+	if (!w->clients)
+		return;
+
+	close_all_client_fds(w);
+	free(w->clients);
+	w->clients = NULL;
+	free_client_stack(w);
+}
 
 static int init_workers(struct server_ctx *ctx)
 {
@@ -520,10 +722,16 @@ static int init_workers(struct server_ctx *ctx)
 	for (i = 0; i < ctx->cfg.nr_workers; i++) {
 		struct server_wrk *w = &ctx->workers[i];
 
+		w->clients = NULL;
+		ret = init_clients(w);
+		if (ret < 0)
+			goto out_err;
+
 		w->idx = i;
 		w->ctx = ctx;
 		w->ep_fd = -1;
 		w->ev_fd = -1;
+		w->timeout = 5000;
 		ret = init_worker(w, i);
 		if (ret) {
 			w->ctx = NULL;
@@ -602,16 +810,95 @@ static void free_ctx(struct server_ctx *ctx)
 	free_socket(ctx);
 }
 
+static int poll_events(struct server_wrk *w)
+{
+	int ret;
+
+	ret = epoll_wait(w->ep_fd, w->events, NR_EPOLL_EVENTS, w->timeout);
+	if (unlikely(ret < 0)) {
+		ret = errno;
+		if (ret == EINTR)
+			return 0;
+
+		pr_error("epoll_wait() failed: %s", strerror(ret));
+		return -ret;
+	}
+
+	return ret;
+}
+
+static int handle_accept_error(int err, struct server_wrk *w)
+{
+	if (err == EAGAIN)
+		return 0;
+
+	if (err == EMFILE || err == ENFILE) {
+		pr_error("accept(): (%d) Too many open files, stop accepting...", err);
+		w->ctx->accept_stopped = true;
+		return epoll_del(w, w->ctx->tcp_fd);
+	}
+
+	pr_error("accept() failed: %s", strerror(err));
+	return -err;
+}
+
+static int handle_accept_event(struct server_wrk *w)
+{
+	struct server_ctx *ctx = w->ctx;
+	struct sockaddr_in46 addr;
+	socklen_t len;
+	int ret;
+
+	len = sizeof(addr);
+	ret = accept(ctx->tcp_fd, &addr.sa, &len);
+	if (ret < 0)
+		return handle_accept_error(errno, w);
+
+	return 0;
+}
+
+static int handle_event(struct server_wrk *w, struct epoll_event *ev)
+{
+	if (ev->data.u64 == EPOLL_EV_FD_DATA)
+		return consume_event_fd(w);
+
+	if (ev->data.u64 == EPOLL_TCP_FD_DATA)
+		return handle_accept_event(w);
+
+	return 0;
+}
+
+static int handle_events(struct server_wrk *w, int nr_events)
+{
+	int ret, i;
+
+	for (i = 0; i < nr_events; i++) {
+		ret = handle_event(w, &w->events[i]);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
 static void *worker_func(void *data)
 {
 	struct server_wrk *w = data;
 	struct server_ctx *ctx = w->ctx;
+	int ret = 0;
 
 	pr_info("Worker thread %u started", w->idx);
 	while (!ctx->should_stop) {
+		ret = poll_events(w);
+		if (ret < 0)
+			break;
+
+		ret = handle_events(w, ret);
+		if (ret < 0)
+			break;
 	}
 
-	return NULL;
+	return (void *)(long)ret;
 }
 
 static int run_main_worker(struct server_ctx *ctx)
