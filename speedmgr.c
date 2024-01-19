@@ -26,7 +26,10 @@
 #include <unistd.h>
 #include <fcntl.h>
 
-#if 1
+static volatile bool *g_stop;
+static uint8_t g_verbose;
+
+#if 0
 #define pr_debug(fmt, ...) printf("debug %d: " fmt "\n", gettid(), ##__VA_ARGS__)
 #else
 #define pr_debug(fmt, ...) do { } while (0)
@@ -34,6 +37,18 @@
 
 #define pr_error(fmt, ...) printf("error: " fmt "\n", ##__VA_ARGS__)
 #define pr_info(fmt, ...) printf("info: " fmt "\n", ##__VA_ARGS__)
+
+#define pr_errorv(fmt, ...)			\
+do {						\
+	if (g_verbose)				\
+		pr_error(fmt, ##__VA_ARGS__);	\
+} while (0)
+
+#define pr_infov(fmt, ...)			\
+do {						\
+	if (g_verbose)				\
+		pr_info(fmt, ##__VA_ARGS__);	\
+} while (0)
 
 #define NR_EPOLL_EVENTS		64
 #define NR_CLIENTS		2048
@@ -84,7 +99,7 @@ struct server_wrk {
 	struct client_state	*clients;
 	struct client_stack	*cl_stack;
 	struct epoll_event	events[NR_EPOLL_EVENTS];
-	bool			handle_events_should_stop;
+	volatile bool		handle_events_should_stop;
 };
 
 struct server_cfg {
@@ -312,8 +327,6 @@ static const char *sockaddr_to_str(struct sockaddr_in46 *addr)
 
 	return buf;
 }
-
-static volatile bool *g_stop;
 
 static void signal_handler(int sig)
 {
@@ -777,6 +790,8 @@ static void put_client_slot(struct server_wrk *w, struct client_state *c)
 	}
 
 	if (c->client_fd >= 0) {
+		pr_infov("Closing client FD %d (src: %s) (thread %u)", c->client_fd,
+			 sockaddr_to_str(&c->client_addr), w->idx);
 		ret = epoll_del(w, c->client_fd);
 		assert(!ret);
 		close(c->client_fd);
@@ -790,6 +805,18 @@ static void put_client_slot(struct server_wrk *w, struct client_state *c)
 		close(c->target_fd);
 		c->target_fd = -c->target_fd;
 		hess = true;
+	}
+
+	if (hess && w->ctx->accept_stopped) {
+		union epoll_data data;
+
+		pr_info("Re-enabling accept() (thread %u)", w->idx);
+		data.u64 = EPOLL_TCP_FD_DATA;
+		ret = epoll_add(w, w->ctx->tcp_fd, EPOLLIN, data);
+		assert(!ret);
+
+		w->ctx->accept_stopped = false;
+		send_event_fd(&w->ctx->workers[0]);
 	}
 
 	w->handle_events_should_stop = hess;
@@ -888,6 +915,7 @@ static int init_ctx(struct server_ctx *ctx)
 {
 	int ret;
 
+	g_verbose = ctx->cfg.verbose;
 	ret = install_signal_handlers(ctx);
 	if (ret)
 		return ret;
@@ -939,6 +967,7 @@ static int handle_accept_error(int err, struct server_wrk *w)
 
 	if (err == EMFILE || err == ENFILE) {
 		pr_error("accept(): (%d) Too many open files, stop accepting...", err);
+		pr_info("accept() will be re-enabled when a client disconnects (thread %u)", w->idx);
 		w->ctx->accept_stopped = true;
 		return epoll_del(w, w->ctx->tcp_fd);
 	}
@@ -1072,7 +1101,7 @@ static int handle_accept_event(struct server_wrk *w)
 		return -EINVAL;
 	}
 
-	pr_debug("New connection from %s", sockaddr_to_str(&addr));
+	pr_infov("New connection from %s", sockaddr_to_str(&addr));
 
 	fd = ret;
 	ret = give_client_fd_to_a_worker(ctx, fd, &addr);
@@ -1163,7 +1192,7 @@ static ssize_t do_splice(int src_fd, int dst_fd, struct splice_buf *sb)
 			if (ret == EAGAIN)
 				goto do_send;
 
-			pr_error("Failed to read from FD %d: %s", src_fd, strerror(ret));
+			pr_errorv("Failed to read from FD %d: %s", src_fd, strerror(ret));
 			return -ret;
 		}
 
@@ -1183,7 +1212,7 @@ do_send:
 		if (ret == EAGAIN)
 			return 0;
 
-		pr_error("Failed to write to FD %d: %s", dst_fd, strerror(ret));
+		pr_errorv("Failed to write to FD %d: %s", dst_fd, strerror(ret));
 		return -ret;
 	}
 
@@ -1207,7 +1236,7 @@ static int handle_target_event(struct server_wrk *w, struct epoll_event *ev)
 	int err;
 
 	if (unlikely(events & (EPOLLERR | EPOLLHUP))) {
-		pr_error("Target socket error: %s (thread %u)", strerror(errno), w->idx);
+		pr_errorv("Target socket hit (EPOLLERR|EPOLLHUP): %s (thread %u)", strerror(errno), w->idx);
 		put_client_slot(w, c);
 		return 0;
 	}
@@ -1297,7 +1326,7 @@ static int handle_client_event(struct server_wrk *w, struct epoll_event *ev)
 	int err;
 
 	if (unlikely(events & (EPOLLERR | EPOLLHUP))) {
-		pr_error("Client socket error: %s (thread %u)", strerror(errno), w->idx);
+		pr_errorv("Client socket hit (EPOLLERR|EPOLLHUP): %s (thread %u)", strerror(errno), w->idx);
 		put_client_slot(w, c);
 		return 0;
 	}
@@ -1407,7 +1436,6 @@ static int handle_events(struct server_wrk *w, int nr_events)
 	int ret, i;
 
 	for (i = 0; i < nr_events; i++) {
-		pr_debug("Handling event %d/%d (thread %u) bool=%d", i + 1, nr_events, w->idx, w->handle_events_should_stop);
 		if (w->handle_events_should_stop)
 			break;
 
