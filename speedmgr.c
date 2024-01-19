@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <errno.h>
 
+#include <sys/resource.h>
 #include <netinet/tcp.h>
 #include <sys/eventfd.h>
 #include <sys/signal.h>
@@ -917,6 +918,32 @@ static void free_workers(struct server_ctx *ctx)
 	return;
 }
 
+static int try_increase_rlimit_nofile(void)
+{
+	struct rlimit rlim;
+	int ret;
+
+	ret = getrlimit(RLIMIT_NOFILE, &rlim);
+	if (ret) {
+		ret = errno;
+		pr_error("Failed to get RLIMIT_NOFILE: %s", strerror(ret));
+		return -ret;
+	}
+
+	if (rlim.rlim_cur >= rlim.rlim_max)
+		return 0;
+
+	rlim.rlim_cur = rlim.rlim_max;
+	ret = setrlimit(RLIMIT_NOFILE, &rlim);
+	if (ret) {
+		ret = errno;
+		pr_error("Failed to set RLIMIT_NOFILE: %s", strerror(ret));
+		return -ret;
+	}
+
+	return 0;
+}
+
 static int init_ctx(struct server_ctx *ctx)
 {
 	int ret;
@@ -926,6 +953,7 @@ static int init_ctx(struct server_ctx *ctx)
 	if (ret)
 		return ret;
 
+	try_increase_rlimit_nofile();
 	ctx->should_stop = false;
 	ctx->tcp_fd = -1;
 	ret = init_socket(ctx);
