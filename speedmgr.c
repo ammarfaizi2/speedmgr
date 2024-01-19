@@ -500,7 +500,7 @@ static int init_epoll(struct server_wrk *w)
 	int ep_fd, ev_fd, ret;
 	union epoll_data data;
 
-	ep_fd = epoll_create1(0);
+	ep_fd = epoll_create(300);
 	if (ep_fd < 0) {
 		pr_error("Failed to create epoll FD: %s", strerror(errno));
 		return -errno;
