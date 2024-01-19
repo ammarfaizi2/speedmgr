@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <errno.h>
 
+#include <netinet/tcp.h>
 #include <sys/eventfd.h>
 #include <sys/signal.h>
 #include <sys/socket.h>
@@ -36,6 +37,7 @@
 
 #define NR_EPOLL_EVENTS		64
 #define NR_CLIENTS		2048
+#define SPLICE_BUF_SIZE		8192
 
 struct sockaddr_in46 {
 	union {
@@ -48,7 +50,13 @@ struct sockaddr_in46 {
 struct client_state {
 	int			client_fd;
 	int			target_fd;
+	uint32_t		cpoll_mask;
+	uint32_t		tpoll_mask;
 	uint32_t		idx;
+	size_t			cbuf_len;
+	size_t			tbuf_len;
+	char			*cbuf;
+	char			*tbuf;
 	struct sockaddr_in46	client_addr;
 };
 
@@ -76,6 +84,7 @@ struct server_wrk {
 	struct client_state	*clients;
 	struct client_stack	*cl_stack;
 	struct epoll_event	events[NR_EPOLL_EVENTS];
+	bool			handle_events_should_stop;
 };
 
 struct server_cfg {
@@ -95,9 +104,14 @@ struct server_ctx {
 };
 
 enum {
-	EPOLL_EV_FD_DATA  = 0,
-	EPOLL_TCP_FD_DATA = 1
+	EPOLL_EV_FD_DATA          = 0,
+	EPOLL_TCP_FD_DATA         = 1,
+	EPOLL_TARGET_CONNECT_MASK = (1ull << 61ull),
+	EPOLL_TARGET_EVENT_MASK   = (2ull << 61ull),
+	EPOLL_CLIENT_EVENT_MASK   = (3ull << 61ull),
 };
+
+#define EPOLL_DATA_MASK (3ull << 61ull)
 
 #ifndef likely
 #define likely(x)	__builtin_expect(!!(x), 1)
@@ -370,6 +384,11 @@ static int init_socket(struct server_ctx *ctx)
 		return -errno;
 	}
 
+#ifdef SO_REUSEADDR
+	ret = 1;
+	setsockopt(tcp_fd, SOL_SOCKET, SO_REUSEADDR, &ret, sizeof(ret));
+#endif
+
 	if (family == AF_INET6)
 		len = sizeof(ctx->cfg.bind_addr.in6);
 	else
@@ -415,9 +434,9 @@ static int epoll_add(struct server_wrk *w, int fd, uint32_t events,
 
 	ret = epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, fd, &ev);
 	if (ret) {
-		ret = -errno;
-		pr_error("Failed to add FD %d to epoll: %s", fd, strerror(-ret));
-		return ret;
+		ret = errno;
+		pr_error("Failed to add FD %d to epoll: %s", fd, strerror(ret));
+		abort();
 	}
 
 	return 0;
@@ -429,9 +448,9 @@ static int epoll_del(struct server_wrk *w, int fd)
 
 	ret = epoll_ctl(w->ep_fd, EPOLL_CTL_DEL, fd, NULL);
 	if (ret) {
-		ret = -errno;
-		pr_error("Failed to delete FD %d from epoll: %s", fd, strerror(-ret));
-		return ret;
+		ret = errno;
+		pr_error("Failed to delete FD %d from epoll: %s", fd, strerror(ret));
+		abort();
 	}
 
 	return 0;
@@ -448,9 +467,9 @@ static int epoll_mod(struct server_wrk *w, int fd, uint32_t events,
 
 	ret = epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, fd, &ev);
 	if (ret) {
-		ret = -errno;
-		pr_error("Failed to modify FD %d in epoll: %s\n", fd, strerror(-ret));
-		return ret;
+		ret = errno;
+		pr_error("Failed to modify FD %d in epoll: %s\n", fd, strerror(ret));
+		abort();
 	}
 
 	return 0;
@@ -561,19 +580,18 @@ static int consume_event_fd(struct server_wrk *w)
 	return 0;
 }
 
-static void free_worker(struct server_wrk *w)
+static void free_client_stack(struct server_wrk *w)
 {
-	if (w->ctx && w->idx != 0) {
-		send_event_fd(w);
-		pr_info("Joining worker thread %u...", w->idx);
-		pthread_join(w->thread, NULL);
-		pr_info("Worker thread %u joined", w->idx);
-	}
+	if (!w->cl_stack)
+		return;
 
-	free_epoll(w);
+	pthread_mutex_lock(&w->cl_stack->lock);
+	pthread_mutex_unlock(&w->cl_stack->lock);
+	pthread_mutex_destroy(&w->cl_stack->lock);
+	free(w->cl_stack);
+	w->cl_stack = NULL;
 }
 
-static void *worker_func(void *data);
 
 static int __push_client_stack(struct client_stack *cs, uint32_t data)
 {
@@ -641,22 +659,14 @@ static int init_client_stack(struct server_wrk *w)
 	return 0;
 }
 
-static void free_client_stack(struct server_wrk *w)
-{
-	if (!w->cl_stack)
-		return;
-
-	pthread_mutex_lock(&w->cl_stack->lock);
-	pthread_mutex_unlock(&w->cl_stack->lock);
-	pthread_mutex_destroy(&w->cl_stack->lock);
-	free(w->cl_stack);
-	w->cl_stack = NULL;
-}
-
 static void init_client_state(struct client_state *c)
 {
 	c->client_fd = -1;
 	c->target_fd = -1;
+	c->cbuf = NULL;
+	c->tbuf = NULL;
+	c->cbuf_len = 0;
+	c->tbuf_len = 0;
 	memset(&c->client_addr, 0, sizeof(c->client_addr));
 }
 
@@ -686,6 +696,48 @@ static int init_clients(struct server_wrk *w)
 	return 0;
 }
 
+static void close_all_client_fds(struct server_wrk *w)
+{
+	uint32_t i;
+
+	for (i = 0; i < w->nr_clients; i++) {
+		struct client_state *c = &w->clients[i];
+
+		if (c->client_fd >= 0) {
+			close(c->client_fd);
+			c->client_fd = -1;
+		}
+
+		if (c->target_fd >= 0) {
+			close(c->target_fd);
+			c->target_fd = -1;
+		}
+
+		if (c->cbuf) {
+			free(c->cbuf);
+			c->cbuf = NULL;
+			c->cbuf_len = 0;
+		}
+
+		if (c->tbuf) {
+			free(c->tbuf);
+			c->tbuf = NULL;
+			c->tbuf_len = 0;
+		}
+	}
+}
+
+void free_clients(struct server_wrk *w)
+{
+	if (!w->clients)
+		return;
+
+	close_all_client_fds(w);
+	free(w->clients);
+	w->clients = NULL;
+	free_client_stack(w);
+}
+
 static struct client_state *get_free_client_slot(struct server_wrk *w)
 {
 	struct client_state *c;
@@ -705,13 +757,33 @@ static struct client_state *get_free_client_slot(struct server_wrk *w)
 
 static void put_client_slot(struct server_wrk *w, struct client_state *c)
 {
+	bool hess = false;
 	int ret;
 
+	if (c->cbuf) {
+		free(c->cbuf);
+		c->cbuf = NULL;
+		c->cbuf_len = 0;
+	} else {
+		assert(c->cbuf_len == 0);
+	}
+
+	if (c->tbuf) {
+		free(c->tbuf);
+		c->tbuf = NULL;
+		c->tbuf_len = 0;
+	} else {
+		assert(c->tbuf_len == 0);
+	}
+
 	if (c->client_fd >= 0) {
+		pr_debug("Closing client FD %d (src: %s) (thread %u)",
+			 c->client_fd, sockaddr_to_str(&c->client_addr), w->idx);
 		ret = epoll_del(w, c->client_fd);
 		assert(!ret);
 		close(c->client_fd);
 		c->client_fd = -1;
+		hess = true;
 	}
 
 	if (c->target_fd >= 0) {
@@ -719,43 +791,31 @@ static void put_client_slot(struct server_wrk *w, struct client_state *c)
 		assert(!ret);
 		close(c->target_fd);
 		c->target_fd = -1;
+		hess = true;
 	}
 
+	pr_debug("xxx Clearing client state %p (thread %u)", (void *)c, w->idx);
+	w->handle_events_should_stop = hess;
 	memset(&c->client_addr, 0, sizeof(c->client_addr));
 	ret = push_client_stack(w->cl_stack, c->idx);
 	assert(!ret);
 	(void)ret;
 }
 
-static void close_all_client_fds(struct server_wrk *w)
+static void free_worker(struct server_wrk *w)
 {
-	uint32_t i;
-
-	for (i = 0; i < w->nr_clients; i++) {
-		struct client_state *c = &w->clients[i];
-
-		if (c->client_fd >= 0) {
-			close(c->client_fd);
-			c->client_fd = -1;
-		}
-
-		if (c->target_fd >= 0) {
-			close(c->target_fd);
-			c->target_fd = -1;
-		}
+	if (w->ctx && w->idx != 0) {
+		send_event_fd(w);
+		pr_info("Joining worker thread %u...", w->idx);
+		pthread_join(w->thread, NULL);
+		pr_info("Worker thread %u joined", w->idx);
 	}
+
+	free_clients(w);
+	free_epoll(w);
 }
 
-void free_clients(struct server_wrk *w)
-{
-	if (!w->clients)
-		return;
-
-	close_all_client_fds(w);
-	free(w->clients);
-	w->clients = NULL;
-	free_client_stack(w);
-}
+static void *worker_func(void *data);
 
 static int init_workers(struct server_ctx *ctx)
 {
@@ -861,6 +921,7 @@ static int poll_events(struct server_wrk *w)
 {
 	int ret;
 
+	w->handle_events_should_stop = false;
 	ret = epoll_wait(w->ep_fd, w->events, NR_EPOLL_EVENTS, w->timeout);
 	if (unlikely(ret < 0)) {
 		ret = errno;
@@ -906,16 +967,64 @@ static struct server_wrk *pick_worker_for_new_conn(struct server_ctx *ctx)
 	return w;
 }
 
-static int install_client_fd(struct server_wrk *w, struct client_state *c)
+static int prepare_target_connect(struct server_wrk *w, struct client_state *c)
 {
+	struct sockaddr_in46 *taddr = &w->ctx->cfg.target_addr;
 	union epoll_data data;
-	int ret;
+	socklen_t len;
+	int fd, ret;
 
-	data.u64 = EPOLL_EV_FD_DATA;
-	ret = epoll_add(w, c->client_fd, EPOLLIN, data);
-	if (ret)
+	if (taddr->sa.sa_family == AF_INET6)
+		len = sizeof(taddr->in6);
+	else
+		len = sizeof(taddr->in4);
+
+	fd = socket(taddr->sa.sa_family, SOCK_STREAM | SOCK_NONBLOCK, 0);
+	if (fd < 0) {
+		ret = errno;
+		pr_error("Failed to create target socket: %s", strerror(ret));
+		return -ret;
+	}
+
+#ifdef TCP_NODELAY
+	ret = 1;
+	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &ret, sizeof(ret));
+#endif
+
+	ret = connect(fd, &taddr->sa, len);
+	if (ret) {
+		ret = errno;
+		if (ret != EINPROGRESS) {
+			pr_error("Failed to connect to target: %s", strerror(ret));
+			close(fd);
+			return -ret;
+		}
+	}
+
+	data.ptr = c;
+	data.u64 |= EPOLL_TARGET_CONNECT_MASK;
+	c->tpoll_mask = EPOLLOUT | EPOLLIN;
+	ret = epoll_add(w, fd, c->tpoll_mask, data);
+	if (ret) {
+		close(fd);
 		return ret;
+	}
 
+	data.ptr = c;
+	data.u64 |= EPOLL_CLIENT_EVENT_MASK;
+	c->cpoll_mask = 0;
+	ret = epoll_add(w, c->client_fd, c->cpoll_mask, data);
+	if (ret) {
+		epoll_del(w, fd);
+		close(fd);
+		return ret;
+	}
+
+	pr_debug("Preparing forward conn from %s to %s (thread %u)",
+		 sockaddr_to_str(&c->client_addr), sockaddr_to_str(taddr), w->idx);
+	c->target_fd = fd;
+	pr_debug("xxx Assigning target fd %d to client state %p (thread %u)",
+		 fd, (void *)c, w->idx);
 	return 0;
 }
 
@@ -935,7 +1044,7 @@ static int give_client_fd_to_a_worker(struct server_ctx *ctx, int fd,
 
 	c->client_fd = fd;
 	c->client_addr = *addr;
-	ret = install_client_fd(w, c);
+	ret = prepare_target_connect(w, c);
 	if (ret) {
 		put_client_slot(w, c);
 		return ret;
@@ -980,13 +1089,319 @@ static int handle_accept_event(struct server_wrk *w)
 	return 0;
 }
 
+static int handle_target_connect_event(struct server_wrk *w, struct epoll_event *ev)
+{
+	struct client_state *c = ev->data.ptr;
+	uint32_t events = ev->events;
+	union epoll_data data;
+	socklen_t len;
+	int ret, tmp;
+
+	if (unlikely(events & (EPOLLERR | EPOLLHUP))) {
+		pr_error("Target connect failed: %s (thread %u)", strerror(errno), w->idx);
+		put_client_slot(w, c);
+		return 0;
+	}
+
+	tmp = 0;
+	len = sizeof(tmp);
+	ret = getsockopt(c->target_fd, SOL_SOCKET, SO_ERROR, &tmp, &len);
+	if (unlikely(tmp || !(events & EPOLLOUT))) {
+		pr_error("Failed to get target socket error: %s (thread %u)", strerror(tmp), w->idx);
+		put_client_slot(w, c);
+		return 0;
+	}
+
+	data.ptr = c;
+	data.u64 |= EPOLL_TARGET_EVENT_MASK;
+	c->tpoll_mask = EPOLLIN;
+	pr_debug("xxxx Setting target FD %p %d (thread %u)", (void *)c, c->target_fd, w->idx);
+	ret = epoll_mod(w, c->target_fd, c->tpoll_mask, data);
+	if (ret) {
+		put_client_slot(w, c);
+		return ret;
+	}
+
+	data.ptr = c;
+	data.u64 |= EPOLL_CLIENT_EVENT_MASK;
+	c->cpoll_mask = EPOLLIN;
+	ret = epoll_mod(w, c->client_fd, c->cpoll_mask, data);
+	if (ret) {
+		put_client_slot(w, c);
+		return ret;
+	}
+
+	c->cbuf = malloc(SPLICE_BUF_SIZE);
+	c->tbuf = malloc(SPLICE_BUF_SIZE);
+	if (unlikely(!c->cbuf || !c->tbuf)) {
+		pr_error("Failed to allocate splice buffers: %s (thread %u)", strerror(errno), w->idx);
+		put_client_slot(w, c);
+		return -ENOMEM;
+	}
+
+	c->cbuf_len = 0;
+	c->tbuf_len = 0;
+	pr_debug("Forward connection established from %s to %s (thread %u)",
+		 sockaddr_to_str(&c->client_addr),
+		 sockaddr_to_str(&w->ctx->cfg.target_addr), w->idx);
+
+	return 0;
+}
+
+struct splice_buf {
+	char *buf;
+	size_t cur_len;
+	size_t max_len;
+};
+
+static ssize_t do_splice(int src_fd, int dst_fd, struct splice_buf *sb)
+{
+	size_t recv_len;
+	ssize_t ret;
+
+	recv_len = sb->max_len - sb->cur_len;
+	if (recv_len > 0) {
+		ret = recv(src_fd, sb->buf + sb->cur_len, recv_len, MSG_DONTWAIT);
+		if (ret < 0) {
+			ret = errno;
+			if (ret == EAGAIN)
+				goto do_send;
+
+			pr_error("Failed to read from FD %d: %s", src_fd, strerror(ret));
+			return -ret;
+		}
+
+		if (ret == 0)
+			return -EIO;
+
+		sb->cur_len += (size_t)ret;
+	}
+
+do_send:
+	if (sb->cur_len == 0)
+		return 0;
+
+	ret = send(dst_fd, sb->buf, sb->cur_len, MSG_DONTWAIT);
+	if (ret < 0) {
+		ret = errno;
+		if (ret == EAGAIN)
+			return 0;
+
+		pr_error("Failed to write to FD %d: %s", dst_fd, strerror(ret));
+		return -ret;
+	}
+
+	if (ret == 0)
+		return -EIO;
+
+	sb->cur_len -= (size_t)ret;
+	if (sb->cur_len > 0)
+		memmove(sb->buf, sb->buf + ret, sb->cur_len);
+
+	return ret;
+}
+
+static int handle_target_event(struct server_wrk *w, struct epoll_event *ev)
+{
+	struct client_state *c = ev->data.ptr;
+	uint32_t events = ev->events;
+	union epoll_data data;
+	struct splice_buf sb;
+	ssize_t ret;
+	int err;
+
+	if (unlikely(events & (EPOLLERR | EPOLLHUP))) {
+		pr_error("Target socket error: %s (thread %u)", strerror(errno), w->idx);
+		put_client_slot(w, c);
+		return 0;
+	}
+
+	if (events & EPOLLIN) {
+		sb.buf = c->tbuf;
+		sb.cur_len = c->tbuf_len;
+		sb.max_len = SPLICE_BUF_SIZE;
+		ret = do_splice(c->target_fd, c->client_fd, &sb);
+		if (ret < 0) {
+			put_client_slot(w, c);
+			return 0;
+		}
+
+		c->tbuf_len = sb.cur_len;
+		if (c->tbuf_len > 0) {
+			/*
+			 * Client is not ready to receive more data, so we
+			 * need to wait for EPOLLOUT.
+			 */
+			data.ptr = c;
+			data.u64 |= EPOLL_CLIENT_EVENT_MASK;
+			c->cpoll_mask |= EPOLLOUT;
+			err = epoll_mod(w, c->client_fd, c->cpoll_mask, data);
+			assert(!err);
+		}
+
+		if (c->tbuf_len == SPLICE_BUF_SIZE) {
+			/*
+			 * Target buffer is full, stop reading from target
+			 * until we have more space.
+			 */
+			data.ptr = c;
+			data.u64 |= EPOLL_TARGET_EVENT_MASK;
+			c->tpoll_mask &= ~EPOLLIN;
+			err = epoll_mod(w, c->target_fd, c->tpoll_mask, data);
+			assert(!err);
+		}
+	}
+
+	if (events & EPOLLOUT) {
+		sb.buf = c->cbuf;
+		sb.cur_len = c->cbuf_len;
+		sb.max_len = SPLICE_BUF_SIZE;
+		ret = do_splice(c->client_fd, c->target_fd, &sb);
+		if (ret < 0) {
+			put_client_slot(w, c);
+			return 0;
+		}
+
+		c->cbuf_len = sb.cur_len;
+		if (c->cbuf_len == 0) {
+			/*
+			 * Buffer is fully flushed to the target, stop
+			 * the EPOLLOUT event.
+			 */
+			data.ptr = c;
+			data.u64 |= EPOLL_TARGET_EVENT_MASK;
+			c->tpoll_mask &= ~EPOLLOUT;
+			err = epoll_mod(w, c->target_fd, c->tpoll_mask, data);
+			assert(!err);
+		}
+
+		if (c->cbuf_len < SPLICE_BUF_SIZE && !(c->cpoll_mask & EPOLLIN)) {
+			/*
+			 * Client is ready to receive more data, start
+			 * reading from client again.
+			 */
+			data.ptr = c;
+			data.u64 |= EPOLL_CLIENT_EVENT_MASK;
+			c->cpoll_mask |= EPOLLIN;
+			err = epoll_mod(w, c->client_fd, c->cpoll_mask, data);
+			assert(!err);
+		}
+	}
+
+	return 0;
+}
+
+static int handle_client_event(struct server_wrk *w, struct epoll_event *ev)
+{
+	struct client_state *c = ev->data.ptr;
+	uint32_t events = ev->events;
+	union epoll_data data;
+	struct splice_buf sb;
+	ssize_t ret;
+	int err;
+
+	if (unlikely(events & (EPOLLERR | EPOLLHUP))) {
+		pr_error("Client socket error: %s (thread %u)", strerror(errno), w->idx);
+		put_client_slot(w, c);
+		return 0;
+	}
+
+	if (events & EPOLLIN) {
+		sb.buf = c->cbuf;
+		sb.cur_len = c->cbuf_len;
+		sb.max_len = SPLICE_BUF_SIZE;
+		ret = do_splice(c->client_fd, c->target_fd, &sb);
+		if (ret < 0) {
+			put_client_slot(w, c);
+			return 0;
+		}
+
+		c->cbuf_len = sb.cur_len;
+		if (c->cbuf_len > 0) {
+			/*
+			 * Target is not ready to receive more data, so we
+			 * need to wait for EPOLLOUT.
+			 */
+			data.ptr = c;
+			data.u64 |= EPOLL_TARGET_EVENT_MASK;
+			c->tpoll_mask |= EPOLLOUT;
+			err = epoll_mod(w, c->target_fd, c->tpoll_mask, data);
+			assert(!err);
+		}
+
+		if (c->cbuf_len == SPLICE_BUF_SIZE) {
+			/*
+			 * Client buffer is full, stop reading from client
+			 * until we have more space.
+			 */
+			data.ptr = c;
+			data.u64 |= EPOLL_CLIENT_EVENT_MASK;
+			c->cpoll_mask &= ~EPOLLIN;
+			err = epoll_mod(w, c->client_fd, c->cpoll_mask, data);
+			assert(!err);
+		}
+	}
+
+	if (events & EPOLLOUT) {
+		sb.buf = c->tbuf;
+		sb.cur_len = c->tbuf_len;
+		sb.max_len = SPLICE_BUF_SIZE;
+		ret = do_splice(c->target_fd, c->client_fd, &sb);
+		if (ret < 0) {
+			put_client_slot(w, c);
+			return 0;
+		}
+
+		c->tbuf_len = sb.cur_len;
+		if (c->tbuf_len == 0) {
+			/*
+			 * Buffer is fully flushed to the client, stop
+			 * the EPOLLOUT event.
+			 */
+			data.ptr = c;
+			data.u64 |= EPOLL_CLIENT_EVENT_MASK;
+			c->cpoll_mask &= ~EPOLLOUT;
+			err = epoll_mod(w, c->client_fd, c->cpoll_mask, data);
+			assert(!err);
+		}
+
+		if (c->tbuf_len < SPLICE_BUF_SIZE && !(c->tpoll_mask & EPOLLIN)) {
+			/*
+			 * Target is ready to receive more data, start
+			 * reading from target again.
+			 */
+			data.ptr = c;
+			data.u64 |= EPOLL_TARGET_EVENT_MASK;
+			c->tpoll_mask |= EPOLLIN;
+			err = epoll_mod(w, c->target_fd, c->tpoll_mask, data);
+			assert(!err);
+		}
+	}
+
+	return 0;
+}
+
 static int handle_event(struct server_wrk *w, struct epoll_event *ev)
 {
+	uint64_t mask;
+
 	if (ev->data.u64 == EPOLL_EV_FD_DATA)
 		return consume_event_fd(w);
 
 	if (ev->data.u64 == EPOLL_TCP_FD_DATA)
 		return handle_accept_event(w);
+
+	mask = ev->data.u64 & EPOLL_DATA_MASK;
+	ev->data.u64 &= ~EPOLL_DATA_MASK;
+
+	if (mask == EPOLL_TARGET_CONNECT_MASK)
+		return handle_target_connect_event(w, ev);
+
+	if (mask == EPOLL_TARGET_EVENT_MASK)
+		return handle_target_event(w, ev);
+
+	if (mask == EPOLL_CLIENT_EVENT_MASK)
+		return handle_client_event(w, ev);
 
 	return 0;
 }
@@ -999,6 +1414,9 @@ static int handle_events(struct server_wrk *w, int nr_events)
 		ret = handle_event(w, &w->events[i]);
 		if (ret)
 			return ret;
+
+		if (w->handle_events_should_stop)
+			break;
 	}
 
 	return 0;
