@@ -27,7 +27,7 @@
 #include <fcntl.h>
 
 #if 1
-#define pr_debug(fmt, ...) printf("debug: " fmt "\n", ##__VA_ARGS__)
+#define pr_debug(fmt, ...) printf("debug %d: " fmt "\n", gettid(), ##__VA_ARGS__)
 #else
 #define pr_debug(fmt, ...) do { } while (0)
 #endif
@@ -106,12 +106,12 @@ struct server_ctx {
 enum {
 	EPOLL_EV_FD_DATA          = 0,
 	EPOLL_TCP_FD_DATA         = 1,
-	EPOLL_TARGET_CONNECT_MASK = (1ull << 61ull),
-	EPOLL_TARGET_EVENT_MASK   = (2ull << 61ull),
-	EPOLL_CLIENT_EVENT_MASK   = (3ull << 61ull),
+	EPOLL_TARGET_CONNECT_MASK = (0x0001ull << 48ull),
+	EPOLL_TARGET_EVENT_MASK   = (0x0002ull << 48ull),
+	EPOLL_CLIENT_EVENT_MASK   = (0x0003ull << 48ull),
 };
 
-#define EPOLL_DATA_MASK (3ull << 61ull)
+#define EPOLL_DATA_MASK (0xffffull << 48ull)
 
 #ifndef likely
 #define likely(x)	__builtin_expect(!!(x), 1)
@@ -431,6 +431,13 @@ static int epoll_add(struct server_wrk *w, int fd, uint32_t events,
 		.data = data,
 	};
 	int ret;
+	uint64_t mask;
+	uint64_t no_mask;
+
+	mask = data.u64 & EPOLL_DATA_MASK;
+	no_mask = data.u64 & ~EPOLL_DATA_MASK;
+	pr_debug("xxx Adding FD %d to epoll (mask: %lx) (thread %u) no_mask: %lx",
+		 fd, mask, w->idx, no_mask);
 
 	ret = epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, fd, &ev);
 	if (ret) {
@@ -749,8 +756,8 @@ static struct client_state *get_free_client_slot(struct server_wrk *w)
 		return NULL;
 
 	c = &w->clients[idx];
-	assert(c->client_fd == -1);
-	assert(c->target_fd == -1);
+	assert(c->client_fd < 0);
+	assert(c->target_fd < 0);
 	assert(c->idx == idx);
 	return c;
 }
@@ -789,12 +796,13 @@ static void put_client_slot(struct server_wrk *w, struct client_state *c)
 	if (c->target_fd >= 0) {
 		ret = epoll_del(w, c->target_fd);
 		assert(!ret);
+		pr_debug("xxx Clearing target FD %d from client state %p (thread %u)",
+			 c->target_fd, (void *)c, w->idx);
 		close(c->target_fd);
-		c->target_fd = -1;
+		c->target_fd = -c->target_fd;
 		hess = true;
 	}
 
-	pr_debug("xxx Clearing client state %p (thread %u)", (void *)c, w->idx);
 	w->handle_events_should_stop = hess;
 	memset(&c->client_addr, 0, sizeof(c->client_addr));
 	ret = push_client_stack(w->cl_stack, c->idx);
@@ -1001,28 +1009,24 @@ static int prepare_target_connect(struct server_wrk *w, struct client_state *c)
 		}
 	}
 
-	data.ptr = c;
-	data.u64 |= EPOLL_TARGET_CONNECT_MASK;
-	c->tpoll_mask = EPOLLOUT | EPOLLIN;
-	ret = epoll_add(w, fd, c->tpoll_mask, data);
-	if (ret) {
-		close(fd);
-		return ret;
-	}
+	c->target_fd = fd;
 
 	data.ptr = c;
 	data.u64 |= EPOLL_CLIENT_EVENT_MASK;
 	c->cpoll_mask = 0;
 	ret = epoll_add(w, c->client_fd, c->cpoll_mask, data);
-	if (ret) {
-		epoll_del(w, fd);
-		close(fd);
+	if (ret)
 		return ret;
-	}
+
+	data.ptr = c;
+	data.u64 |= EPOLL_TARGET_CONNECT_MASK;
+	c->tpoll_mask = EPOLLOUT | EPOLLIN;
+	ret = epoll_add(w, c->target_fd, c->tpoll_mask, data);
+	if (ret)
+		return ret;
 
 	pr_debug("Preparing forward conn from %s to %s (thread %u)",
 		 sockaddr_to_str(&c->client_addr), sockaddr_to_str(taddr), w->idx);
-	c->target_fd = fd;
 	pr_debug("xxx Assigning target fd %d to client state %p (thread %u)",
 		 fd, (void *)c, w->idx);
 	return 0;
@@ -1107,6 +1111,8 @@ static int handle_target_connect_event(struct server_wrk *w, struct epoll_event 
 	len = sizeof(tmp);
 	ret = getsockopt(c->target_fd, SOL_SOCKET, SO_ERROR, &tmp, &len);
 	if (unlikely(tmp || !(events & EPOLLOUT))) {
+		if (tmp < 0)
+			tmp = -tmp;
 		pr_error("Failed to get target socket error: %s (thread %u)", strerror(tmp), w->idx);
 		put_client_slot(w, c);
 		return 0;
@@ -1411,12 +1417,13 @@ static int handle_events(struct server_wrk *w, int nr_events)
 	int ret, i;
 
 	for (i = 0; i < nr_events; i++) {
+		pr_debug("Handling event %d/%d (thread %u) bool=%d", i + 1, nr_events, w->idx, w->handle_events_should_stop);
+		if (w->handle_events_should_stop)
+			break;
+
 		ret = handle_event(w, &w->events[i]);
 		if (ret)
 			return ret;
-
-		if (w->handle_events_should_stop)
-			break;
 	}
 
 	return 0;
