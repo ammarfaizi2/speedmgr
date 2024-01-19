@@ -174,7 +174,13 @@ static int parse_addr_and_port(const char *str, struct sockaddr_in46 *out)
 	if (!addr)
 		return -ENOMEM;
 
-	port = strchr(addr, ':');
+	port = strchr(addr, ']');
+	if (port)
+		port++;
+	else
+		port = addr;
+
+	port = strchr(port, ':');
 	if (!port) {
 		pr_error("Invalid address and port combination: \"%s\"", str);
 		pr_error("Missing port number");
