@@ -431,13 +431,6 @@ static int epoll_add(struct server_wrk *w, int fd, uint32_t events,
 		.data = data,
 	};
 	int ret;
-	uint64_t mask;
-	uint64_t no_mask;
-
-	mask = data.u64 & EPOLL_DATA_MASK;
-	no_mask = data.u64 & ~EPOLL_DATA_MASK;
-	pr_debug("xxx Adding FD %d to epoll (mask: %lx) (thread %u) no_mask: %lx",
-		 fd, mask, w->idx, no_mask);
 
 	ret = epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, fd, &ev);
 	if (ret) {
@@ -784,20 +777,16 @@ static void put_client_slot(struct server_wrk *w, struct client_state *c)
 	}
 
 	if (c->client_fd >= 0) {
-		pr_debug("Closing client FD %d (src: %s) (thread %u)",
-			 c->client_fd, sockaddr_to_str(&c->client_addr), w->idx);
 		ret = epoll_del(w, c->client_fd);
 		assert(!ret);
 		close(c->client_fd);
-		c->client_fd = -1;
+		c->client_fd = -c->client_fd;
 		hess = true;
 	}
 
 	if (c->target_fd >= 0) {
 		ret = epoll_del(w, c->target_fd);
 		assert(!ret);
-		pr_debug("xxx Clearing target FD %d from client state %p (thread %u)",
-			 c->target_fd, (void *)c, w->idx);
 		close(c->target_fd);
 		c->target_fd = -c->target_fd;
 		hess = true;
@@ -960,14 +949,17 @@ static int handle_accept_error(int err, struct server_wrk *w)
 
 static struct server_wrk *pick_worker_for_new_conn(struct server_ctx *ctx)
 {
-	uint32_t i, min = UINT32_MAX;
 	struct server_wrk *w = NULL;
+	uint32_t i, min;
 
-	for (i = 0; i < ctx->cfg.nr_workers; i++) {
-		uint32_t nr_clients = atomic_load(&ctx->workers[i].nr_active_clients);
+	w = &ctx->workers[0];
+	min = atomic_load(&ctx->workers[0].nr_active_clients);
+	for (i = 1; i < ctx->cfg.nr_workers; i++) {
+		uint32_t nr;
 
-		if (nr_clients < min) {
-			min = nr_clients;
+		nr = atomic_load(&ctx->workers[i].nr_active_clients);
+		if (nr < min) {
+			min = nr;
 			w = &ctx->workers[i];
 		}
 	}
@@ -1025,10 +1017,9 @@ static int prepare_target_connect(struct server_wrk *w, struct client_state *c)
 	if (ret)
 		return ret;
 
+	send_event_fd(w);
 	pr_debug("Preparing forward conn from %s to %s (thread %u)",
 		 sockaddr_to_str(&c->client_addr), sockaddr_to_str(taddr), w->idx);
-	pr_debug("xxx Assigning target fd %d to client state %p (thread %u)",
-		 fd, (void *)c, w->idx);
 	return 0;
 }
 
@@ -1121,7 +1112,6 @@ static int handle_target_connect_event(struct server_wrk *w, struct epoll_event 
 	data.ptr = c;
 	data.u64 |= EPOLL_TARGET_EVENT_MASK;
 	c->tpoll_mask = EPOLLIN;
-	pr_debug("xxxx Setting target FD %p %d (thread %u)", (void *)c, c->target_fd, w->idx);
 	ret = epoll_mod(w, c->target_fd, c->tpoll_mask, data);
 	if (ret) {
 		put_client_slot(w, c);
