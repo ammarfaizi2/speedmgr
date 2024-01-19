@@ -4,6 +4,8 @@
 #define _GNU_SOURCE
 #endif
 
+#include "ip_map.h"
+
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -14,6 +16,7 @@
 #include <errno.h>
 
 #include <sys/resource.h>
+#include <sys/timerfd.h>
 #include <netinet/tcp.h>
 #include <sys/eventfd.h>
 #include <sys/signal.h>
@@ -30,10 +33,22 @@
 static volatile bool *g_stop;
 static uint8_t g_verbose;
 
-#if 0
+#if 1
 #define pr_debug(fmt, ...) printf("debug %d: " fmt "\n", gettid(), ##__VA_ARGS__)
 #else
 #define pr_debug(fmt, ...) do { } while (0)
+#endif
+
+#ifndef __must_hold
+#define __must_hold(x)
+#endif
+
+#ifndef __acquires
+#define __acquires(x)
+#endif
+
+#ifndef __releases
+#define __releases(x)
 #endif
 
 #define pr_error(fmt, ...) printf("error: " fmt "\n", ##__VA_ARGS__)
@@ -51,6 +66,7 @@ do {						\
 		pr_info(fmt, ##__VA_ARGS__);	\
 } while (0)
 
+#define NR_INIT_BUCKETS		4
 #define NR_EPOLL_EVENTS		64
 #define NR_CLIENTS		2048
 #define SPLICE_BUF_SIZE		8192
@@ -61,6 +77,29 @@ struct sockaddr_in46 {
 		struct sockaddr_in in4;
 		struct sockaddr_in6 in6;
 	};
+};
+
+struct client_state;
+
+struct token_bucket {
+	struct sockaddr_in46	addr;
+	int			timer_fd;
+	_Atomic(uint32_t)	cur_tokens;
+	uint32_t		max_tokens;
+	uint64_t		last_update;
+	pthread_mutex_t		lock;
+	struct server_wrk	*wrk;
+	struct client_state	**clients;	/* Protected by mutex. */
+	uint32_t		nr_clients;	/* Protected by mutex. */
+	uint32_t		refcnt;		/* Protected by mutex. */
+};
+
+struct rate_limit {
+	pthread_mutex_t		lock;
+	uint32_t		nr_tbuckets;
+	uint32_t		nr_allocated;
+	struct token_bucket	**tbuckets;
+	ip_map_t		ip_map;
 };
 
 struct client_state {
@@ -74,6 +113,8 @@ struct client_state {
 	char			*cbuf;
 	char			*tbuf;
 	struct sockaddr_in46	client_addr;
+	struct token_bucket	*tbucket;
+	bool			rate_limited;
 };
 
 struct client_stack {
@@ -113,9 +154,10 @@ struct server_cfg {
 
 struct server_ctx {
 	volatile bool		should_stop;
-	bool			accept_stopped;
+	volatile bool		accept_stopped;
 	int			tcp_fd;
 	struct server_wrk	*workers;
+	struct rate_limit	rl;
 	struct server_cfg	cfg;
 };
 
@@ -125,6 +167,7 @@ enum {
 	EPOLL_TARGET_CONNECT_MASK = (0x0001ull << 48ull),
 	EPOLL_TARGET_EVENT_MASK   = (0x0002ull << 48ull),
 	EPOLL_CLIENT_EVENT_MASK   = (0x0003ull << 48ull),
+	EPOLL_TIMER_EVENT_MASK    = (0x0004ull << 48ull),
 };
 
 #define EPOLL_DATA_MASK (0xffffull << 48ull)
@@ -151,6 +194,14 @@ struct option long_options[] = {
 	{ "backlog",	required_argument,	NULL,	'B' },
 	{ NULL,		0,			NULL,	0 },
 };
+
+static uint64_t get_time_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
 
 static void show_help(const char *app)
 {
@@ -443,6 +494,52 @@ static void free_socket(struct server_ctx *ctx)
 		close(ctx->tcp_fd);
 }
 
+static int init_rate_limit(struct server_ctx *ctx)
+{
+	struct rate_limit *rl = &ctx->rl;
+	struct token_bucket **tbuckets;
+	int ret;
+
+	rl->nr_tbuckets = 0;
+	rl->nr_allocated = NR_INIT_BUCKETS;
+	tbuckets = calloc(rl->nr_allocated, sizeof(*tbuckets));
+	if (!tbuckets)
+		return -ENOMEM;
+
+	ret = pthread_mutex_init(&rl->lock, NULL);
+	if (ret) {
+		pr_error("Failed to initialize rate limit mutex: %s", strerror(ret));
+		free(tbuckets);
+		return -ret;
+	}
+
+	ret = ip_map_init(&rl->ip_map);
+	if (ret) {
+		pr_error("Failed to initialize IP map: %s", strerror(ret));
+		free(tbuckets);
+		pthread_mutex_destroy(&rl->lock);
+		return ret;
+	}
+
+	rl->tbuckets = tbuckets;
+	return 0;
+}
+
+static void free_rate_limit(struct server_ctx *ctx)
+{
+	struct rate_limit *rl = &ctx->rl;
+
+	if (!rl->tbuckets)
+		return;
+
+	free(rl->tbuckets);
+	rl->tbuckets = NULL;
+	rl->nr_allocated = 0;
+	rl->nr_tbuckets = 0;
+	pthread_mutex_destroy(&rl->lock);
+	ip_map_destroy(&rl->ip_map);
+}
+
 static int epoll_add(struct server_wrk *w, int fd, uint32_t events,
 		     union epoll_data data)
 {
@@ -687,6 +784,7 @@ static void init_client_state(struct client_state *c)
 	c->tbuf = NULL;
 	c->cbuf_len = 0;
 	c->tbuf_len = 0;
+	c->rate_limited = false;
 	memset(&c->client_addr, 0, sizeof(c->client_addr));
 }
 
@@ -775,6 +873,8 @@ static struct client_state *get_free_client_slot(struct server_wrk *w)
 	return c;
 }
 
+static int del_client_from_tbucket(struct server_wrk *w, struct client_state *c);
+
 static void put_client_slot(struct server_wrk *w, struct client_state *c)
 {
 	bool hess = false;
@@ -826,7 +926,12 @@ static void put_client_slot(struct server_wrk *w, struct client_state *c)
 		send_event_fd(&w->ctx->workers[0]);
 	}
 
+	assert(c->tbucket);
+	del_client_from_tbucket(w, c);
+
+	c->rate_limited = false;
 	w->handle_events_should_stop = hess;
+	atomic_fetch_sub(&w->nr_active_clients, 1u);
 	memset(&c->client_addr, 0, sizeof(c->client_addr));
 	ret = push_client_stack(w->cl_stack, c->idx);
 	assert(!ret);
@@ -960,9 +1065,16 @@ static int init_ctx(struct server_ctx *ctx)
 	if (ret)
 		return ret;
 
+	ret = init_rate_limit(ctx);
+	if (ret) {
+		free_socket(ctx);
+		return ret;
+	}
+
 	ret = init_workers(ctx);
 	if (ret) {
 		free_socket(ctx);
+		free_rate_limit(ctx);
 		return ret;
 	}
 
@@ -974,6 +1086,7 @@ static void free_ctx(struct server_ctx *ctx)
 	ctx->should_stop = true;
 	free_workers(ctx);
 	free_socket(ctx);
+	free_rate_limit(ctx);
 }
 
 static int poll_events(struct server_wrk *w)
@@ -1010,11 +1123,293 @@ static int handle_accept_error(int err, struct server_wrk *w)
 	return -err;
 }
 
-static struct server_wrk *pick_worker_for_new_conn(struct server_ctx *ctx)
+static const void *get_ip_field_ptr(const struct sockaddr_in46 *addr)
+{
+	if (addr->sa.sa_family == AF_INET6)
+		return &addr->in6.sin6_addr;
+
+	return &addr->in4.sin_addr;
+}
+
+static struct token_bucket *find_token_bucket(struct server_ctx *ctx,
+					      struct sockaddr_in46 *addr)
+	__must_hold(&w->ctx->rl.lock)
+{
+	struct rate_limit *rl = &ctx->rl;
+	struct token_bucket *tb = NULL;
+	const void *ip_field;
+	int ret, family;
+
+	family = (addr->sa.sa_family == AF_INET6) ? 6 : 4;
+	ip_field = get_ip_field_ptr(addr);
+	ret = ip_map_get(&rl->ip_map, ip_field, family, (void **)&tb);
+	if (ret == -ENOENT) {
+		tb = NULL;
+	} else if (ret) {
+		pr_error("Failed to get token bucket from IP map: %s", strerror(-ret));
+		tb = NULL;
+	}
+
+	return tb;
+}
+
+static int start_ip_bucket_timer(struct server_wrk *w, struct token_bucket *tb)
+	__must_hold(&w->ctx->rl.lock)
+{
+	union epoll_data data;
+	struct itimerspec its;
+	struct timespec now;
+	int ret;
+
+	ret = clock_gettime(CLOCK_MONOTONIC, &now);
+	if (ret) {
+		ret = errno;
+		pr_error("Failed to get current time: %s", strerror(ret));
+		return -ret;
+	}
+
+	ret = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+	if (ret < 0) {
+		ret = errno;
+		pr_error("Failed to create timer FD: %s", strerror(ret));
+		return -ret;
+	}
+
+	tb->timer_fd = ret;
+	/*
+	 * Every 0.5 seconds.
+	 */
+	its.it_interval.tv_sec = 0;
+	its.it_interval.tv_nsec = 500000000;
+	its.it_value.tv_sec = now.tv_sec + 1;
+	its.it_value.tv_nsec = now.tv_nsec;
+	ret = timerfd_settime(tb->timer_fd, TFD_TIMER_ABSTIME, &its, NULL);
+	if (ret) {
+		ret = errno;
+		close(tb->timer_fd);
+		tb->timer_fd = -1;
+		pr_error("Failed to set timer FD time: %s", strerror(ret));
+		return -ret;
+	}
+
+	data.ptr = tb;
+	data.u64 |= EPOLL_TIMER_EVENT_MASK;
+	ret = epoll_add(w, tb->timer_fd, EPOLLIN, data);
+	if (ret) {
+		close(tb->timer_fd);
+		tb->timer_fd = -1;
+		return ret;
+	}
+
+	return 0;
+}
+
+static struct token_bucket *create_token_bucket(struct server_wrk *w,
+						struct sockaddr_in46 *addr)
+	__must_hold(&w->ctx->rl.lock)
+{
+	struct rate_limit *rl = &w->ctx->rl;
+	struct token_bucket *tb;
+	int family, ret;
+
+	tb = malloc(sizeof(*tb));
+	if (!tb)
+		return NULL;
+
+	ret = pthread_mutex_init(&tb->lock, NULL);
+	if (ret) {
+		pr_error("Failed to initialize token bucket mutex: %s", strerror(ret));
+		free(tb);
+		return NULL;
+	}
+
+	family = (addr->sa.sa_family == AF_INET6) ? 6 : 4;
+	ret = ip_map_add(&rl->ip_map, get_ip_field_ptr(addr), family, tb);
+	if (ret) {
+		pr_error("Failed to add token bucket to IP map: %s", strerror(-ret));
+		pthread_mutex_destroy(&tb->lock);
+		free(tb);
+		return NULL;
+	}
+
+	tb->addr = *addr;
+	tb->cur_tokens = 1024*1024*5;
+	tb->max_tokens = 1024*1024*5;
+	tb->last_update = get_time_ms();
+	tb->refcnt = 0;
+	tb->clients = NULL;
+	tb->timer_fd = -1;
+	tb->wrk = w;
+	ret = start_ip_bucket_timer(w, tb);
+	if (ret) {
+		ip_map_del(&rl->ip_map, get_ip_field_ptr(addr), family);
+		pthread_mutex_destroy(&tb->lock);
+		free(tb);
+		return NULL;
+	}
+
+	return tb;
+}
+
+static void __delete_token_bucket(struct server_wrk *w, struct sockaddr_in46 *addr)
+	__must_hold(&w->ctx->rl.lock)
+{
+	struct rate_limit *rl = &w->ctx->rl;
+	const void *ip_field;
+	int family;
+
+	family = (addr->sa.sa_family == AF_INET6) ? 6 : 4;
+	ip_field = get_ip_field_ptr(addr);
+	ip_map_del(&rl->ip_map, ip_field, family);
+	pr_debug("Deleted token bucket for %s", sockaddr_to_str(addr));
+}
+
+static void put_token_bucket(struct server_wrk *w, struct sockaddr_in46 *addr)
+	__must_hold(&w->ctx->rl.lock)
+{
+	struct token_bucket *tb;
+
+	tb = find_token_bucket(w->ctx, addr);
+	if (!tb)
+		return;
+
+	pthread_mutex_lock(&tb->lock);
+	if (--tb->refcnt) {
+		pr_debug("Not deleting token bucket for %s, it's still in use",
+			 sockaddr_to_str(addr));
+		pthread_mutex_unlock(&tb->lock);
+		return;
+	}
+
+	pthread_mutex_unlock(&tb->lock);
+	__delete_token_bucket(w, addr);
+
+	assert(tb->timer_fd >= 0);
+	epoll_del(w, tb->timer_fd);
+	close(tb->timer_fd);
+	tb->timer_fd = -1;
+	free(tb);
+}
+
+static int add_client_to_tbucket(struct token_bucket *tb, struct client_state *c)
+{
+	struct client_state **clients;
+
+	pthread_mutex_lock(&tb->lock);
+	clients = realloc(tb->clients, sizeof(*clients) * (tb->nr_clients + 1));
+	if (!clients) {
+		pr_error("Failed to reallocate client array: %s", strerror(errno));
+		pthread_mutex_unlock(&tb->lock);
+		return -ENOMEM;
+	}
+
+	clients[tb->nr_clients++] = c;
+	tb->clients = clients;
+	tb->refcnt++;
+	pthread_mutex_unlock(&tb->lock);
+	return 0;
+}
+
+static int del_client_from_tbucket(struct server_wrk *w, struct client_state *c)
+{
+	struct token_bucket *tb = c->tbucket;
+	struct client_state **clients;
+	bool found = false;
+	uint32_t i, cl_idx;
+
+	pthread_mutex_lock(&w->ctx->rl.lock);
+	pthread_mutex_lock(&tb->lock);
+	assert(tb->nr_clients > 0);
+
+	clients = tb->clients;
+	cl_idx = 0;
+	for (i = 0; i < tb->nr_clients; i++) {
+		if (clients[i] == c) {
+			found = true;
+			cl_idx = i;
+			break;
+		}
+	}
+
+	assert(found);
+	if (cl_idx == tb->nr_clients - 1) {
+		tb->nr_clients--;
+	} else {
+		clients[cl_idx] = clients[tb->nr_clients - 1];
+		tb->nr_clients--;
+	}
+
+	/*
+	 * Don't realloc() with 0 size, it's not portable.
+	 */
+	if (tb->nr_clients > 0) {
+		struct client_state **tmp;
+
+		/*
+		 * Fail to realloc() is fine, we're just shrinking the array.
+		 */
+		tmp = realloc(tb->clients, sizeof(*tb->clients) * tb->nr_clients);
+		if (tmp)
+			tb->clients = tmp;
+	}
+
+	pthread_mutex_unlock(&tb->lock);
+	put_token_bucket(w, &c->client_addr);
+	pthread_mutex_unlock(&w->ctx->rl.lock);
+	(void)found;
+	return 0;
+}
+
+static int start_rate_limit(struct server_wrk *w, struct client_state *c)
+{
+	struct rate_limit *rl = &w->ctx->rl;
+	struct token_bucket *tb;
+	int ret = 0;
+
+	pthread_mutex_lock(&rl->lock);
+	tb = find_token_bucket(w->ctx, &c->client_addr);
+	if (!tb) {
+		tb = create_token_bucket(w, &c->client_addr);
+		if (!tb) {
+			ret = -ENOMEM;
+			goto out;
+		}
+	}
+
+	ret = add_client_to_tbucket(tb, c);
+	if (ret)
+		put_token_bucket(w, &c->client_addr);
+out:
+	pthread_mutex_unlock(&rl->lock);
+	if (ret)
+		return ret;
+
+	c->tbucket = tb;
+	return 0;
+}
+
+/*
+ * For better management of rate limiter, clients
+ * with the same IP address are grouped into the
+ * same worker thread.
+ */
+static struct server_wrk *pick_worker_for_new_conn(struct server_ctx *ctx,
+						   struct sockaddr_in46 *taddr)
 {
 	struct server_wrk *w = NULL;
+	struct token_bucket *tb;
 	uint32_t i, min;
 
+	pthread_mutex_lock(&ctx->rl.lock);
+	tb = find_token_bucket(ctx, taddr);
+	if (tb) {
+		w = tb->wrk;
+		pthread_mutex_unlock(&ctx->rl.lock);
+		return w;
+	}
+	pthread_mutex_unlock(&ctx->rl.lock);
+
+	pr_debug("Picking a new worker for new connection to %s", sockaddr_to_str(taddr));
 	w = &ctx->workers[0];
 	min = atomic_load(&ctx->workers[0].nr_active_clients);
 	for (i = 1; i < ctx->cfg.nr_workers; i++) {
@@ -1093,7 +1488,8 @@ static int give_client_fd_to_a_worker(struct server_ctx *ctx, int fd,
 	struct server_wrk *w;
 	int ret;
 
-	w = pick_worker_for_new_conn(ctx);
+	w = pick_worker_for_new_conn(ctx, addr);
+	printf("worker = %p\n", w);
 	c = get_free_client_slot(w);
 	if (!c) {
 		pr_error("No free client slots, closing connection... (thread %u)", w->idx);
@@ -1103,6 +1499,12 @@ static int give_client_fd_to_a_worker(struct server_ctx *ctx, int fd,
 	c->client_fd = fd;
 	c->client_addr = *addr;
 	ret = prepare_target_connect(w, c);
+	if (ret) {
+		put_client_slot(w, c);
+		return ret;
+	}
+
+	ret = start_rate_limit(w, c);
 	if (ret) {
 		put_client_slot(w, c);
 		return ret;
@@ -1190,6 +1592,8 @@ static int handle_target_connect_event(struct server_wrk *w, struct epoll_event 
 		return ret;
 	}
 
+	c->cbuf_len = 0;
+	c->tbuf_len = 0;
 	c->cbuf = malloc(SPLICE_BUF_SIZE);
 	c->tbuf = malloc(SPLICE_BUF_SIZE);
 	if (unlikely(!c->cbuf || !c->tbuf)) {
@@ -1198,8 +1602,6 @@ static int handle_target_connect_event(struct server_wrk *w, struct epoll_event 
 		return -ENOMEM;
 	}
 
-	c->cbuf_len = 0;
-	c->tbuf_len = 0;
 	pr_debug("Forward connection established from %s to %s (thread %u)",
 		 sockaddr_to_str(&c->client_addr),
 		 sockaddr_to_str(&w->ctx->cfg.target_addr), w->idx);
@@ -1211,15 +1613,22 @@ struct splice_buf {
 	char *buf;
 	size_t cur_len;
 	size_t max_len;
+	size_t max_recv;
+	size_t max_send;
 };
 
 static ssize_t do_splice(int src_fd, int dst_fd, struct splice_buf *sb)
 {
 	size_t recv_len;
+	size_t send_len;
 	ssize_t ret;
 
 	recv_len = sb->max_len - sb->cur_len;
+	if (recv_len > sb->max_recv)
+		recv_len = sb->max_recv;
+
 	if (recv_len > 0) {
+
 		ret = recv(src_fd, sb->buf + sb->cur_len, recv_len, MSG_DONTWAIT);
 		if (ret < 0) {
 			ret = errno;
@@ -1240,7 +1649,14 @@ do_send:
 	if (sb->cur_len == 0)
 		return 0;
 
-	ret = send(dst_fd, sb->buf, sb->cur_len, MSG_DONTWAIT);
+	send_len = sb->cur_len;
+	if (send_len > sb->max_send)
+		send_len = sb->max_send;
+
+	if (send_len == 0)
+		return 0;
+
+	ret = send(dst_fd, sb->buf, send_len, MSG_DONTWAIT);
 	if (ret < 0) {
 		ret = errno;
 		if (ret == EAGAIN)
@@ -1260,12 +1676,63 @@ do_send:
 	return ret;
 }
 
+static size_t get_max_rw_size(struct client_state *c)
+{
+	struct token_bucket *tb = c->tbucket;
+	size_t cur_token = atomic_load(&tb->cur_tokens);
+	size_t nr_clients = tb->nr_clients;
+
+	assert(cur_token <= tb->max_tokens);
+	return cur_token / nr_clients;
+}
+
+static size_t consume_client_token(struct client_state *c, size_t csize)
+{
+	struct token_bucket *tb = c->tbucket;
+
+	pthread_mutex_lock(&tb->lock);
+	if (tb->cur_tokens < csize)
+		atomic_store(&tb->cur_tokens, 0u);
+	else
+		atomic_fetch_sub(&tb->cur_tokens, csize);
+	pthread_mutex_unlock(&tb->lock);
+	return 0;
+}
+
+static int mark_client_rate_limited(struct server_wrk *w, struct client_state *c)
+{
+	union epoll_data data;
+	int ret;
+
+	c->rate_limited = true;
+
+	if (c->cpoll_mask) {
+		data.ptr = c;
+		data.u64 |= EPOLL_CLIENT_EVENT_MASK;
+		c->cpoll_mask = 0;
+		ret = epoll_mod(w, c->client_fd, c->cpoll_mask, data);
+		assert(!ret);
+	}
+
+	if (c->tpoll_mask) {
+		data.ptr = c;
+		data.u64 |= EPOLL_TARGET_EVENT_MASK;
+		c->tpoll_mask = 0;
+		ret = epoll_mod(w, c->target_fd, c->tpoll_mask, data);
+		assert(!ret);
+	}
+
+	(void)ret;
+	return 0;
+}
+
 static int handle_target_event(struct server_wrk *w, struct epoll_event *ev)
 {
 	struct client_state *c = ev->data.ptr;
 	uint32_t events = ev->events;
 	union epoll_data data;
 	struct splice_buf sb;
+	size_t max_rw;
 	ssize_t ret;
 	int err;
 
@@ -1275,16 +1742,23 @@ static int handle_target_event(struct server_wrk *w, struct epoll_event *ev)
 		return 0;
 	}
 
+	max_rw = get_max_rw_size(c);
+	if (!max_rw)
+		return mark_client_rate_limited(w, c);
+
 	if (events & EPOLLIN) {
 		sb.buf = c->tbuf;
 		sb.cur_len = c->tbuf_len;
 		sb.max_len = SPLICE_BUF_SIZE;
+		sb.max_recv = max_rw;
+		sb.max_send = max_rw;
 		ret = do_splice(c->target_fd, c->client_fd, &sb);
 		if (ret < 0) {
 			put_client_slot(w, c);
 			return 0;
 		}
 
+		consume_client_token(c, (size_t)ret);
 		c->tbuf_len = sb.cur_len;
 		if (c->tbuf_len > 0) {
 			/*
@@ -1315,12 +1789,15 @@ static int handle_target_event(struct server_wrk *w, struct epoll_event *ev)
 		sb.buf = c->cbuf;
 		sb.cur_len = c->cbuf_len;
 		sb.max_len = SPLICE_BUF_SIZE;
+		sb.max_recv = max_rw;
+		sb.max_send = max_rw;
 		ret = do_splice(c->client_fd, c->target_fd, &sb);
 		if (ret < 0) {
 			put_client_slot(w, c);
 			return 0;
 		}
 
+		consume_client_token(c, (size_t)ret);
 		c->cbuf_len = sb.cur_len;
 		if (c->cbuf_len == 0) {
 			/*
@@ -1356,6 +1833,7 @@ static int handle_client_event(struct server_wrk *w, struct epoll_event *ev)
 	uint32_t events = ev->events;
 	union epoll_data data;
 	struct splice_buf sb;
+	size_t max_rw;
 	ssize_t ret;
 	int err;
 
@@ -1365,16 +1843,23 @@ static int handle_client_event(struct server_wrk *w, struct epoll_event *ev)
 		return 0;
 	}
 
+	max_rw = get_max_rw_size(c);
+	if (!max_rw)
+		return mark_client_rate_limited(w, c);
+
 	if (events & EPOLLIN) {
 		sb.buf = c->cbuf;
 		sb.cur_len = c->cbuf_len;
 		sb.max_len = SPLICE_BUF_SIZE;
+		sb.max_recv = max_rw;
+		sb.max_send = max_rw;
 		ret = do_splice(c->client_fd, c->target_fd, &sb);
 		if (ret < 0) {
 			put_client_slot(w, c);
 			return 0;
 		}
 
+		consume_client_token(c, (size_t)ret);
 		c->cbuf_len = sb.cur_len;
 		if (c->cbuf_len > 0) {
 			/*
@@ -1405,12 +1890,15 @@ static int handle_client_event(struct server_wrk *w, struct epoll_event *ev)
 		sb.buf = c->tbuf;
 		sb.cur_len = c->tbuf_len;
 		sb.max_len = SPLICE_BUF_SIZE;
+		sb.max_recv = max_rw;
+		sb.max_send = max_rw;
 		ret = do_splice(c->target_fd, c->client_fd, &sb);
 		if (ret < 0) {
 			put_client_slot(w, c);
 			return 0;
 		}
 
+		consume_client_token(c, (size_t)ret);
 		c->tbuf_len = sb.cur_len;
 		if (c->tbuf_len == 0) {
 			/*
@@ -1440,6 +1928,67 @@ static int handle_client_event(struct server_wrk *w, struct epoll_event *ev)
 	return 0;
 }
 
+static int fill_token_bucket(struct server_wrk *w, struct token_bucket *tb)
+{
+	uint32_t i;
+
+	pthread_mutex_lock(&tb->lock);
+	tb->cur_tokens += tb->max_tokens / 2;
+	if (tb->cur_tokens > tb->max_tokens)
+		tb->cur_tokens = tb->max_tokens;
+
+	for (i = 0; i < tb->nr_clients; i++) {
+		struct client_state *c = tb->clients[i];
+		union epoll_data data;
+		int ret;
+
+		if (!c->rate_limited)
+			continue;
+
+		data.ptr = c;
+		data.u64 |= EPOLL_TARGET_EVENT_MASK;
+		c->tpoll_mask |= EPOLLIN;
+		ret = epoll_mod(w, c->target_fd, c->tpoll_mask, data);
+		assert(!ret);
+
+		data.ptr = c;
+		data.u64 |= EPOLL_CLIENT_EVENT_MASK;
+		c->cpoll_mask |= EPOLLIN;
+		ret = epoll_mod(w, c->client_fd, c->cpoll_mask, data);
+		assert(!ret);
+		(void)ret;
+	}
+
+	tb->last_update = get_time_ms();
+	pthread_mutex_unlock(&tb->lock);
+	return 0;
+}
+
+static int handle_timer_event(struct server_wrk *w, struct epoll_event *ev)
+{
+	struct token_bucket *tb = ev->data.ptr;
+	uint64_t nr_exps;
+	int ret;
+
+	ret = read(tb->timer_fd, &nr_exps, sizeof(nr_exps));
+	if (unlikely(ret < 0)) {
+		ret = errno;
+		if (ret == EAGAIN)
+			return 0;
+
+		pr_error("Failed to read timer FD: %s", strerror(ret));
+		return -ret;
+	}
+
+	if (unlikely(ret != sizeof(nr_exps))) {
+		pr_error("Failed to read timer FD: short read");
+		return -EIO;
+	}
+
+	pr_debug("Timer expired for %s (%llu)", sockaddr_to_str(&tb->addr), (unsigned long long)nr_exps);
+	return fill_token_bucket(w, tb);
+}
+
 static int handle_event(struct server_wrk *w, struct epoll_event *ev)
 {
 	uint64_t mask;
@@ -1461,6 +2010,9 @@ static int handle_event(struct server_wrk *w, struct epoll_event *ev)
 
 	if (mask == EPOLL_CLIENT_EVENT_MASK)
 		return handle_client_event(w, ev);
+
+	if (mask == EPOLL_TIMER_EVENT_MASK)
+		return handle_timer_event(w, ev);
 
 	return 0;
 }

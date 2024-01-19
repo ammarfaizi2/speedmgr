@@ -3,6 +3,8 @@
 #ifndef SPEEDMGR__IP_MAP_H
 #define SPEEDMGR__IP_MAP_H
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
