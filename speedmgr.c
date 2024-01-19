@@ -150,11 +150,14 @@ struct server_cfg {
 	uint32_t		nr_workers;
 	struct sockaddr_in46	bind_addr;
 	struct sockaddr_in46	target_addr;
+	uint64_t		nbytes;
+	uint64_t		interval;
 };
 
 struct server_ctx {
 	volatile bool		should_stop;
 	volatile bool		accept_stopped;
+	bool			using_rate_limit;
 	int			tcp_fd;
 	struct server_wrk	*workers;
 	struct rate_limit	rl;
@@ -192,6 +195,8 @@ struct option long_options[] = {
 	{ "target",	required_argument,	NULL,	't' },
 	{ "verbose",	no_argument,		NULL,	'v' },
 	{ "backlog",	required_argument,	NULL,	'B' },
+	{ "nbytes",	required_argument,	NULL,	'n' },
+	{ "interval",	required_argument,	NULL,	'i' },
 	{ NULL,		0,			NULL,	0 },
 };
 
@@ -212,8 +217,11 @@ static void show_help(const char *app)
 	printf("  -w, --workers <number>\tNumber of workers\n");
 	printf("  -b, --bind ip:port\t\tBind to IP and port\n");
 	printf("  -t, --target ip:port\t\tTarget IP and port\n");
-	printf("  -V, --verbose\t\t\tVerbose output\n\n");
-	printf("  -B, --backlog <number>\tTCP backlog\n\n");
+	printf("  -V, --verbose\t\t\tVerbose output\n");
+	printf("  -B, --backlog <number>\tTCP backlog (default: 64)\n\n");
+	printf("Rate limiting options:\n");
+	printf("  -i  --interval <number>\tInterval in milliseconds\n");
+	printf("  -n  --nbytes <number>\t\tMaximum number of bytes to send per interval per IP\n\n");
 }
 
 static int parse_addr_and_port(const char *str, struct sockaddr_in46 *out)
@@ -289,16 +297,20 @@ static int parse_args(int argc, char *argv[], struct server_cfg *cfg)
 	struct parse_state {
 		bool got_bind_addr;
 		bool got_target_addr;
+		bool got_nbytes;
+		bool got_interval;
 	} p;
 
 	cfg->backlog = 64;
 	cfg->nr_workers = 4;
+	cfg->nbytes = 0;
+	cfg->interval = 0;
 
 	memset(&p, 0, sizeof(p));
 	while (1) {
 		int c, tmp;
 
-		c = getopt_long(argc, argv, "hVw:b:t:vB:", long_options, NULL);
+		c = getopt_long(argc, argv, "hVw:b:t:vB:n:i:", long_options, NULL);
 		if (c == -1)
 			break;
 
@@ -340,6 +352,14 @@ static int parse_args(int argc, char *argv[], struct server_cfg *cfg)
 			}
 			cfg->backlog = tmp;
 			break;
+		case 'n':
+			p.got_nbytes = true;
+			cfg->nbytes = strtoull(optarg, NULL, 10);
+			break;
+		case 'i':
+			p.got_interval = true;
+			cfg->interval = strtoull(optarg, NULL, 10);
+			break;
 		case '?':
 			show_help(argv[0]);
 			exit(EXIT_FAILURE);
@@ -359,6 +379,20 @@ static int parse_args(int argc, char *argv[], struct server_cfg *cfg)
 
 	if (!p.got_target_addr) {
 		pr_error("Missing target address (the -t option)");
+		show_help(argv[0]);
+		return -EINVAL;
+	}
+
+	if (p.got_nbytes && !p.got_interval) {
+		pr_error("Missing interval (the -i option)");
+		pr_error("The -n option requires the -i option");
+		show_help(argv[0]);
+		return -EINVAL;
+	}
+
+	if (!p.got_nbytes && p.got_interval) {
+		pr_error("Missing number of bytes (the -n option)");
+		pr_error("The -i option requires the -n option");
 		show_help(argv[0]);
 		return -EINVAL;
 	}
@@ -926,8 +960,13 @@ static void put_client_slot(struct server_wrk *w, struct client_state *c)
 		send_event_fd(&w->ctx->workers[0]);
 	}
 
-	assert(c->tbucket);
-	del_client_from_tbucket(w, c);
+	if (w->ctx->using_rate_limit) {
+		assert(c->tbucket);
+		del_client_from_tbucket(w, c);
+		c->tbucket = NULL;
+	} else {
+		assert(!c->tbucket);
+	}
 
 	c->rate_limited = false;
 	w->handle_events_should_stop = hess;
@@ -1071,6 +1110,7 @@ static int init_ctx(struct server_ctx *ctx)
 		return ret;
 	}
 
+	ctx->using_rate_limit = (ctx->cfg.nbytes > 0 && ctx->cfg.interval > 0);
 	ret = init_workers(ctx);
 	if (ret) {
 		free_socket(ctx);
@@ -1153,6 +1193,12 @@ static struct token_bucket *find_token_bucket(struct server_ctx *ctx,
 	return tb;
 }
 
+static void ms_to_timespec(uint64_t ms, struct timespec *ts)
+{
+	ts->tv_sec = ms / 1000;
+	ts->tv_nsec = (ms % 1000) * 1000000;
+}
+
 static int start_ip_bucket_timer(struct server_wrk *w, struct token_bucket *tb)
 	__must_hold(&w->ctx->rl.lock)
 {
@@ -1176,11 +1222,7 @@ static int start_ip_bucket_timer(struct server_wrk *w, struct token_bucket *tb)
 	}
 
 	tb->timer_fd = ret;
-	/*
-	 * Every 0.5 seconds.
-	 */
-	its.it_interval.tv_sec = 0;
-	its.it_interval.tv_nsec = 500000000;
+	ms_to_timespec(w->ctx->cfg.interval, &its.it_interval);
 	its.it_value.tv_sec = now.tv_sec + 1;
 	its.it_value.tv_nsec = now.tv_nsec;
 	ret = timerfd_settime(tb->timer_fd, TFD_TIMER_ABSTIME, &its, NULL);
@@ -1233,8 +1275,8 @@ static struct token_bucket *create_token_bucket(struct server_wrk *w,
 	}
 
 	tb->addr = *addr;
-	tb->cur_tokens = 1024*1024*5;
-	tb->max_tokens = 1024*1024*5;
+	tb->cur_tokens = w->ctx->cfg.nbytes;
+	tb->max_tokens = w->ctx->cfg.nbytes;
 	tb->last_update = get_time_ms();
 	tb->refcnt = 0;
 	tb->clients = NULL;
@@ -1489,7 +1531,6 @@ static int give_client_fd_to_a_worker(struct server_ctx *ctx, int fd,
 	int ret;
 
 	w = pick_worker_for_new_conn(ctx, addr);
-	printf("worker = %p\n", w);
 	c = get_free_client_slot(w);
 	if (!c) {
 		pr_error("No free client slots, closing connection... (thread %u)", w->idx);
@@ -1504,10 +1545,12 @@ static int give_client_fd_to_a_worker(struct server_ctx *ctx, int fd,
 		return ret;
 	}
 
-	ret = start_rate_limit(w, c);
-	if (ret) {
-		put_client_slot(w, c);
-		return ret;
+	if (ctx->using_rate_limit) {
+		ret = start_rate_limit(w, c);
+		if (ret) {
+			put_client_slot(w, c);
+			return ret;
+		}
 	}
 
 	atomic_fetch_add(&w->nr_active_clients, 1u);
@@ -1742,9 +1785,13 @@ static int handle_target_event(struct server_wrk *w, struct epoll_event *ev)
 		return 0;
 	}
 
-	max_rw = get_max_rw_size(c);
-	if (!max_rw)
-		return mark_client_rate_limited(w, c);
+	if (w->ctx->using_rate_limit) {
+		max_rw = get_max_rw_size(c);
+		if (!max_rw)
+			return mark_client_rate_limited(w, c);
+	} else {
+		max_rw = SPLICE_BUF_SIZE;
+	}
 
 	if (events & EPOLLIN) {
 		sb.buf = c->tbuf;
@@ -1758,7 +1805,9 @@ static int handle_target_event(struct server_wrk *w, struct epoll_event *ev)
 			return 0;
 		}
 
-		consume_client_token(c, (size_t)ret);
+		if (w->ctx->using_rate_limit)
+			consume_client_token(c, (size_t)ret);
+
 		c->tbuf_len = sb.cur_len;
 		if (c->tbuf_len > 0) {
 			/*
@@ -1797,7 +1846,9 @@ static int handle_target_event(struct server_wrk *w, struct epoll_event *ev)
 			return 0;
 		}
 
-		consume_client_token(c, (size_t)ret);
+		if (w->ctx->using_rate_limit)
+			consume_client_token(c, (size_t)ret);
+
 		c->cbuf_len = sb.cur_len;
 		if (c->cbuf_len == 0) {
 			/*
@@ -1843,9 +1894,13 @@ static int handle_client_event(struct server_wrk *w, struct epoll_event *ev)
 		return 0;
 	}
 
-	max_rw = get_max_rw_size(c);
-	if (!max_rw)
-		return mark_client_rate_limited(w, c);
+	if (w->ctx->using_rate_limit) {
+		max_rw = get_max_rw_size(c);
+		if (!max_rw)
+			return mark_client_rate_limited(w, c);
+	} else {
+		max_rw = SPLICE_BUF_SIZE;
+	}
 
 	if (events & EPOLLIN) {
 		sb.buf = c->cbuf;
@@ -1859,7 +1914,9 @@ static int handle_client_event(struct server_wrk *w, struct epoll_event *ev)
 			return 0;
 		}
 
-		consume_client_token(c, (size_t)ret);
+		if (w->ctx->using_rate_limit)
+			consume_client_token(c, (size_t)ret);
+
 		c->cbuf_len = sb.cur_len;
 		if (c->cbuf_len > 0) {
 			/*
@@ -1898,7 +1955,9 @@ static int handle_client_event(struct server_wrk *w, struct epoll_event *ev)
 			return 0;
 		}
 
-		consume_client_token(c, (size_t)ret);
+		if (w->ctx->using_rate_limit)
+			consume_client_token(c, (size_t)ret);
+
 		c->tbuf_len = sb.cur_len;
 		if (c->tbuf_len == 0) {
 			/*
@@ -1932,6 +1991,7 @@ static int fill_token_bucket(struct server_wrk *w, struct token_bucket *tb)
 {
 	uint32_t i;
 
+	assert(w->ctx->using_rate_limit);
 	pthread_mutex_lock(&tb->lock);
 	tb->cur_tokens += tb->max_tokens / 2;
 	if (tb->cur_tokens > tb->max_tokens)
