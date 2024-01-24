@@ -33,7 +33,7 @@
 static volatile bool *g_stop;
 static uint8_t g_verbose;
 
-#if 1
+#if 0
 #define pr_debug(fmt, ...) printf("debug %d: " fmt "\n", gettid(), ##__VA_ARGS__)
 #else
 #define pr_debug(fmt, ...) do { } while (0)
@@ -1993,10 +1993,8 @@ static int fill_token_bucket(struct server_wrk *w, struct token_bucket *tb)
 
 	assert(w->ctx->using_rate_limit);
 	pthread_mutex_lock(&tb->lock);
-	tb->cur_tokens += tb->max_tokens / 2;
-	if (tb->cur_tokens > tb->max_tokens)
-		tb->cur_tokens = tb->max_tokens;
 
+	tb->cur_tokens = tb->max_tokens;
 	for (i = 0; i < tb->nr_clients; i++) {
 		struct client_state *c = tb->clients[i];
 		union epoll_data data;
