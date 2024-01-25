@@ -33,6 +33,7 @@
 #define SPEEDMGR_DEBUG		1
 #define NR_CLIENTS		4096
 #define NR_INIT_BUCKETS		4
+#define SPLICE_BUF_SIZE		8192
 
 #ifndef SO_ORIGINAL_DST
 #define SO_ORIGINAL_DST		80
@@ -642,6 +643,12 @@ static int init_socket_tcp(struct server_ctx *ctx)
 		len = sizeof(ctx->cfg.tcp_bind_addr.in6);
 	else
 		len = sizeof(ctx->cfg.tcp_bind_addr.in4);
+
+#ifdef SO_REUSEADDR
+	ret = 1;
+	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &ret, sizeof(ret));
+	setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &ret, sizeof(ret));
+#endif
 
 	ret = bind(fd, &ctx->cfg.tcp_bind_addr.sa, len);
 	if (ret) {
@@ -1331,7 +1338,7 @@ static void rearm_tcp_accept(struct server_ctx *ctx)
 static void put_client_slot(struct server_wrk *w, struct client_state *c)
 {
 	bool handle_events_should_break = false;
-	int ret;
+	int ret, tmp;
 
 	if (c->cbuf) {
 		free(c->cbuf);
@@ -1350,18 +1357,23 @@ static void put_client_slot(struct server_wrk *w, struct client_state *c)
 	}
 
 	if (c->client_fd >= 0) {
+		pr_vinfo("Closing a client connection (src=%s, thread=%u)",
+			 sockaddr_to_str(&c->client_addr), w->idx);
+
+		tmp = -c->client_fd;
 		ret = epoll_del(w, c->client_fd);
 		assert(!ret);
 		close_fd_p(&c->client_fd);
-		c->client_fd *= -1;
+		c->client_fd = tmp;
 		handle_events_should_break = true;
 	}
 
 	if (c->target_fd >= 0) {
+		tmp = -c->target_fd;
 		ret = epoll_del(w, c->target_fd);
 		assert(!ret);
 		close_fd_p(&c->target_fd);
-		c->target_fd *= -1;
+		c->target_fd = tmp;
 		handle_events_should_break = true;
 	}
 
@@ -1449,7 +1461,7 @@ static int prepare_tcp_target_connect(struct server_wrk *w, struct client_state 
 
 	data.ptr = c;
 	data.u64 |= EPL_DT_MASK_CLIENT_TCP_DATA;
-	c->cpoll_mask = EPOLLIN;
+	c->cpoll_mask = 0;
 	ret = epoll_add(w, c->client_fd, c->cpoll_mask, data);
 	if (ret) {
 		pr_error("Failed to add target FD to epoll: %s", strerror(ret));
@@ -1593,6 +1605,324 @@ static int handle_event_event_fd(struct server_wrk *w, struct epoll_event *ev)
 	return 0;
 }
 
+static int handle_event_tcp_target_connect(struct server_wrk *w, struct epoll_event *ev)
+{
+	struct client_state *c = ev->data.ptr;
+	struct sockaddr_in46 target_addr;
+	uint32_t events = ev->events;
+	union epoll_data data;
+	socklen_t len;
+	int ret, tmp;
+
+	if (unlikely(events & (EPOLLERR | EPOLLHUP))) {
+		pr_error("Target connect failed, hit {EPOLLERR | EPOLLHUP}: 0x%x (thread %u)", events, w->idx);
+		put_client_slot(w, c);
+		return 0;
+	}
+
+	tmp = 0;
+	len = sizeof(tmp);
+	ret = getsockopt(c->target_fd, SOL_SOCKET, SO_ERROR, &tmp, &len);
+	if (unlikely(tmp || !(events & EPOLLOUT))) {
+		if (tmp < 0)
+			tmp = -tmp;
+		pr_error("Failed to get target socket error: %s (thread %u)", strerror(tmp), w->idx);
+		put_client_slot(w, c);
+		return 0;
+	}
+
+	data.ptr = c;
+	data.u64 |= EPL_DT_MASK_TARGET_TCP_DATA;
+	c->tpoll_mask = EPOLLIN;
+	ret = epoll_mod(w, c->target_fd, c->tpoll_mask, data);
+	if (ret) {
+		put_client_slot(w, c);
+		return ret;
+	}
+
+	data.ptr = c;
+	data.u64 |= EPL_DT_MASK_CLIENT_TCP_DATA;
+	c->cpoll_mask = EPOLLIN;
+	ret = epoll_mod(w, c->client_fd, c->cpoll_mask, data);
+	if (ret) {
+		put_client_slot(w, c);
+		return ret;
+	}
+
+	c->cbuf_len = 0;
+	c->tbuf_len = 0;
+	c->cbuf = malloc(SPLICE_BUF_SIZE);
+	c->tbuf = malloc(SPLICE_BUF_SIZE);
+	if (unlikely(!c->cbuf || !c->tbuf)) {
+		pr_error("Failed to allocate splice buffers: %s (thread %u)", strerror(errno), w->idx);
+		put_client_slot(w, c);
+		return -ENOMEM;
+	}
+
+	if (c->client_addr.sa.sa_family == AF_INET6)
+		len = sizeof(c->client_addr.in6);
+	else
+		len = sizeof(c->client_addr.in4);
+
+	memset(&target_addr, 0, sizeof(target_addr));
+	getpeername(c->target_fd, &target_addr.sa, &len);
+
+	pr_debug("Forwarding connection from %s to %s has been established (thread %u)",
+		 sockaddr_to_str(&c->client_addr), sockaddr_to_str(&target_addr), w->idx);
+	return 0;
+}
+
+struct tcp_splice_buf {
+	char *buf;
+	size_t cur_len;
+	size_t max_len;
+	size_t max_recv;
+	size_t max_send;
+};
+
+static ssize_t do_tcp_splice(int src_fd, int dst_fd, struct tcp_splice_buf *sb)
+{
+	size_t recv_len;
+	size_t send_len;
+	ssize_t ret = 0;
+
+	recv_len = sb->max_len - sb->cur_len;
+	if (recv_len > sb->max_recv)
+		recv_len = sb->max_recv;
+
+	if (recv_len > 0) {
+		ret = recv(src_fd, sb->buf + sb->cur_len, recv_len, MSG_DONTWAIT);
+		if (ret < 0) {
+			ret = errno;
+			if (ret == EAGAIN)
+				goto do_send;
+
+			pr_verror("Failed to read from FD %d: %s", src_fd, strerror(ret));
+			return -ret;
+		}
+
+		if (ret == 0)
+			return -EIO;
+
+		sb->cur_len += (size_t)ret;
+	}
+
+do_send:
+	if (sb->cur_len == 0)
+		return 0;
+
+	send_len = sb->cur_len;
+	if (send_len > sb->max_send)
+		send_len = sb->max_send;
+
+	if (send_len > 0) {
+		ret = send(dst_fd, sb->buf, send_len, MSG_DONTWAIT);
+		if (ret < 0) {
+			ret = errno;
+			if (ret == EAGAIN)
+				return 0;
+
+			pr_verror("Failed to write to FD %d: %s", dst_fd, strerror(ret));
+			return -ret;
+		}
+
+		if (ret == 0)
+			return -EIO;
+
+		sb->cur_len -= (size_t)ret;
+		if (sb->cur_len > 0)
+			memmove(sb->buf, sb->buf + ret, sb->cur_len);
+	}
+
+	return ret;
+}
+
+static int handle_event_tcp_target_data(struct server_wrk *w, struct epoll_event *ev)
+{
+	struct client_state *c = ev->data.ptr;
+	uint32_t events = ev->events;
+	struct tcp_splice_buf sb;
+	union epoll_data data;
+	ssize_t ret;
+	int err;
+
+	if (unlikely(events & (EPOLLERR | EPOLLHUP))) {
+		put_client_slot(w, c);
+		return 0;
+	}
+
+	if (events & EPOLLIN) {
+		sb.buf = c->tbuf;
+		sb.cur_len = c->tbuf_len;
+		sb.max_len = SPLICE_BUF_SIZE;
+		sb.max_recv = sb.max_len;
+		sb.max_send = sb.max_len;
+		ret = do_tcp_splice(c->target_fd, c->client_fd, &sb);
+		if (unlikely(ret < 0)) {
+			put_client_slot(w, c);
+			return 0;
+		}
+
+		c->tbuf_len = sb.cur_len;
+		if (c->tbuf_len > 0) {
+			/*
+			 * Client is not ready to receive more data, so we
+			 * need to wait for EPOLLOUT.
+			 */
+			data.ptr = c;
+			data.u64 |= EPL_DT_MASK_CLIENT_TCP_DATA;
+			c->cpoll_mask |= EPOLLOUT;
+			err = epoll_mod(w, c->client_fd, c->cpoll_mask, data);
+			assert(!err);
+		}
+
+		if (c->tbuf_len == SPLICE_BUF_SIZE) {
+			/*
+			 * Target buffer is full, stop reading from target
+			 * until we have more space.
+			 */
+			data.ptr = c;
+			data.u64 |= EPL_DT_MASK_TARGET_TCP_DATA;
+			c->tpoll_mask &= ~EPOLLIN;
+			err = epoll_mod(w, c->target_fd, c->tpoll_mask, data);
+			assert(!err);
+		}
+	}
+
+	if (events & EPOLLOUT) {
+		sb.buf = c->cbuf;
+		sb.cur_len = c->cbuf_len;
+		sb.max_len = SPLICE_BUF_SIZE;
+		sb.max_recv = sb.max_len;
+		sb.max_send = sb.max_len;
+		ret = do_tcp_splice(c->client_fd, c->target_fd, &sb);
+		if (unlikely(ret < 0)) {
+			put_client_slot(w, c);
+			return 0;
+		}
+
+		c->cbuf_len = sb.cur_len;
+		if (c->cbuf_len == 0) {
+			/*
+			 * Buffer is fully flushed to the target, stop
+			 * the EPOLLOUT event.
+			 */
+			data.ptr = c;
+			data.u64 |= EPL_DT_MASK_TARGET_TCP_DATA;
+			c->tpoll_mask &= ~EPOLLOUT;
+			err = epoll_mod(w, c->target_fd, c->tpoll_mask, data);
+			assert(!err);
+		}
+
+		if (c->cbuf_len < SPLICE_BUF_SIZE && !(c->cpoll_mask & EPOLLIN)) {
+			/*
+			 * Client is ready to receive more data, start
+			 * reading from client again.
+			 */
+			data.ptr = c;
+			data.u64 |= EPL_DT_MASK_CLIENT_TCP_DATA;
+			c->cpoll_mask |= EPOLLIN;
+			err = epoll_mod(w, c->client_fd, c->cpoll_mask, data);
+			assert(!err);
+		}
+	}
+
+	return 0;
+}
+
+static int handle_event_tcp_client_data(struct server_wrk *w, struct epoll_event *ev)
+{
+	struct client_state *c = ev->data.ptr;
+	uint32_t events = ev->events;
+	struct tcp_splice_buf sb;
+	union epoll_data data;
+	ssize_t ret;
+	int err;
+
+	if (unlikely(events & (EPOLLERR | EPOLLHUP))) {
+		put_client_slot(w, c);
+		return 0;
+	}
+
+	if (events & EPOLLIN) {
+		sb.buf = c->cbuf;
+		sb.cur_len = c->cbuf_len;
+		sb.max_len = SPLICE_BUF_SIZE;
+		sb.max_recv = sb.max_len;
+		sb.max_send = sb.max_len;
+		ret = do_tcp_splice(c->client_fd, c->target_fd, &sb);
+		if (unlikely(ret < 0)) {
+			put_client_slot(w, c);
+			return 0;
+		}
+
+		c->cbuf_len = sb.cur_len;
+		if (c->cbuf_len > 0) {
+			/*
+			 * Target is not ready to receive more data, so we
+			 * need to wait for EPOLLOUT.
+			 */
+			data.ptr = c;
+			data.u64 |= EPL_DT_MASK_TARGET_TCP_DATA;
+			c->tpoll_mask |= EPOLLOUT;
+			err = epoll_mod(w, c->target_fd, c->tpoll_mask, data);
+			assert(!err);
+		}
+
+		if (c->cbuf_len == SPLICE_BUF_SIZE) {
+			/*
+			 * Client buffer is full, stop reading from client
+			 * until we have more space.
+			 */
+			data.ptr = c;
+			data.u64 |= EPL_DT_MASK_CLIENT_TCP_DATA;
+			c->cpoll_mask &= ~EPOLLIN;
+			err = epoll_mod(w, c->client_fd, c->cpoll_mask, data);
+			assert(!err);
+		}
+	}
+
+	if (events & EPOLLOUT) {
+		sb.buf = c->tbuf;
+		sb.cur_len = c->tbuf_len;
+		sb.max_len = SPLICE_BUF_SIZE;
+		sb.max_recv = sb.max_len;
+		sb.max_send = sb.max_len;
+		ret = do_tcp_splice(c->target_fd, c->client_fd, &sb);
+		if (unlikely(ret < 0)) {
+			put_client_slot(w, c);
+			return 0;
+		}
+
+		c->tbuf_len = sb.cur_len;
+		if (c->tbuf_len == 0) {
+			/*
+			 * Buffer is fully flushed to the client, stop
+			 * the EPOLLOUT event.
+			 */
+			data.ptr = c;
+			data.u64 |= EPL_DT_MASK_CLIENT_TCP_DATA;
+			c->cpoll_mask &= ~EPOLLOUT;
+			err = epoll_mod(w, c->client_fd, c->cpoll_mask, data);
+			assert(!err);
+		}
+
+		if (c->tbuf_len < SPLICE_BUF_SIZE && !(c->tpoll_mask & EPOLLIN)) {
+			/*
+			 * Target is ready to receive more data, start
+			 * reading from target again.
+			 */
+			data.ptr = c;
+			data.u64 |= EPL_DT_MASK_TARGET_TCP_DATA;
+			c->tpoll_mask |= EPOLLIN;
+			err = epoll_mod(w, c->target_fd, c->tpoll_mask, data);
+			assert(!err);
+		}
+	}
+
+	return 0;
+}
+
 static int poll_events(struct server_wrk *w)
 {
 	int ret;
@@ -1629,13 +1959,11 @@ static int handle_event(struct server_wrk *w, struct epoll_event *ev)
 
 	switch (mask) {
 	case EPL_DT_MASK_CLIENT_TCP_DATA:
-		printf("TCP data\n");
-		return 0;
+		return handle_event_tcp_client_data(w, ev);
 	case EPL_DT_MASK_TARGET_TCP_CONNECT:
-		printf("TCP connect\n");
-		return 0;
+		return handle_event_tcp_target_connect(w, ev);
 	case EPL_DT_MASK_TARGET_TCP_DATA:
-		return 0;
+		return handle_event_tcp_target_data(w, ev);
 	case EPL_DT_MASK_CLIENT_UDP_DATA:
 		return 0;
 	case EPL_DT_MASK_TARGET_UDP_DATA:
