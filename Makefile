@@ -6,7 +6,10 @@ CXXFLAGS = -Wall -Wextra -ggdb3 -O2 -std=c++14
 LDFLAGS = -ggdb -O2
 LIBS = -lpthread
 
-TARGET := speedmgr
+SPEEDMGR_BIN := speedmgr
+SPEEDMGR_C_SOURCES := src/speedmgr.c
+SPEEDMGR_CXX_SOURCES := src/ip_map.cpp
+SPEEDMGR_OBJECTS := $(SPEEDMGR_C_SOURCES:.c=.o) $(SPEEDMGR_CXX_SOURCES:.cpp=.o)
 
 ifeq ($(ENABLE_STATIC), 1)
 CFLAGS += -static
@@ -20,10 +23,7 @@ CXXFLAGS += -fsanitize=address
 LDFLAGS += -fsanitize=address
 endif
 
-all: $(TARGET)
-
-$(TARGET): speedmgr.o ip_map.o
-	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
+all: $(SPEEDMGR_BIN)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -31,7 +31,10 @@ $(TARGET): speedmgr.o ip_map.o
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
+$(SPEEDMGR_BIN): $(SPEEDMGR_OBJECTS)
+	$(CXX) $(LDFLAGS) $(SPEEDMGR_OBJECTS) $(LIBS) -o $@
+
 clean:
-	rm -f *.o $(TARGET)
+	rm -vf $(SPEEDMGR_BIN) $(SPEEDMGR_OBJECTS)
 
 .PHONY: all clean
