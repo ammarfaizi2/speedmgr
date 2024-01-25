@@ -8,19 +8,18 @@
 
 #include "ip_map.h"
 
-extern "C" {
-
-struct ipv6 {
+struct in_addr6 {
 	char data[16];
 
-	bool operator==(const ipv6 &other) const
+	bool operator==(const in_addr6 &other) const
 	{
 		return memcmp(data, other.data, sizeof(data)) == 0;
 	}
 };
 
-struct std::hash<ipv6> {
-	size_t operator()(const ipv6 &ip) const
+template <>
+struct std::hash<in_addr6> {
+	size_t operator()(const in_addr6 &ip) const
 	{
 		size_t i, ret = 0;
 
@@ -33,8 +32,10 @@ struct std::hash<ipv6> {
 
 struct ip_map {
 	std::unordered_map<uint32_t, void *>	ipv4;
-	std::unordered_map<ipv6, void *>	ipv6;
+	std::unordered_map<in_addr6, void *>	ipv6;
 };
+
+extern "C" {
 
 int ip_map_init(ip_map_t *map)
 {
@@ -69,7 +70,7 @@ int ip_map_add(ip_map_t *map, const void *ip, char family, void *data)
 		}
 
 		if (family == 6) {
-			ipv6 ipv6;
+			in_addr6 ipv6;
 
 			memcpy(ipv6.data, ip, sizeof(ipv6.data));
 			imap->ipv6[ipv6] = data;
@@ -99,7 +100,7 @@ int ip_map_del(ip_map_t *map, const void *ip, char family)
 		}
 
 		if (family == 6) {
-			ipv6 ipv6;
+			in_addr6 ipv6;
 
 			memcpy(ipv6.data, ip, sizeof(ipv6.data));
 			if (imap->ipv6.find(ipv6) == imap->ipv6.end())
@@ -131,7 +132,7 @@ int ip_map_get(ip_map_t *map, const void *ip, char family, void **data)
 	}
 
 	if (family == 6) {
-		ipv6 ipv6;
+		in_addr6 ipv6;
 
 		memcpy(ipv6.data, ip, sizeof(ipv6.data));
 		if (imap->ipv6.find(ipv6) == imap->ipv6.end())
