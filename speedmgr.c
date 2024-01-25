@@ -277,9 +277,9 @@ static int parse_addr_and_port(const char *str, struct sockaddr_in46 *out)
 	}
 
 	ret = atoi(port);
-	if (ret <= 0 || ret > 65535) {
+	if (ret < 0 || ret > 65535) {
 		pr_error("Invalid port in the address and port combination: \"%s\"", str);
-		pr_error("Port must be between 1 and 65535");
+		pr_error("Port must be between 0 and 65535");
 		ret = -EINVAL;
 		goto out;
 	}
