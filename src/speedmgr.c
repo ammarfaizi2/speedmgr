@@ -30,8 +30,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 
-#define SPEEDMGR_DEBUG		1
-#define NR_CLIENTS		4096
+#define SPEEDMGR_DEBUG		0
+#define NR_CLIENTS		20480
 #define NR_INIT_BUCKETS		4
 #define SPLICE_BUF_SIZE		8192
 
@@ -40,20 +40,20 @@
 #endif
 
 #if SPEEDMGR_DEBUG
-#define pr_debug(fmt, ...) printf("debug: " fmt "\n", ##__VA_ARGS__)
+#define pr_debug(fmt, ...) printf("[%08d] debug: " fmt "\n", gettid(), ##__VA_ARGS__)
 #else
 #define pr_debug(fmt, ...) do {} while (0)
 #endif
 
-#define pr_info(fmt, ...)	printf("info: " fmt "\n", ##__VA_ARGS__)
-#define pr_error(fmt, ...)	printf("error: " fmt "\n", ##__VA_ARGS__)
-#define pr_warn(fmt, ...)	printf("warn: " fmt "\n", ##__VA_ARGS__)
+#define pr_info(fmt, ...)	printf("[%08d] info: " fmt "\n", gettid(), ##__VA_ARGS__)
+#define pr_error(fmt, ...)	printf("[%08d] error: " fmt "\n", gettid(), ##__VA_ARGS__)
+#define pr_warn(fmt, ...)	printf("[%08d] warn: " fmt "\n", gettid(), ##__VA_ARGS__)
 #define pr_vinfo(fmt, ...)	do { if (g_verbose) pr_info(fmt, ##__VA_ARGS__); } while (0)
 #define pr_verror(fmt, ...)	do { if (g_verbose) pr_error(fmt, ##__VA_ARGS__); } while (0)
 #define pr_vwarn(fmt, ...)	do { if (g_verbose) pr_warn(fmt, ##__VA_ARGS__); } while (0)
 #define pr_vdebug(fmt, ...)	do { if (g_verbose) pr_debug(fmt, ##__VA_ARGS__); } while (0)
 
-#define NR_EPOLL_EVENTS		64
+#define NR_EPOLL_EVENTS		128
 
 static volatile bool *g_stop;
 static uint8_t g_verbose;
@@ -159,7 +159,6 @@ struct server_ctx {
 	volatile bool		accept_need_rearm;
 	int			tcp_fd;
 	int			udp_fd;
-	uint32_t		nr_workers;
 	struct server_wrk	*workers;
 	struct rate_limit	rl;
 	struct server_cfg	cfg;
@@ -499,7 +498,6 @@ static void set_default_server_ctx(struct server_ctx *ctx)
 	ctx->accept_need_rearm = false;
 	ctx->tcp_fd = -1;
 	ctx->udp_fd = -1;
-	ctx->nr_workers = 0;
 	ctx->workers = NULL;
 	ctx->rl.nr_tbuckets = 0;
 	ctx->rl.nr_allocated = 0;
@@ -1222,7 +1220,7 @@ static int propagate_workers(struct server_ctx *ctx)
 
 	if (ctx->cfg.using_udp) {
 		w = &ctx->workers[0];
-		if (ctx->nr_workers > 1)
+		if (ctx->cfg.nr_workers > 1)
 			w = &ctx->workers[1];
 
 		data.u64 = EPL_DT_UDP_FD;
@@ -1280,6 +1278,7 @@ static struct server_wrk *pick_worker_for_new_conn(struct server_ctx *ctx,
 	struct server_wrk *w = NULL;
 	uint32_t i, min;
 
+	(void)taddr;
 	pr_debug("Picking a new worker for new connection to %s", sockaddr_to_str(taddr));
 
 	w = &ctx->workers[0];
@@ -1391,11 +1390,24 @@ static void put_client_slot(struct server_wrk *w, struct client_state *c)
 
 static int tcp_get_original_dst(int fd, struct sockaddr_in46 *orig_addr, socklen_t *len)
 {
-	int ret;
+	int ret, level;
 
-	ret = getsockopt(fd, SOL_IP, SO_ORIGINAL_DST, &orig_addr->sa, len);
-	if (ret)
-		return -errno;
+	if (orig_addr->sa.sa_family == AF_INET) {
+		level = SOL_IP;
+	} else {
+		if (IN6_IS_ADDR_V4MAPPED(&orig_addr->in6.sin6_addr))
+			level = SOL_IP;
+		else
+			level = SOL_IPV6;
+	}
+
+	ret = getsockopt(fd, level, SO_ORIGINAL_DST, &orig_addr->sa, len);
+	if (ret) {
+		level = (level == SOL_IP) ? SOL_IPV6 : SOL_IP;
+		ret = getsockopt(fd, level, SO_ORIGINAL_DST, &orig_addr->sa, len);
+		if (ret)
+			return -errno;
+	}
 
 	return 0;
 }
@@ -1437,21 +1449,43 @@ static int prepare_tcp_target_connect(struct server_wrk *w, struct client_state 
 	}
 
 	if (ret) {
-		pr_error("Failed to get original destination: %s", strerror(-ret));
+		pr_error("Failed to get original destination: %s (src=%s, thread=%u)",
+			 strerror(-ret), sockaddr_to_str(&c->client_addr), w->idx);
 		close_fd_p(&fd);
 		return ret;
 	}
 
-	if (run_tproxy)
+	if (run_tproxy) {
 		pr_debug("Running TPROXY on %s to %s", sockaddr_to_str(&c->client_addr), sockaddr_to_str(&taddr));
-	else
+		ret = 0x7777;
+		ret = setsockopt(fd, SOL_SOCKET, SO_MARK, &ret, sizeof(ret));
+		if (ret) {
+			ret = errno;
+			pr_error("Failed to set SO_MARK on target socket: %s", strerror(ret));
+			close_fd_p(&fd);
+			return -ret;
+		}
+	} else {
 		pr_debug("Connecting proxy from %s to %s", sockaddr_to_str(&c->client_addr), sockaddr_to_str(&taddr));
+	}
+
+	if (family == AF_INET6 && taddr.sa.sa_family != AF_INET6) {
+		struct sockaddr_in46 new_taddr;
+
+		memset(&new_taddr, 0, sizeof(new_taddr));
+		new_taddr.in6.sin6_family = AF_INET6;
+		new_taddr.in6.sin6_addr.__in6_u.__u6_addr8[10] = 0xff;
+		new_taddr.in6.sin6_addr.__in6_u.__u6_addr8[11] = 0xff;
+		new_taddr.in6.sin6_port = taddr.in4.sin_port;
+		memcpy(&new_taddr.in6.sin6_addr.__in6_u.__u6_addr8[12], &taddr.in4.sin_addr.s_addr, 4);
+		taddr = new_taddr;
+	}
 
 	ret = connect(fd, &taddr.sa, len);
 	if (ret) {
 		ret = errno;
 		if (ret != EINPROGRESS) {
-			pr_error("Failed to connect to target: %s", strerror(ret));
+			pr_error("Failed to connect to target %s: %s", sockaddr_to_str(&taddr), strerror(ret));
 			close_fd_p(&fd);
 			return -ret;
 		}
@@ -1503,8 +1537,9 @@ static int register_new_tcp_client(struct server_ctx *ctx, int fd,
 
 	ret = prepare_tcp_target_connect(w, c);
 	if (ret) {
+		c->client_fd = -1;
 		put_client_slot(w, c);
-		pr_error("Failed to prepare TCP target connect: %s", strerror(ret));
+		pr_error("Failed to prepare TCP target connect: %s", strerror(-ret));
 		return ret;
 	}
 
@@ -1561,8 +1596,8 @@ static int handle_event_tcp_accept(struct server_wrk *w)
 	pr_vinfo("New connection from %s", sockaddr_to_str(&addr));
 
 	ret = register_new_tcp_client(ctx, fd, &addr);
-	if (ret) {
-		pr_error("Failed to give client FD to a worker: %s", strerror(ret));
+	if (ret < 0) {
+		pr_error("Failed to give client FD to a worker: %s", strerror(-ret));
 		close_fd_p(&fd);
 
 		/* Yes, it's "return 0;", don't exit on fail... */
