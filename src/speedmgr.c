@@ -1140,6 +1140,7 @@ static void free_worker(struct server_wrk *w)
 		pr_vinfo("Sub worker %u stopped", w->idx);
 	}
 
+	free_clients(w);
 	free_epoll(w);
 }
 
@@ -1183,6 +1184,7 @@ static int init_workers(struct server_ctx *ctx)
 	return 0;
 
 out_err:
+	ctx->should_stop = true;
 	while (i--)
 		free_worker(&workers[i]);
 
@@ -1227,46 +1229,6 @@ static int propagate_workers(struct server_ctx *ctx)
 		ret = epoll_add(w, ctx->udp_fd, EPOLLIN, data);
 		if (ret)
 			return ret;
-	}
-
-	return 0;
-}
-
-static int init_server_ctx(struct server_ctx *ctx)
-{
-	int ret;
-
-	set_default_server_ctx(ctx);
-	try_increase_rlimit_nofile();
-
-	g_verbose = ctx->cfg.verbose;
-	ret = install_signal_handlers(ctx);
-	if (ret)
-		return ret;
-
-	ret = init_socket(ctx);
-	if (ret)
-		return ret;
-
-	ret = init_rate_limit(ctx);
-	if (ret) {
-		free_socket(ctx);
-		return ret;
-	}
-
-	ret = init_workers(ctx);
-	if (ret) {
-		free_socket(ctx);
-		free_rate_limit(ctx);
-		return ret;
-	}
-
-	ret = propagate_workers(ctx);
-	if (ret) {
-		free_workers(ctx);
-		free_socket(ctx);
-		free_rate_limit(ctx);
-		return ret;
 	}
 
 	return 0;
@@ -2056,6 +2018,46 @@ static int run_server(struct server_ctx *ctx)
 	ret = (long)ret_p;
 
 	return (int)ret;
+}
+
+static int init_server_ctx(struct server_ctx *ctx)
+{
+	int ret;
+
+	set_default_server_ctx(ctx);
+	try_increase_rlimit_nofile();
+
+	g_verbose = ctx->cfg.verbose;
+	ret = install_signal_handlers(ctx);
+	if (ret)
+		return ret;
+
+	ret = init_rate_limit(ctx);
+	if (ret)
+		return ret;
+
+	ret = init_socket(ctx);
+	if (ret) {
+		free_rate_limit(ctx);
+		return ret;
+	}
+
+	ret = init_workers(ctx);
+	if (ret) {
+		free_socket(ctx);
+		free_rate_limit(ctx);
+		return ret;
+	}
+
+	ret = propagate_workers(ctx);
+	if (ret) {
+		free_workers(ctx);
+		free_socket(ctx);
+		free_rate_limit(ctx);
+		return ret;
+	}
+
+	return 0;
 }
 
 static void free_server_ctx(struct server_ctx *ctx)
