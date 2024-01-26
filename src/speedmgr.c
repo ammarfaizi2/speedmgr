@@ -40,14 +40,14 @@
 #endif
 
 #if SPEEDMGR_DEBUG
-#define pr_debug(fmt, ...) printf("[%08d] debug: " fmt "\n", gettid(), ##__VA_ARGS__)
+#define pr_debug(fmt, ...) printf("[%08d][D]: " fmt "\n", gettid(), ##__VA_ARGS__)
 #else
 #define pr_debug(fmt, ...) do {} while (0)
 #endif
 
-#define pr_info(fmt, ...)	printf("[%08d] info: " fmt "\n", gettid(), ##__VA_ARGS__)
-#define pr_error(fmt, ...)	printf("[%08d] error: " fmt "\n", gettid(), ##__VA_ARGS__)
-#define pr_warn(fmt, ...)	printf("[%08d] warn: " fmt "\n", gettid(), ##__VA_ARGS__)
+#define pr_info(fmt, ...)	printf("[%08d][I]: " fmt "\n", gettid(), ##__VA_ARGS__)
+#define pr_error(fmt, ...)	printf("[%08d][E]: " fmt "\n", gettid(), ##__VA_ARGS__)
+#define pr_warn(fmt, ...)	printf("[%08d][w]: " fmt "\n", gettid(), ##__VA_ARGS__)
 #define pr_vinfo(fmt, ...)	do { if (g_verbose) pr_info(fmt, ##__VA_ARGS__); } while (0)
 #define pr_verror(fmt, ...)	do { if (g_verbose) pr_error(fmt, ##__VA_ARGS__); } while (0)
 #define pr_vwarn(fmt, ...)	do { if (g_verbose) pr_warn(fmt, ##__VA_ARGS__); } while (0)
@@ -107,6 +107,7 @@ struct client_state {
 	char			*cbuf;
 	char			*tbuf;
 	struct sockaddr_in46	client_addr;
+	struct sockaddr_in46	target_addr;
 	struct token_bucket	*tbucket;
 	bool			is_rate_limited;
 };
@@ -143,6 +144,8 @@ struct server_cfg {
 	bool			using_rate_limit;
 	bool			using_tcp;
 	bool			using_udp;
+	bool			run_as_tproxy_tcp;
+	bool			run_as_tproxy_udp;
 	int			tcp_backlog;
 	uint32_t		nr_workers;
 	uint64_t		max_upload_speed;
@@ -240,6 +243,28 @@ static void show_version(void)
 	printf("speedmgr version 0.0.1\n");
 }
 
+
+static inline socklen_t get_sockaddr_len(struct sockaddr_in46 *addr)
+{
+	if (addr->sa.sa_family == AF_INET6)
+		return sizeof(addr->in6);
+	else
+		return sizeof(addr->in4);
+}
+
+static bool is_addr_any(struct sockaddr_in46 *addr)
+{
+	if (addr->sa.sa_family == AF_INET6) {
+		if (memcmp(&addr->in6.sin6_addr, &in6addr_any, sizeof(in6addr_any)) == 0)
+			return true;
+	} else {
+		if (addr->in4.sin_addr.s_addr == INADDR_ANY)
+			return true;
+	}
+
+	return false;
+}
+
 static int parse_addr_and_port(const char *str, struct sockaddr_in46 *out)
 {
 	char *addr, *port;
@@ -312,11 +337,15 @@ static void set_default_server_cfg(struct server_cfg *cfg)
 {
 	cfg->verbose = 0;
 	cfg->using_rate_limit = false;
+	cfg->using_tcp = false;
+	cfg->using_udp = false;
+	cfg->run_as_tproxy_tcp = false;
+	cfg->run_as_tproxy_udp = false;
 	cfg->tcp_backlog = 128;
-	cfg->nr_workers = 4;
+	cfg->nr_workers = 1;
 	cfg->max_upload_speed = 0;
 	cfg->max_download_speed = 0;
-	cfg->interval_ms = 1000;
+	cfg->interval_ms = 0;
 	memset(&cfg->tcp_bind_addr, 0, sizeof(cfg->tcp_bind_addr));
 	memset(&cfg->tcp_target_addr, 0, sizeof(cfg->tcp_target_addr));
 	memset(&cfg->udp_bind_addr, 0, sizeof(cfg->udp_bind_addr));
@@ -451,6 +480,8 @@ static int parse_args(int argc, char *argv[], struct server_cfg *cfg)
 			pr_error("Missing TCP target address");
 			return -EINVAL;
 		}
+
+		cfg->run_as_tproxy_tcp = is_addr_any(&cfg->tcp_target_addr);
 	}
 
 	if (p.got_udp_bind_addr || p.got_udp_target_addr) {
@@ -463,6 +494,8 @@ static int parse_args(int argc, char *argv[], struct server_cfg *cfg)
 			pr_error("Missing UDP target address");
 			return -EINVAL;
 		}
+
+		cfg->run_as_tproxy_udp = is_addr_any(&cfg->udp_target_addr);
 	}
 
 	if (!p.got_udp_bind_addr && !p.got_tcp_bind_addr) {
@@ -646,6 +679,11 @@ static int init_socket_tcp(struct server_ctx *ctx)
 	ret = 1;
 	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &ret, sizeof(ret));
 	setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &ret, sizeof(ret));
+#endif
+
+#ifdef TCP_NODELAY
+	ret = 1;
+	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &ret, sizeof(ret));
 #endif
 
 	ret = bind(fd, &ctx->cfg.tcp_bind_addr.sa, len);
@@ -841,10 +879,11 @@ static int epoll_add(struct server_wrk *w, int fd, uint32_t events,
 	int ret;
 
 	ret = epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, fd, &ev);
-	if (ret) {
+	if (unlikely(ret)) {
 		ret = errno;
-		pr_error("Failed to add FD %d to epoll: %s", fd, strerror(ret));
-		abort();
+		pr_error("Failed to add FD %d to epoll (epl_fd=%d): %s (thread=%u)",
+			 fd, w->ep_fd, strerror(ret), w->idx);
+		return -ret;
 	}
 
 	return 0;
@@ -857,8 +896,10 @@ static int epoll_del(struct server_wrk *w, int fd)
 	ret = epoll_ctl(w->ep_fd, EPOLL_CTL_DEL, fd, NULL);
 	if (ret) {
 		ret = errno;
-		pr_error("Failed to delete FD %d from epoll: %s", fd, strerror(ret));
-		abort();
+		pr_error("Failed to delete FD %d from epoll (epl_fd=%d): %s (thread=%u)",
+			 fd, w->ep_fd, strerror(ret), w->idx);
+		return -ret;
+	
 	}
 
 	return 0;
@@ -876,8 +917,10 @@ static int epoll_mod(struct server_wrk *w, int fd, uint32_t events,
 	ret = epoll_ctl(w->ep_fd, EPOLL_CTL_MOD, fd, &ev);
 	if (ret) {
 		ret = errno;
-		pr_error("Failed to modify FD %d in epoll: %s\n", fd, strerror(ret));
-		abort();
+		pr_error("Failed to modify FD %d in epoll (epl_fd=%d): %s (thread=%u)",
+			 fd, w->ep_fd, strerror(ret), w->idx);
+		return -ret;
+	
 	}
 
 	return 0;
@@ -1022,6 +1065,7 @@ static void init_client(struct client_state *c)
 	c->cbuf = NULL;
 	c->tbuf = NULL;
 	memset(&c->client_addr, 0, sizeof(c->client_addr));
+	memset(&c->target_addr, 0, sizeof(c->target_addr));
 	c->tbucket = NULL;
 	c->is_rate_limited = false;
 }
@@ -1318,8 +1362,8 @@ static void put_client_slot(struct server_wrk *w, struct client_state *c)
 	}
 
 	if (c->client_fd >= 0) {
-		pr_vinfo("Closing a client connection (src=%s, thread=%u)",
-			 sockaddr_to_str(&c->client_addr), w->idx);
+		pr_vinfo("Closing a client connection (client_fd=%d; target_fd=%d; src=%s; thread=%u)",
+			 c->client_fd, c->target_fd, sockaddr_to_str(&c->client_addr), w->idx);
 
 		tmp = -c->client_fd;
 		ret = epoll_del(w, c->client_fd);
@@ -1344,168 +1388,172 @@ static void put_client_slot(struct server_wrk *w, struct client_state *c)
 	c->is_rate_limited = false;
 	w->handle_events_should_break = handle_events_should_break;
 	atomic_fetch_sub(&w->nr_active_clients, 1u);
+
 	memset(&c->client_addr, 0, sizeof(c->client_addr));
+	memset(&c->target_addr, 0, sizeof(c->target_addr));
+
 	ret = push_client_stack(w->cl_stack, c->idx);
 	assert(!ret);
 	(void)ret;
 }
 
-static int tcp_get_original_dst(int fd, struct sockaddr_in46 *orig_addr, socklen_t *len)
+static int prepare_tcp_target_connect(struct server_wrk *w, struct sockaddr_in46 *taddr)
 {
-	int ret, level;
-
-	if (orig_addr->sa.sa_family == AF_INET) {
-		level = SOL_IP;
-	} else {
-		if (IN6_IS_ADDR_V4MAPPED(&orig_addr->in6.sin6_addr))
-			level = SOL_IP;
-		else
-			level = SOL_IPV6;
-	}
-
-	ret = getsockopt(fd, level, SO_ORIGINAL_DST, &orig_addr->sa, len);
-	if (ret) {
-		level = (level == SOL_IP) ? SOL_IPV6 : SOL_IP;
-		ret = getsockopt(fd, level, SO_ORIGINAL_DST, &orig_addr->sa, len);
-		if (ret)
-			return -errno;
-	}
-
-	return 0;
-}
-
-static int prepare_tcp_target_connect(struct server_wrk *w, struct client_state *c)
-{
-	struct sockaddr_in46 taddr = w->ctx->cfg.tcp_target_addr;
-	bool run_tproxy = false;
-	union epoll_data data;
-	int fd, ret, family;
+	int ret, tmp, fd, family = taddr->sa.sa_family;
 	socklen_t len;
 
-	family = taddr.sa.sa_family;
 	fd = socket(family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-	if (fd < 0) {
-		ret = errno;
-		pr_error("Failed to create target socket: %s", strerror(ret));
-		return -ret;
-	}
+	if (fd < 0)
+		return -errno;
 
 #ifdef TCP_NODELAY
 	ret = 1;
 	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &ret, sizeof(ret));
 #endif
 
-	ret = 0;
-	if (family == AF_INET6) {
-		len = sizeof(taddr.in6);
-		if (memcmp(&taddr.in6.sin6_addr, &in6addr_any, sizeof(in6addr_any)) == 0) {
-			ret = tcp_get_original_dst(c->client_fd, &taddr, &len);
-			run_tproxy = true;
-		}
-	} else {
-		len = sizeof(taddr.in4);
-		if (taddr.in4.sin_addr.s_addr == INADDR_ANY) {
-			ret = tcp_get_original_dst(c->client_fd, &taddr, &len);
-			run_tproxy = true;
-		}
-	}
-
-	if (ret) {
-		pr_error("Failed to get original destination: %s (src=%s, thread=%u)",
-			 strerror(-ret), sockaddr_to_str(&c->client_addr), w->idx);
-		close_fd_p(&fd);
-		return ret;
-	}
-
-	if (run_tproxy) {
-		pr_debug("Running TPROXY on %s to %s", sockaddr_to_str(&c->client_addr), sockaddr_to_str(&taddr));
-		ret = 0x7777;
-		ret = setsockopt(fd, SOL_SOCKET, SO_MARK, &ret, sizeof(ret));
+	if (w->ctx->cfg.run_as_tproxy_tcp) {
+		tmp = 0x7777;
+		ret = setsockopt(fd, SOL_SOCKET, SO_MARK, &tmp, sizeof(tmp));
 		if (ret) {
-			ret = errno;
-			pr_error("Failed to set SO_MARK on target socket: %s", strerror(ret));
+			ret = -errno;
+			pr_error("Failed to set SO_MARK: %s", strerror(-ret));
 			close_fd_p(&fd);
-			return -ret;
+			return ret;
 		}
-	} else {
-		pr_debug("Connecting proxy from %s to %s", sockaddr_to_str(&c->client_addr), sockaddr_to_str(&taddr));
 	}
 
-	if (family == AF_INET6 && taddr.sa.sa_family != AF_INET6) {
-		struct sockaddr_in46 new_taddr;
-
-		memset(&new_taddr, 0, sizeof(new_taddr));
-		new_taddr.in6.sin6_family = AF_INET6;
-		new_taddr.in6.sin6_addr.__in6_u.__u6_addr8[10] = 0xff;
-		new_taddr.in6.sin6_addr.__in6_u.__u6_addr8[11] = 0xff;
-		new_taddr.in6.sin6_port = taddr.in4.sin_port;
-		memcpy(&new_taddr.in6.sin6_addr.__in6_u.__u6_addr8[12], &taddr.in4.sin_addr.s_addr, 4);
-		taddr = new_taddr;
-	}
-
-	ret = connect(fd, &taddr.sa, len);
+	len = get_sockaddr_len(taddr);
+	ret = connect(fd, &taddr->sa, len);
 	if (ret) {
 		ret = errno;
 		if (ret != EINPROGRESS) {
-			pr_error("Failed to connect to target %s: %s", sockaddr_to_str(&taddr), strerror(ret));
 			close_fd_p(&fd);
 			return -ret;
 		}
 	}
 
-	c->target_fd = fd;
+	return fd;
+}
 
-	data.ptr = c;
-	data.u64 |= EPL_DT_MASK_CLIENT_TCP_DATA;
-	c->cpoll_mask = 0;
-	ret = epoll_add(w, c->client_fd, c->cpoll_mask, data);
-	if (ret) {
-		pr_error("Failed to add target FD to epoll: %s", strerror(ret));
-		close_fd_p(&fd);
-		return ret;
+static int get_target_addr(struct server_wrk *w, int family_hint, int fd,
+			   struct sockaddr_in46 *taddr)
+{
+	struct sockaddr_in46 *cfg_taddr = &w->ctx->cfg.tcp_target_addr;
+	socklen_t len, alt_len;
+	int ret, lvl, alt_lvl;
+
+	if (!w->ctx->cfg.run_as_tproxy_tcp) {
+		*taddr = *cfg_taddr;
+		assert(!is_addr_any(taddr));
+		return 0;
 	}
 
-	data.ptr = c;
-	data.u64 |= EPL_DT_MASK_TARGET_TCP_CONNECT;
-	c->tpoll_mask = EPOLLOUT | EPOLLIN;
-	ret = epoll_add(w, c->target_fd, c->tpoll_mask, data);
-	if (ret) {
-		pr_error("Failed to add target FD to epoll: %s", strerror(ret));
-		close_fd_p(&fd);
-		return ret;
+	memset(taddr, 0, sizeof(*taddr));
+	if (family_hint == AF_INET6) {
+		len = sizeof(taddr->in6);
+		lvl = SOL_IPV6;
+		alt_len = sizeof(taddr->in4);
+		alt_lvl = SOL_IP;
+	} else {
+		len = sizeof(taddr->in4);
+		lvl = SOL_IP;
+		alt_len = sizeof(taddr->in6);
+		alt_lvl = SOL_IPV6;
 	}
 
-	send_event_fd(w);
+	ret = getsockopt(fd, lvl, SO_ORIGINAL_DST, &taddr->sa, &len);
+	if (!ret)
+		return 0;
+
+	ret = getsockopt(fd, alt_lvl, SO_ORIGINAL_DST, &taddr->sa, &alt_len);
+	if (ret)
+		return -errno;
+
 	return 0;
 }
 
 static int register_new_tcp_client(struct server_ctx *ctx, int fd,
 				   struct sockaddr_in46 *addr)
 {
+	int target_fd, ret, family_hint;
+	struct sockaddr_in46 taddr;
 	struct client_state *c;
+	union epoll_data data;
 	struct server_wrk *w;
-	int ret;
 
 	w = pick_worker_for_new_conn(ctx, addr);
 	c = get_free_client_slot(w);
 	if (unlikely(!c)) {
-		pr_error("Failed to get a free client slot on worker %u", w->idx);
+		pr_error("Failed to get a free client slot (fd=%d; src=%s; thread=%u)",
+			 fd, sockaddr_to_str(addr), w->idx);
 		return -EAGAIN;
 	}
 
-	pr_debug("Registering new TCP client %s (fd=%d) on worker %u", sockaddr_to_str(addr), fd, w->idx);
-	c->client_fd = fd;
-	c->client_addr = *addr;
+	if (ctx->cfg.run_as_tproxy_tcp) {
+		if (addr->sa.sa_family == AF_INET6) {
+			if (IN6_IS_ADDR_V4MAPPED(&addr->in6.sin6_addr))
+				family_hint = AF_INET;
+			else
+				family_hint = AF_INET6;
+		} else {
+			family_hint = AF_INET;
+		}
+	} else {
+		family_hint = ctx->cfg.tcp_target_addr.sa.sa_family;
+	}
 
-	ret = prepare_tcp_target_connect(w, c);
-	if (ret) {
-		c->client_fd = -1;
+	ret = get_target_addr(w, family_hint, fd, &taddr);
+	if (unlikely(ret < 0)) {
 		put_client_slot(w, c);
-		pr_error("Failed to prepare TCP target connect: %s", strerror(-ret));
 		return ret;
 	}
 
+	target_fd = prepare_tcp_target_connect(w, &taddr);
+	if (unlikely(target_fd < 0)) {
+		pr_error("Failed to prepare target connect (fd=%d; src=%s; dst=%s; thread=%u)",
+			 fd, sockaddr_to_str(addr), sockaddr_to_str(&taddr), w->idx);
+		put_client_slot(w, c);
+		return target_fd;
+	}
+
+	c->target_fd = target_fd;
+	c->client_fd = fd;
+	c->client_addr = *addr;
+	c->target_addr = taddr;
+
+	data.ptr = c;
+	data.u64 |= EPL_DT_MASK_CLIENT_TCP_DATA;
+	c->cpoll_mask = 0;
+	ret = epoll_add(w, c->client_fd, c->cpoll_mask, data);
+	if (unlikely(ret)) {
+		pr_error("Failed to add client FD to epoll: %s (fd=%d; src=%s; dst=%s; thread=%u)",
+			 strerror(ret), fd, sockaddr_to_str(addr), sockaddr_to_str(&taddr), w->idx);
+		goto out_err_epl;
+	}
+
+	data.ptr = c;
+	data.u64 |= EPL_DT_MASK_TARGET_TCP_CONNECT;
+	c->tpoll_mask = EPOLLOUT | EPOLLIN;
+	ret = epoll_add(w, c->target_fd, c->tpoll_mask, data);
+	if (unlikely(ret)) {
+		pr_error("Failed to add target FD to epoll: %s (fd=%d; src=%s; dst=%s; thread=%u)",
+			 strerror(ret), fd, sockaddr_to_str(addr), sockaddr_to_str(&taddr), w->idx);
+		epoll_del(w, c->client_fd);
+		goto out_err_epl;
+	}
+
+	pr_debug("Preparing forward conn from %s to %s (client_fd=%d; target_fd=%d; thread=%u)",
+		 sockaddr_to_str(&c->client_addr), sockaddr_to_str(&c->target_addr),
+		 c->target_fd, c->client_fd, w->idx);
+
+	send_event_fd(w);
 	return 0;
+
+out_err_epl:
+	close_fd_p(&c->target_fd);
+	close_fd_p(&c->client_fd);
+	put_client_slot(w, c);
+	return ret;
 }
 
 static int handle_accept_error(int err, struct server_wrk *w)
@@ -1543,28 +1591,25 @@ static int handle_event_tcp_accept(struct server_wrk *w)
 
 	fd = ret;
 	if (unlikely(len > (socklen_t)sizeof(addr))) {
-		pr_error("accept() returned invalid address length: %u", len);
-		close(ret);
+		pr_error("accept() returned invalid address length: %u (fd=%d; thread=%u)", len, fd, w->idx);
+		close_fd_p(&fd);
 		return -EINVAL;
 	}
 
 	ret = set_fd_nonblock(fd);
-	if (ret) {
-		pr_error("Failed to set client FD non-blocking: %s", strerror(ret));
-		close_fd_p(&ret);
+	if (unlikely(ret < 0)) {
+		pr_error("Failed to set client FD non-blocking: %s (fd=%d; src=%s; thread=%u)",
+			 strerror(-ret), fd, sockaddr_to_str(&addr), w->idx);
+		close_fd_p(&fd);
 		return ret;
 	}
 
-	pr_vinfo("New connection from %s", sockaddr_to_str(&addr));
+	pr_vinfo("New conn from %s (fd=%d; thread=%u)", sockaddr_to_str(&addr),
+		 fd, w->idx);
 
 	ret = register_new_tcp_client(ctx, fd, &addr);
-	if (ret < 0) {
-		pr_error("Failed to give client FD to a worker: %s", strerror(-ret));
+	if (ret < 0)
 		close_fd_p(&fd);
-
-		/* Yes, it's "return 0;", don't exit on fail... */
-		return 0;
-	}
 
 	return 0;
 }
@@ -1605,25 +1650,26 @@ static int handle_event_event_fd(struct server_wrk *w, struct epoll_event *ev)
 static int handle_event_tcp_target_connect(struct server_wrk *w, struct epoll_event *ev)
 {
 	struct client_state *c = ev->data.ptr;
-	struct sockaddr_in46 target_addr;
-	uint32_t events = ev->events;
 	union epoll_data data;
 	socklen_t len;
 	int ret, tmp;
 
-	if (unlikely(events & (EPOLLERR | EPOLLHUP))) {
-		pr_error("Target connect failed, hit {EPOLLERR | EPOLLHUP}: 0x%x (thread %u)", events, w->idx);
+	tmp = 0;
+	len = sizeof(tmp);
+	ret = getsockopt(c->target_fd, SOL_SOCKET, SO_ERROR, &tmp, &len);
+	if (unlikely(ret)) {
+		ret = errno;
+		pr_error("Failed to get target socket error: %s (src=%s; dst=%s; thread=%u)",
+			 strerror(ret), sockaddr_to_str(&c->client_addr),
+			 sockaddr_to_str(&c->target_addr), w->idx);
 		put_client_slot(w, c);
 		return 0;
 	}
 
-	tmp = 0;
-	len = sizeof(tmp);
-	ret = getsockopt(c->target_fd, SOL_SOCKET, SO_ERROR, &tmp, &len);
-	if (unlikely(tmp || !(events & EPOLLOUT))) {
-		if (tmp < 0)
-			tmp = -tmp;
-		pr_error("Failed to get target socket error: %s (thread %u)", strerror(tmp), w->idx);
+	if (tmp) {
+		pr_error("Target socket connect error: %s (src=%s; dst=%s; thread=%u)",
+			 strerror(tmp), sockaddr_to_str(&c->client_addr),
+			 sockaddr_to_str(&c->target_addr), w->idx);
 		put_client_slot(w, c);
 		return 0;
 	}
@@ -1651,21 +1697,16 @@ static int handle_event_tcp_target_connect(struct server_wrk *w, struct epoll_ev
 	c->cbuf = malloc(SPLICE_BUF_SIZE);
 	c->tbuf = malloc(SPLICE_BUF_SIZE);
 	if (unlikely(!c->cbuf || !c->tbuf)) {
-		pr_error("Failed to allocate splice buffers: %s (thread %u)", strerror(errno), w->idx);
+		pr_error("Failed to allocate memory for buffers (src=%s; dst=%s; thread=%u)",
+			 sockaddr_to_str(&c->client_addr), sockaddr_to_str(&c->target_addr), w->idx);
 		put_client_slot(w, c);
 		return -ENOMEM;
 	}
 
-	if (c->client_addr.sa.sa_family == AF_INET6)
-		len = sizeof(c->client_addr.in6);
-	else
-		len = sizeof(c->client_addr.in4);
+	pr_vinfo("Fwd conn established from %s to %s (client_fd=%d; target_fd=%d; thread=%u)",
+		 sockaddr_to_str(&c->client_addr), sockaddr_to_str(&c->target_addr),
+		 c->target_fd, c->client_fd, w->idx);
 
-	memset(&target_addr, 0, sizeof(target_addr));
-	getpeername(c->target_fd, &target_addr.sa, &len);
-
-	pr_debug("Forwarding connection from %s to %s has been established (thread %u)",
-		 sockaddr_to_str(&c->client_addr), sockaddr_to_str(&target_addr), w->idx);
 	return 0;
 }
 
@@ -1928,8 +1969,10 @@ static int poll_events(struct server_wrk *w)
 	ret = epoll_wait(w->ep_fd, w->events, NR_EPOLL_EVENTS, w->ep_timeout);
 	if (unlikely(ret < 0)) {
 		ret = errno;
-		if (ret == EINTR)
+		if (ret == EINTR) {
+			pr_vwarn("epoll_wait() interrupted");
 			return 0;
+		}
 
 		pr_error("epoll_wait() failed: %s", strerror(ret));
 		return -ret;
