@@ -1158,7 +1158,7 @@ static int init_worker(struct server_ctx *ctx, struct server_wrk *w)
 
 	w->ctx = ctx;
 	if (w->idx > 0) {
-		pr_vinfo("Starting sub worker %u", w->idx);
+		pr_info("Starting sub worker %u", w->idx);
 		ret = pthread_create(&w->thread, NULL, server_worker_thread, w);
 		if (ret) {
 			pr_error("Failed to create worker thread: %s", strerror(ret));
@@ -1362,7 +1362,7 @@ static void put_client_slot(struct server_wrk *w, struct client_state *c)
 	}
 
 	if (c->client_fd >= 0) {
-		pr_vinfo("Closing a client connection (client_fd=%d; target_fd=%d; src=%s; thread=%u)",
+		pr_vinfo("Closing a client connection (cfd=%d; tfd=%d; src=%s; thread=%u)",
 			 c->client_fd, c->target_fd, sockaddr_to_str(&c->client_addr), w->idx);
 
 		tmp = -c->client_fd;
@@ -1484,7 +1484,7 @@ static int register_new_tcp_client(struct server_ctx *ctx, int fd,
 	w = pick_worker_for_new_conn(ctx, addr);
 	c = get_free_client_slot(w);
 	if (unlikely(!c)) {
-		pr_error("Failed to get a free client slot (fd=%d; src=%s; thread=%u)",
+		pr_error("Failed to get a free client slot (cfd=%d; src=%s; thread=%u)",
 			 fd, sockaddr_to_str(addr), w->idx);
 		return -EAGAIN;
 	}
@@ -1510,8 +1510,9 @@ static int register_new_tcp_client(struct server_ctx *ctx, int fd,
 
 	target_fd = prepare_tcp_target_connect(w, &taddr);
 	if (unlikely(target_fd < 0)) {
-		pr_error("Failed to prepare target connect (fd=%d; src=%s; dst=%s; thread=%u)",
-			 fd, sockaddr_to_str(addr), sockaddr_to_str(&taddr), w->idx);
+		pr_error("Failed to prepare target connect: %s (cfd=%d; src=%s; dst=%s; thread=%u)",
+			 strerror(-target_fd), fd, sockaddr_to_str(addr),
+			 sockaddr_to_str(&taddr), w->idx);
 		put_client_slot(w, c);
 		return target_fd;
 	}
@@ -1526,8 +1527,10 @@ static int register_new_tcp_client(struct server_ctx *ctx, int fd,
 	c->cpoll_mask = 0;
 	ret = epoll_add(w, c->client_fd, c->cpoll_mask, data);
 	if (unlikely(ret)) {
-		pr_error("Failed to add client FD to epoll: %s (fd=%d; src=%s; dst=%s; thread=%u)",
-			 strerror(ret), fd, sockaddr_to_str(addr), sockaddr_to_str(&taddr), w->idx);
+		pr_error("Failed to add client FD to epoll: %s (cfd=%d; tfd=%d; src=%s; dst=%s; thread=%u)",
+			 strerror(ret), c->client_fd, c->target_fd,
+			 sockaddr_to_str(&c->client_addr),
+			 sockaddr_to_str(&c->target_addr), w->idx);
 		goto out_err_epl;
 	}
 
@@ -1536,15 +1539,18 @@ static int register_new_tcp_client(struct server_ctx *ctx, int fd,
 	c->tpoll_mask = EPOLLOUT | EPOLLIN;
 	ret = epoll_add(w, c->target_fd, c->tpoll_mask, data);
 	if (unlikely(ret)) {
-		pr_error("Failed to add target FD to epoll: %s (fd=%d; src=%s; dst=%s; thread=%u)",
-			 strerror(ret), fd, sockaddr_to_str(addr), sockaddr_to_str(&taddr), w->idx);
+		pr_error("Failed to add target FD to epoll: %s (cfd=%d; tfd=%d; src=%s; dst=%s; thread=%u)",
+			 strerror(ret), c->client_fd, c->target_fd,
+			 sockaddr_to_str(&c->client_addr),
+			 sockaddr_to_str(&c->target_addr), w->idx);
 		epoll_del(w, c->client_fd);
 		goto out_err_epl;
 	}
 
-	pr_debug("Preparing forward conn from %s to %s (client_fd=%d; target_fd=%d; thread=%u)",
-		 sockaddr_to_str(&c->client_addr), sockaddr_to_str(&c->target_addr),
-		 c->target_fd, c->client_fd, w->idx);
+	pr_debug("Preparing forward conn from %s to %s (cfd=%d; tfd=%d; thread=%u)",
+		 sockaddr_to_str(&c->client_addr),
+		 sockaddr_to_str(&c->target_addr),
+		 c->client_fd, c->target_fd, w->idx);
 
 	send_event_fd(w);
 	return 0;
@@ -1559,7 +1565,7 @@ out_err_epl:
 static int handle_accept_error(int err, struct server_wrk *w)
 {
 	if (err == EAGAIN)
-		return 0;
+		return -EAGAIN;
 
 	if (err == EMFILE || err == ENFILE) {
 		pr_error("accept(): (%d) Too many open files, stop accepting...", err);
@@ -1572,7 +1578,7 @@ static int handle_accept_error(int err, struct server_wrk *w)
 	return -err;
 }
 
-static int handle_event_tcp_accept(struct server_wrk *w)
+static int __handle_event_tcp_accept(struct server_wrk *w)
 {
 	struct server_ctx *ctx = w->ctx;
 	struct sockaddr_in46 addr;
@@ -1614,6 +1620,26 @@ static int handle_event_tcp_accept(struct server_wrk *w)
 	return 0;
 }
 
+static int handle_event_tcp_accept(struct server_wrk *w)
+{
+	uint32_t i = 0;
+	int ret;
+
+	do {
+		ret = __handle_event_tcp_accept(w);
+		if (ret == -EAGAIN)
+			break;
+
+		if (unlikely(ret))
+			return ret;
+	} while (++i < 16);
+
+	if (i > 1)
+		pr_vinfo("Handled %u accept events", i);
+
+	return 0;
+}
+
 static int handle_event_tcp_fd(struct server_wrk *w, struct epoll_event *ev)
 {
 	if (unlikely(ev->events & (EPOLLERR | EPOLLHUP))) {
@@ -1630,6 +1656,8 @@ static int handle_event_tcp_fd(struct server_wrk *w, struct epoll_event *ev)
 
 static int handle_event_udp_fd(struct server_wrk *w, struct epoll_event *ev)
 {
+	(void)w;
+	(void)ev;
 	return 0;
 }
 
@@ -1659,16 +1687,18 @@ static int handle_event_tcp_target_connect(struct server_wrk *w, struct epoll_ev
 	ret = getsockopt(c->target_fd, SOL_SOCKET, SO_ERROR, &tmp, &len);
 	if (unlikely(ret)) {
 		ret = errno;
-		pr_error("Failed to get target socket error: %s (src=%s; dst=%s; thread=%u)",
-			 strerror(ret), sockaddr_to_str(&c->client_addr),
+		pr_error("Failed to get target socket error: %s (cfd=%d; tfd=%d; src=%s; dst=%s; thread=%u)",
+			 strerror(ret), c->client_fd, c->target_fd,
+			 sockaddr_to_str(&c->client_addr),
 			 sockaddr_to_str(&c->target_addr), w->idx);
 		put_client_slot(w, c);
 		return 0;
 	}
 
 	if (tmp) {
-		pr_error("Target socket connect error: %s (src=%s; dst=%s; thread=%u)",
-			 strerror(tmp), sockaddr_to_str(&c->client_addr),
+		pr_error("Target connect error: %s (cfd=%d; tfd=%d; src=%s; dst=%s; thread=%u)",
+			 strerror(tmp), c->client_fd, c->target_fd,
+			 sockaddr_to_str(&c->client_addr),
 			 sockaddr_to_str(&c->target_addr), w->idx);
 		put_client_slot(w, c);
 		return 0;
@@ -1697,8 +1727,9 @@ static int handle_event_tcp_target_connect(struct server_wrk *w, struct epoll_ev
 	c->cbuf = malloc(SPLICE_BUF_SIZE);
 	c->tbuf = malloc(SPLICE_BUF_SIZE);
 	if (unlikely(!c->cbuf || !c->tbuf)) {
-		pr_error("Failed to allocate memory for buffers (src=%s; dst=%s; thread=%u)",
-			 sockaddr_to_str(&c->client_addr), sockaddr_to_str(&c->target_addr), w->idx);
+		pr_error("Failed to allocate memory for buffers (cfd=%d; tfd=%d; src=%s; dst=%s; thread=%u)",
+			 c->client_fd, c->target_fd, sockaddr_to_str(&c->client_addr),
+			 sockaddr_to_str(&c->target_addr), w->idx);
 		put_client_slot(w, c);
 		return -ENOMEM;
 	}
@@ -1970,7 +2001,7 @@ static int poll_events(struct server_wrk *w)
 	if (unlikely(ret < 0)) {
 		ret = errno;
 		if (ret == EINTR) {
-			pr_vwarn("epoll_wait() interrupted");
+			pr_info("epoll_wait() interrupted");
 			return 0;
 		}
 
@@ -2037,7 +2068,7 @@ static void *server_worker_thread(void *warg)
 	int ret = 0;
 
 	if (w->idx == 0)
-		pr_vinfo("The main worker is ready! (worker 0)");
+		pr_info("The main worker is ready! (worker 0)");
 
 	while (!ctx->should_stop) {
 		ret = poll_events(w);
