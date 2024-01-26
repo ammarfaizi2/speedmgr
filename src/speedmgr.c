@@ -91,8 +91,8 @@ struct token_bucket {
 	pthread_mutex_t		lock;
 	int			timer_fd;
 	_Atomic(uint32_t)	nr_rate_limited_clients;
-	_Atomic(uint64_t)	upload_tokens;
-	_Atomic(uint64_t)	download_tokens;
+	_Atomic(int64_t)	upload_tokens;
+	_Atomic(int64_t)	download_tokens;
 	uint64_t		max_upload_tokens;
 	uint64_t		max_download_tokens;
 
@@ -1137,7 +1137,7 @@ static int init_clients(struct server_wrk *w)
 	return 0;
 }
 
-static void put_token_bucket(struct server_wrk *w, struct token_bucket *tb);
+static uint32_t put_token_bucket(struct server_ctx *ctx, struct token_bucket *tb);
 
 static void free_clients(struct server_wrk *w)
 {
@@ -1162,7 +1162,7 @@ static void free_clients(struct server_wrk *w)
 			free(c->tbuf);
 
 		if (c->tbucket)
-			put_token_bucket(w, c->tbucket);
+			put_token_bucket(w->ctx, c->tbucket);
 	}
 
 	free_client_stack(w);
@@ -1424,7 +1424,7 @@ static void put_client_slot(struct server_wrk *w, struct client_state *c)
 	memset(&c->target_addr, 0, sizeof(c->target_addr));
 
 	if (c->tbucket) {
-		put_token_bucket(w, c->tbucket);
+		put_token_bucket(w->ctx, c->tbucket);
 		c->tbucket = NULL;
 	}
 
@@ -1600,42 +1600,64 @@ static void delete_token_bucket(struct rate_limit *rl, struct token_bucket *tb)
 	free(tb);
 }
 
-static void put_token_bucket_locked(struct server_wrk *w, struct token_bucket *tb)
+static uint32_t put_token_bucket_locked(struct server_ctx *ctx, struct token_bucket *tb)
 	__must_hold(&ctx->rl.lock)
 	__must_hold(&tb->lock)
 {
-	struct server_ctx *ctx = w->ctx;
 	uint32_t ref;
 
 	assert(tb->ref_cnt > 0);
 	ref = --tb->ref_cnt;
 
 	if (ref == 0) {
-		pr_vdebug("Deleting token bucket (thread=%u)", w->idx);
+		pr_vdebug("Deleting token bucket");
+		free(tb->clients);
 		delete_token_bucket(&ctx->rl, tb);
 	} else {
-		pr_vdebug("Putting token bucket (ref=%u; thread=%u)", ref, w->idx);
+		pr_vdebug("Putting token bucket (ref=%u)", ref);
 	}
+
+	return ref;
 }
 
-static void put_token_bucket(struct server_wrk *w, struct token_bucket *tb)
+static uint32_t put_token_bucket(struct server_ctx *ctx, struct token_bucket *tb)
 {
-	struct server_ctx *ctx = w->ctx;
+	uint32_t ref;
 
 	assert(ctx->cfg.using_rate_limit);
 	pthread_mutex_lock(&ctx->rl.lock);
 	pthread_mutex_lock(&tb->lock);
 
-	put_token_bucket_locked(w, tb);
+	ref = put_token_bucket_locked(ctx, tb);
+	if (ref > 0)
+		pthread_mutex_unlock(&tb->lock);
 
-	pthread_mutex_unlock(&tb->lock);
 	pthread_mutex_unlock(&ctx->rl.lock);
+	return ref;
+}
+
+static int add_client_to_token_bucket(struct token_bucket *tb, struct client_state *c)
+{
+	struct client_state **clients;
+	uint32_t nr_clients;
+
+	nr_clients = tb->ref_cnt - 1 + 1;
+	assert(nr_clients > 0);
+	clients = realloc(tb->clients, sizeof(*clients) * nr_clients);
+	if (!clients)
+		return -ENOMEM;
+
+	tb->clients = clients;
+	tb->clients[nr_clients - 1] = c;
+	return 0;
 }
 
 static struct token_bucket *get_or_create_token_bucket(struct server_ctx *ctx,
-						       struct sockaddr_in46 *addr)
+						       struct sockaddr_in46 *addr,
+						       struct client_state *c)
 {
 	struct token_bucket *tb;
+	int ret;
 
 	pthread_mutex_lock(&ctx->rl.lock);
 	tb = find_token_bucket(&ctx->rl, addr);
@@ -1645,8 +1667,15 @@ static struct token_bucket *get_or_create_token_bucket(struct server_ctx *ctx,
 	if (tb) {
 		pthread_mutex_lock(&tb->lock);
 		tb->ref_cnt++;
+		ret = add_client_to_token_bucket(tb, c);
+		if (ret) {
+			if (put_token_bucket_locked(ctx, tb) == 0)
+				goto out;
+		}
 		pthread_mutex_unlock(&tb->lock);
 	}
+
+out:	
 	pthread_mutex_unlock(&ctx->rl.lock);
 	return tb;
 }
@@ -1736,13 +1765,6 @@ static int register_new_tcp_client(struct server_ctx *ctx, int fd,
 	union epoll_data data;
 	struct server_wrk *w;
 
-	tb = get_or_create_token_bucket(ctx, addr);
-	if (unlikely(!tb)) {
-		pr_error("Failed to create token bucket for %s (cfd=%d)",
-			 sockaddr_to_str(addr), fd);
-		return -EAGAIN;
-	}
-
 	w = pick_worker_for_new_conn(ctx, addr);
 	c = get_free_client_slot(w);
 	if (unlikely(!c)) {
@@ -1751,7 +1773,6 @@ static int register_new_tcp_client(struct server_ctx *ctx, int fd,
 		return -EAGAIN;
 	}
 
-	c->tbucket = tb;
 	c->wrk_ref = w;
 	if (ctx->cfg.run_as_tproxy_tcp) {
 		if (addr->sa.sa_family == AF_INET6) {
@@ -1779,6 +1800,17 @@ static int register_new_tcp_client(struct server_ctx *ctx, int fd,
 			 sockaddr_to_str(&taddr), w->idx);
 		put_client_slot(w, c);
 		return target_fd;
+	}
+
+	if (ctx->cfg.using_rate_limit) {
+		tb = get_or_create_token_bucket(ctx, addr, c);
+		if (unlikely(!tb)) {
+			pr_error("Failed to create token bucket for %s (cfd=%d)",
+				sockaddr_to_str(addr), fd);
+			return -EAGAIN;
+		}
+
+		c->tbucket = tb;
 	}
 
 	c->target_fd = target_fd;
@@ -2070,12 +2102,64 @@ do_send:
 	return ret;
 }
 
+static size_t get_max_download_tokens(struct token_bucket *tb)
+{
+	uint32_t nr_clients;
+	int64_t tokens;
+	size_t ret;
+
+	tokens = atomic_load_explicit(&tb->download_tokens, memory_order_relaxed);
+	if (tokens < 0)
+		return 0;
+
+	pthread_mutex_lock(&tb->lock);
+	nr_clients = tb->ref_cnt - 1;
+	pthread_mutex_unlock(&tb->lock);
+
+	if (nr_clients == 0)
+		return (size_t)tokens;
+
+	ret = (size_t)(tokens / nr_clients);
+	if (ret == 0)
+		return 1;
+
+	return ret;
+}
+
+static int mark_client_rate_limited(struct server_wrk *w, struct client_state *c)
+{
+	union epoll_data data;
+	int ret;
+
+	c->is_rate_limited = true;
+
+	if (c->cpoll_mask) {
+		data.ptr = c;
+		data.u64 |= EPL_DT_MASK_CLIENT_TCP_DATA;
+		c->cpoll_mask = 0;
+		ret = epoll_mod(w, c->client_fd, c->cpoll_mask, data);
+		assert(!ret);
+	}
+
+	if (c->tpoll_mask) {
+		data.ptr = c;
+		data.u64 |= EPL_DT_MASK_TARGET_TCP_DATA;
+		c->tpoll_mask = 0;
+		ret = epoll_mod(w, c->target_fd, c->tpoll_mask, data);
+		assert(!ret);
+	}
+
+	(void)ret;
+	return 0;
+}
+
 static int handle_event_tcp_target_data(struct server_wrk *w, struct epoll_event *ev)
 {
 	struct client_state *c = ev->data.ptr;
 	uint32_t events = ev->events;
 	struct tcp_splice_buf sb;
 	union epoll_data data;
+	size_t max_down;
 	ssize_t ret;
 	int err;
 
@@ -2085,17 +2169,24 @@ static int handle_event_tcp_target_data(struct server_wrk *w, struct epoll_event
 	}
 
 	if (events & EPOLLIN) {
+		max_down = get_max_download_tokens(c->tbucket);
+		if (!max_down) {
+			pr_debug("Client %s is rate limited", sockaddr_to_str(&c->client_addr));
+			mark_client_rate_limited(w, c);
+			return 0;
+		}
 		sb.buf = c->tbuf;
 		sb.cur_len = c->tbuf_len;
 		sb.max_len = SPLICE_BUF_SIZE;
-		sb.max_recv = sb.max_len;
-		sb.max_send = sb.max_len;
+		sb.max_recv = max_down;
+		sb.max_send = max_down;
 		ret = do_tcp_splice(c->target_fd, c->client_fd, &sb);
 		if (unlikely(ret < 0)) {
 			put_client_slot(w, c);
 			return 0;
 		}
 
+		atomic_fetch_sub(&c->tbucket->download_tokens, (int64_t)ret);
 		c->tbuf_len = sb.cur_len;
 		if (c->tbuf_len > 0) {
 			/*
@@ -2311,10 +2402,12 @@ static int fill_token_bucket(struct server_wrk *w, struct token_bucket *tb)
 		 * tb->ref_cnt might've changed under us when
 		 * releasing &tb->lock. Check again...
 		 */
-		if (tb->ref_cnt == 1)
-			put_token_bucket_locked(w, tb);
-
-		pthread_mutex_unlock(&tb->lock);
+		if (tb->ref_cnt == 1) {
+			if (put_token_bucket_locked(w->ctx, tb) > 0)
+				pthread_mutex_unlock(&tb->lock);
+		} else {
+			pthread_mutex_unlock(&tb->lock);
+		}
 		pthread_mutex_unlock(&w->ctx->rl.lock);
 	} else {
 		pthread_mutex_unlock(&tb->lock);
