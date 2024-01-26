@@ -30,13 +30,25 @@
 #include <unistd.h>
 #include <fcntl.h>
 
-#define SPEEDMGR_DEBUG		0
+#define SPEEDMGR_DEBUG		1
 #define NR_CLIENTS		20480
 #define NR_INIT_BUCKETS		4
 #define SPLICE_BUF_SIZE		8192
 
 #ifndef SO_ORIGINAL_DST
 #define SO_ORIGINAL_DST		80
+#endif
+
+#ifndef __must_hold
+#define __must_hold(x)
+#endif
+
+#ifndef __acquires
+#define __acquires(x)
+#endif
+
+#ifndef __releases
+#define __releases(x)
 #endif
 
 #if SPEEDMGR_DEBUG
@@ -78,14 +90,21 @@ struct client_state;
 struct token_bucket {
 	pthread_mutex_t		lock;
 	int			timer_fd;
+	_Atomic(uint32_t)	nr_rate_limited_clients;
 	_Atomic(uint64_t)	upload_tokens;
 	_Atomic(uint64_t)	download_tokens;
 	uint64_t		max_upload_tokens;
 	uint64_t		max_download_tokens;
+
+	/*
+	 * The number of clients in this bucket is:
+	 * ref_cnt - 1 because one ref is held by
+	 * the timer FD.
+	 */
 	uint32_t		ref_cnt;	/* Protected by lock. */
-	uint32_t		nr_clients;	/* Protected by lock. */
 	struct client_state	**clients;	/* Protected by lock. */
 	struct in46_addr	addr;
+	char			addr_family;
 };
 
 struct rate_limit {
@@ -95,6 +114,8 @@ struct rate_limit {
 	struct token_bucket	**tbuckets;
 	ip_map_t		ip_map;
 };
+
+struct server_wrk;
 
 struct client_state {
 	int			client_fd;
@@ -109,6 +130,7 @@ struct client_state {
 	struct sockaddr_in46	client_addr;
 	struct sockaddr_in46	target_addr;
 	struct token_bucket	*tbucket;
+	struct server_wrk	*wrk_ref;
 	bool			is_rate_limited;
 };
 
@@ -376,12 +398,10 @@ static int parse_args(int argc, char *argv[], struct server_cfg *cfg)
 		case 'h':
 			show_help(argv[0]);
 			exit(EXIT_SUCCESS);
-			break;
 
 		case 'V':
 			show_version();
 			exit(EXIT_SUCCESS);
-			break;
 
 		case 'v':
 			cfg->verbose++;
@@ -389,7 +409,7 @@ static int parse_args(int argc, char *argv[], struct server_cfg *cfg)
 
 		case 'w':
 			tmp = atoi(optarg);
-			if (tmp < 1 || tmp > 1024) {
+			if (tmp < 1) {
 				pr_error("Invalid number of workers: %d", tmp);
 				return -EINVAL;
 			}
@@ -399,7 +419,7 @@ static int parse_args(int argc, char *argv[], struct server_cfg *cfg)
 
 		case 'b':
 			tmp = atoi(optarg);
-			if (tmp < 1 || tmp > 1024) {
+			if (tmp < 1) {
 				pr_error("Invalid TCP backlog size: %d", tmp);
 				return -EINVAL;
 			}
@@ -408,48 +428,54 @@ static int parse_args(int argc, char *argv[], struct server_cfg *cfg)
 			break;
 
 		case 'B':
-			if (parse_addr_and_port(optarg, &cfg->tcp_bind_addr) < 0)
-				return -EINVAL;
+			tmp = parse_addr_and_port(optarg, &cfg->tcp_bind_addr);
+			if (tmp)
+				return tmp;
 
 			p.got_tcp_bind_addr = true;
 			cfg->using_tcp = true;
 			break;
 
 		case 'T':
-			if (parse_addr_and_port(optarg, &cfg->tcp_target_addr) < 0)
-				return -EINVAL;
+			tmp = parse_addr_and_port(optarg, &cfg->tcp_target_addr);
+			if (tmp)
+				return tmp;
 
 			p.got_tcp_target_addr = true;
+			cfg->using_tcp = true;
 			break;
 
 		case 'U':
-			if (parse_addr_and_port(optarg, &cfg->udp_bind_addr) < 0)
-				return -EINVAL;
+			tmp = parse_addr_and_port(optarg, &cfg->udp_bind_addr);
+			if (tmp)
+				return tmp;
 
 			p.got_udp_bind_addr = true;
 			cfg->using_udp = true;
 			break;
 
 		case 'W':
-			if (parse_addr_and_port(optarg, &cfg->udp_target_addr) < 0)
-				return -EINVAL;
+			tmp = parse_addr_and_port(optarg, &cfg->udp_target_addr);
+			if (tmp)
+				return tmp;
 
 			p.got_udp_target_addr = true;
+			cfg->using_udp = true;
 			break;
 
 		case 'u':
-			cfg->max_download_speed = (uint64_t)strtoull(optarg, NULL, 10);
-			p.got_max_download_speed = true;
-			break;
-
-		case 'd':
 			cfg->max_upload_speed = (uint64_t)strtoull(optarg, NULL, 10);
 			p.got_max_upload_speed = true;
 			break;
 
+		case 'd':
+			cfg->max_download_speed = (uint64_t)strtoull(optarg, NULL, 10);
+			p.got_max_download_speed = true;
+			break;
+
 		case 'i':
 			tmp = atoi(optarg);
-			if (tmp < 1 || tmp > 10000) {
+			if (tmp < 1) {
 				pr_error("Invalid interval: %d", tmp);
 				return -EINVAL;
 			}
@@ -460,8 +486,7 @@ static int parse_args(int argc, char *argv[], struct server_cfg *cfg)
 
 		case '?':
 			show_help(argv[0]);
-			exit(EXIT_FAILURE);
-			break;
+			return -EINVAL;
 
 		default:
 			pr_error("Unknown option: %c", c);
@@ -563,7 +588,7 @@ static int try_increase_rlimit_nofile(void)
 	return 0;
 }
 
-static const char *sockaddr_to_str(struct sockaddr_in46 *addr)
+static const char *sockaddr_to_str(const struct sockaddr_in46 *addr)
 {
 	static __thread char _buf[8][INET6_ADDRSTRLEN + sizeof("[]:65535")];
 	static __thread uint8_t _counter;
@@ -791,6 +816,9 @@ static int init_rate_limit(struct server_ctx *ctx)
 	struct token_bucket **tbuckets;
 	int ret;
 
+	if (!ctx->cfg.using_rate_limit)
+		return 0;
+
 	rl->nr_tbuckets = 0;
 	rl->nr_allocated = NR_INIT_BUCKETS;
 	tbuckets = calloc(rl->nr_allocated, sizeof(*tbuckets));
@@ -813,6 +841,7 @@ static int init_rate_limit(struct server_ctx *ctx)
 	}
 
 	rl->tbuckets = tbuckets;
+	pr_vinfo("Rate limit initialized (nr_allocated=%u)", rl->nr_allocated);
 	return 0;
 }
 
@@ -820,10 +849,15 @@ static void free_rate_limit(struct server_ctx *ctx)
 {
 	struct rate_limit *rl = &ctx->rl;
 
+	if (!ctx->cfg.using_rate_limit)
+		return;
+
 	if (!rl->tbuckets)
 		return;
 
 	pthread_mutex_lock(&rl->lock);
+	pr_vinfo("Freeing rate limit buckets (nr_tbuckets=%u; nr_allocated=%u)",
+		 rl->nr_tbuckets, rl->nr_allocated);
 	pthread_mutex_unlock(&rl->lock);
 	free(rl->tbuckets);
 	rl->tbuckets = NULL;
@@ -1103,9 +1137,11 @@ static int init_clients(struct server_wrk *w)
 	return 0;
 }
 
+static void put_token_bucket(struct server_wrk *w, struct token_bucket *tb);
+
 static void free_clients(struct server_wrk *w)
 {
-	uint32_t i, tmp;
+	uint32_t i;
 
 	if (!w->clients)
 		return;
@@ -1125,13 +1161,8 @@ static void free_clients(struct server_wrk *w)
 		if (c->tbuf)
 			free(c->tbuf);
 
-		if (c->tbucket) {
-			pthread_mutex_lock(&c->tbucket->lock);
-			tmp = c->tbucket->ref_cnt--;
-			pthread_mutex_unlock(&c->tbucket->lock);
-			if (tmp == 1)
-				free(c->tbucket);
-		}
+		if (c->tbucket)
+			put_token_bucket(w, c->tbucket);
 	}
 
 	free_client_stack(w);
@@ -1392,9 +1423,232 @@ static void put_client_slot(struct server_wrk *w, struct client_state *c)
 	memset(&c->client_addr, 0, sizeof(c->client_addr));
 	memset(&c->target_addr, 0, sizeof(c->target_addr));
 
+	if (c->tbucket) {
+		put_token_bucket(w, c->tbucket);
+		c->tbucket = NULL;
+	}
+
+	c->wrk_ref = NULL;
 	ret = push_client_stack(w->cl_stack, c->idx);
 	assert(!ret);
 	(void)ret;
+}
+
+static struct token_bucket *find_token_bucket(struct rate_limit *rl,
+					      const struct sockaddr_in46 *addr)
+	__must_hold(&rl->lock)
+{
+	struct token_bucket *tb;
+	const void *ip_data;
+	int ret, family;
+
+	if (addr->sa.sa_family == AF_INET6) {
+		ip_data = &addr->in6.sin6_addr;
+		family = 6;
+	} else {
+		ip_data = &addr->in4.sin_addr;
+		family = 4;
+	}
+
+	tb = NULL;
+	ret = ip_map_get(&rl->ip_map, ip_data, family, (void **)&tb);
+	if (ret)
+		return NULL;
+
+	return tb;
+}
+
+static void ms_to_timespec(uint64_t ms, struct timespec *ts)
+{
+	ts->tv_sec = ms / 1000;
+	ts->tv_nsec = (ms % 1000) * 1000000;
+}
+
+static int start_bucket_timerfd(struct server_ctx *ctx, struct token_bucket *tb)
+	__must_hold(&rl->lock)
+{
+	struct itimerspec its;
+	int timer_fd, ret;
+
+	ret = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+	if (ret < 0) {
+		ret = errno;
+		pr_error("Failed to create timer FD: %s", strerror(ret));
+		return -ret;
+	}
+
+	timer_fd = ret;
+	ms_to_timespec(ctx->cfg.interval_ms, &its.it_interval);
+	its.it_value = its.it_interval;
+	ret = timerfd_settime(timer_fd, 0, &its, NULL);
+	if (ret) {
+		ret = errno;
+		pr_error("Failed to set timer FD: %s", strerror(ret));
+		close_fd_p(&ret);
+		return -ret;
+	}
+
+	tb->timer_fd = timer_fd;
+	return 0;
+}
+
+static int register_timer_fd(struct server_ctx *ctx, int fd, struct token_bucket *tb)
+	__must_hold(&rl->lock)
+{
+	union epoll_data data;
+	int ret;
+
+	data.ptr = tb;
+	data.u64 |= EPL_DT_MASK_TIMER;
+	ret = epoll_add(&ctx->workers[0], fd, EPOLLIN, data);
+	if (ret) {
+		pr_error("Failed to add timer FD to epoll: %s", strerror(-ret));
+		return ret;
+	}
+
+	return 0;
+}
+
+static struct token_bucket *create_token_bucket(struct server_ctx *ctx,
+					        struct rate_limit *rl,
+					        const struct sockaddr_in46 *addr)
+	__must_hold(&rl->lock)
+{
+	struct server_cfg *cfg = &ctx->cfg;
+	struct token_bucket *tb;
+	const void *ip_data;
+	int ret, family;
+
+	tb = calloc(1, sizeof(*tb));
+	if (!tb)
+		return NULL;
+
+	ret = pthread_mutex_init(&tb->lock, NULL);
+	if (ret) {
+		free(tb);
+		return NULL;
+	}
+
+	ret = start_bucket_timerfd(ctx, tb);
+	if (ret) {
+		pthread_mutex_destroy(&tb->lock);
+		free(tb);
+		return NULL;
+	}
+
+	if (addr->sa.sa_family == AF_INET6) {
+		tb->addr_family = 6;
+		tb->addr.in6 = addr->in6.sin6_addr;
+		ip_data = &addr->in6.sin6_addr;
+		family = 6;
+	} else {
+		tb->addr_family = 4;
+		tb->addr.in4 = addr->in4.sin_addr;
+		ip_data = &addr->in4.sin_addr;
+		family = 4;
+	}
+
+	ret = ip_map_add(&rl->ip_map, ip_data, family, tb);
+	if (ret) {
+		pthread_mutex_destroy(&tb->lock);
+		close_fd_p(&tb->timer_fd);
+		free(tb);
+		return NULL;
+	}
+
+	ret = register_timer_fd(ctx, tb->timer_fd, tb);
+	if (ret) {
+		ip_map_del(&rl->ip_map, ip_data, family);
+		pthread_mutex_destroy(&tb->lock);
+		close_fd_p(&tb->timer_fd);
+		free(tb);
+		return NULL;
+	}
+
+	pr_vdebug("Registered a timer for %s (fd=%d)", sockaddr_to_str(addr), tb->timer_fd);
+	atomic_store_explicit(&tb->download_tokens, cfg->max_download_speed, memory_order_relaxed);
+	atomic_store_explicit(&tb->upload_tokens, cfg->max_upload_speed, memory_order_relaxed);
+	tb->max_download_tokens = cfg->max_download_speed;
+	tb->max_upload_tokens = cfg->max_upload_speed;
+	tb->clients = NULL;
+	tb->ref_cnt = 1;
+	return tb;
+}
+
+static void delete_token_bucket(struct rate_limit *rl, struct token_bucket *tb)
+	__must_hold(&rl->lock)
+{
+	const void *ip_data;
+	int ret, family;
+
+	if (tb->addr_family == 6) {
+		ip_data = &tb->addr.in6;
+		family = 6;
+	} else {
+		ip_data = &tb->addr.in4;
+		family = 4;
+	}
+
+	ret = ip_map_del(&rl->ip_map, ip_data, family);
+	if (ret) {
+		pr_warn("Failed to delete token bucket from IP map: %s", strerror(ret));
+		return;
+	}
+
+	pthread_mutex_destroy(&tb->lock);
+	close_fd_p(&tb->timer_fd);
+	free(tb);
+}
+
+static void put_token_bucket_locked(struct server_wrk *w, struct token_bucket *tb)
+	__must_hold(&ctx->rl.lock)
+	__must_hold(&tb->lock)
+{
+	struct server_ctx *ctx = w->ctx;
+	uint32_t ref;
+
+	assert(tb->ref_cnt > 0);
+	ref = --tb->ref_cnt;
+
+	if (ref == 0) {
+		pr_vdebug("Deleting token bucket (thread=%u)", w->idx);
+		delete_token_bucket(&ctx->rl, tb);
+	} else {
+		pr_vdebug("Putting token bucket (ref=%u; thread=%u)", ref, w->idx);
+	}
+}
+
+static void put_token_bucket(struct server_wrk *w, struct token_bucket *tb)
+{
+	struct server_ctx *ctx = w->ctx;
+
+	assert(ctx->cfg.using_rate_limit);
+	pthread_mutex_lock(&ctx->rl.lock);
+	pthread_mutex_lock(&tb->lock);
+
+	put_token_bucket_locked(w, tb);
+
+	pthread_mutex_unlock(&tb->lock);
+	pthread_mutex_unlock(&ctx->rl.lock);
+}
+
+static struct token_bucket *get_or_create_token_bucket(struct server_ctx *ctx,
+						       struct sockaddr_in46 *addr)
+{
+	struct token_bucket *tb;
+
+	pthread_mutex_lock(&ctx->rl.lock);
+	tb = find_token_bucket(&ctx->rl, addr);
+	if (!tb)
+		tb = create_token_bucket(ctx, &ctx->rl, addr);
+
+	if (tb) {
+		pthread_mutex_lock(&tb->lock);
+		tb->ref_cnt++;
+		pthread_mutex_unlock(&tb->lock);
+	}
+	pthread_mutex_unlock(&ctx->rl.lock);
+	return tb;
 }
 
 static int prepare_tcp_target_connect(struct server_wrk *w, struct sockaddr_in46 *taddr)
@@ -1477,9 +1731,17 @@ static int register_new_tcp_client(struct server_ctx *ctx, int fd,
 {
 	int target_fd, ret, family_hint;
 	struct sockaddr_in46 taddr;
+	struct token_bucket *tb;
 	struct client_state *c;
 	union epoll_data data;
 	struct server_wrk *w;
+
+	tb = get_or_create_token_bucket(ctx, addr);
+	if (unlikely(!tb)) {
+		pr_error("Failed to create token bucket for %s (cfd=%d)",
+			 sockaddr_to_str(addr), fd);
+		return -EAGAIN;
+	}
 
 	w = pick_worker_for_new_conn(ctx, addr);
 	c = get_free_client_slot(w);
@@ -1489,6 +1751,8 @@ static int register_new_tcp_client(struct server_ctx *ctx, int fd,
 		return -EAGAIN;
 	}
 
+	c->tbucket = tb;
+	c->wrk_ref = w;
 	if (ctx->cfg.run_as_tproxy_tcp) {
 		if (addr->sa.sa_family == AF_INET6) {
 			if (IN6_IS_ADDR_V4MAPPED(&addr->in6.sin6_addr))
@@ -1992,6 +2256,98 @@ static int handle_event_tcp_client_data(struct server_wrk *w, struct epoll_event
 	return 0;
 }
 
+static int fill_token_bucket(struct server_wrk *w, struct token_bucket *tb)
+{
+	uint32_t i, nr_clients;
+	struct client_state *c;
+	struct server_wrk *cw;
+	union epoll_data data;
+	int ret = 0;
+
+	atomic_store(&tb->download_tokens, tb->max_download_tokens);
+	atomic_store(&tb->upload_tokens, tb->max_upload_tokens);
+
+	pthread_mutex_lock(&tb->lock);
+	assert(tb->ref_cnt > 0);
+	nr_clients = tb->ref_cnt - 1;
+	if (atomic_load(&tb->nr_rate_limited_clients)) {
+		for (i = 0; i < nr_clients; i++) {
+			c = tb->clients[i];
+			if (!c->is_rate_limited)
+				continue;
+
+			cw = c->wrk_ref;
+			c->tpoll_mask = EPOLLIN;
+			data.ptr = c;
+			data.u64 |= EPL_DT_MASK_TARGET_TCP_DATA;
+			ret = epoll_mod(cw, c->target_fd, c->tpoll_mask, data);
+			assert(!ret);
+			if (ret)
+				break;
+
+			c->cpoll_mask = EPOLLIN;
+			data.ptr = c;
+			data.u64 |= EPL_DT_MASK_CLIENT_TCP_DATA;
+			ret = epoll_mod(cw, c->client_fd, c->cpoll_mask, data);
+			assert(!ret);
+			if (ret)
+				break;
+
+			c->is_rate_limited = false;
+			send_event_fd(cw);
+		}
+	}
+
+	if (tb->ref_cnt == 1) {
+		/*
+		 * Keep the lock ordering: Take &ctx->rl.lock first then &tb->lock.
+		 */
+		pthread_mutex_unlock(&tb->lock);
+
+		pthread_mutex_lock(&w->ctx->rl.lock);
+		pthread_mutex_lock(&tb->lock);
+
+		/*
+		 * tb->ref_cnt might've changed under us when
+		 * releasing &tb->lock. Check again...
+		 */
+		if (tb->ref_cnt == 1)
+			put_token_bucket_locked(w, tb);
+
+		pthread_mutex_unlock(&tb->lock);
+		pthread_mutex_unlock(&w->ctx->rl.lock);
+	} else {
+		pthread_mutex_unlock(&tb->lock);
+	}
+
+	return ret;
+}
+
+static int handle_event_timer(struct server_wrk *w, struct epoll_event *ev)
+{
+	struct token_bucket *tb = ev->data.ptr;
+	uint64_t nr_exps;
+	int ret;
+
+	ret = read(tb->timer_fd, &nr_exps, sizeof(nr_exps));
+	if (unlikely(ret < 0)) {
+		ret = errno;
+		if (ret == EAGAIN)
+			return 0;
+
+		pr_error("Failed to read timer FD: %s", strerror(ret));
+		return -ret;
+	}
+
+	if (unlikely(ret != sizeof(nr_exps))) {
+		pr_error("Failed to read timer FD: short read");
+		return -EIO;
+	}
+
+	pr_debug("Timer expired");
+	return fill_token_bucket(w, tb);
+}
+
 static int poll_events(struct server_wrk *w)
 {
 	int ret;
@@ -2025,8 +2381,8 @@ static int handle_event(struct server_wrk *w, struct epoll_event *ev)
 		return handle_event_event_fd(w, ev);
 	}
 
-	mask = ev->data.u64 & EPL_DT_MASK_CLIENT_TCP_DATA;
-	ev->data.u64 &= ~EPL_DT_MASK_CLIENT_TCP_DATA;
+	mask = ev->data.u64 & EPL_DT_MASK_ALL;
+	ev->data.u64 &= ~EPL_DT_MASK_ALL;
 
 	switch (mask) {
 	case EPL_DT_MASK_CLIENT_TCP_DATA:
@@ -2039,6 +2395,8 @@ static int handle_event(struct server_wrk *w, struct epoll_event *ev)
 		return 0;
 	case EPL_DT_MASK_TARGET_UDP_DATA:
 		return 0;
+	case EPL_DT_MASK_TIMER:
+		return handle_event_timer(w, ev);
 	}
 
 	pr_warn("Unknown event data: 0x%lx (mask: 0x%lx)", ev->data.u64, mask);
