@@ -128,8 +128,8 @@ struct client_state {
 	struct sockaddr_in46	target_addr;
 	struct token_bucket	*tbucket;
 	struct server_wrk	*wrk_ref;
-	bool			is_up_rate_limited;
-	bool			is_down_rate_limited;
+	volatile bool		is_up_rate_limited;
+	volatile bool		is_down_rate_limited;
 };
 
 struct client_stack {
@@ -1734,6 +1734,12 @@ static void put_client_slot(struct server_wrk *w, struct client_state *c)
 	bool handle_events_should_break = false;
 	int ret, tmp;
 
+	if (c->tbucket) {
+		assert(w->ctx->cfg.using_rate_limit);
+		put_token_bucket(w->ctx, c->tbucket, c);
+		c->tbucket = NULL;
+	}
+
 	if (c->cbuf) {
 		free(c->cbuf);
 		c->cbuf = NULL;
@@ -1784,12 +1790,6 @@ static void put_client_slot(struct server_wrk *w, struct client_state *c)
 
 	memset(&c->client_addr, 0, sizeof(c->client_addr));
 	memset(&c->target_addr, 0, sizeof(c->target_addr));
-
-	if (c->tbucket) {
-		assert(w->ctx->cfg.using_rate_limit);
-		put_token_bucket(w->ctx, c->tbucket, c);
-		c->tbucket = NULL;
-	}
 
 	ret = push_client_stack(w->cl_stack, c->idx);
 	assert(!ret);
@@ -2234,9 +2234,15 @@ do_send:
 
 static size_t get_max_down_bytes(struct token_bucket *tb)
 {
-	int64_t tokens = atomic_load(&tb->download_tokens);
-	uint32_t nr = atomic_load(&tb->nr_clients);
+	int64_t tokens;
+	uint32_t nr;
 	size_t ret;
+
+	if (!tb)
+		return SPLICE_BUF_SIZE;
+
+	tokens = atomic_load(&tb->download_tokens);
+	nr = atomic_load(&tb->nr_clients);
 
 	assert(nr > 0);
 	if (tokens <= 0)
@@ -2251,9 +2257,15 @@ static size_t get_max_down_bytes(struct token_bucket *tb)
 
 static size_t get_max_up_bytes(struct token_bucket *tb)
 {
-	int64_t tokens = atomic_load(&tb->upload_tokens);
-	uint32_t nr = atomic_load(&tb->nr_clients);
+	int64_t tokens;
+	uint32_t nr;
 	size_t ret;
+
+	if (!tb)
+		return SPLICE_BUF_SIZE;
+
+	tokens = atomic_load(&tb->upload_tokens);
+	nr = atomic_load(&tb->nr_clients);
 
 	assert(nr > 0);
 	if (tokens <= 0)
@@ -2272,7 +2284,8 @@ static int mark_client_up_rate_limited(struct client_state *c)
 	union epoll_data data;
 	int ret;
 
-	assert(!c->is_up_rate_limited);
+	if (c->is_up_rate_limited)
+		return 0;
 
 	data.u64 = 0;
 	data.ptr = c;
@@ -2281,6 +2294,7 @@ static int mark_client_up_rate_limited(struct client_state *c)
 	ret = epoll_mod(w, c->client_fd, c->cpoll_mask, data);
 	c->is_up_rate_limited = true;
 	atomic_fetch_add(&c->tbucket->nr_up_rate_limted, 1u);
+	pr_debug("Client %s is upload rate limited", sockaddr_to_str(&c->client_addr));
 	return ret;
 }
 
@@ -2290,7 +2304,8 @@ static int mark_client_down_rate_limited(struct client_state *c)
 	union epoll_data data;
 	int ret;
 
-	assert(!c->is_down_rate_limited);
+	if (c->is_down_rate_limited)
+		return 0;
 
 	data.u64 = 0;
 	data.ptr = c;
@@ -2299,6 +2314,7 @@ static int mark_client_down_rate_limited(struct client_state *c)
 	ret = epoll_mod(w, c->target_fd, c->tpoll_mask, data);
 	c->is_down_rate_limited = true;
 	atomic_fetch_add(&c->tbucket->nr_down_rate_limted, 1u);
+	pr_debug("Client %s is download rate limited", sockaddr_to_str(&c->client_addr));
 	return ret;
 }
 
@@ -2331,7 +2347,9 @@ static int handle_event_tcp_target_data(struct server_wrk *w, struct epoll_event
 				return 0;
 			}
 
-			atomic_fetch_sub(&c->tbucket->download_tokens, (int64_t)ret);
+			if (w->ctx->cfg.using_rate_limit)
+				atomic_fetch_sub(&c->tbucket->download_tokens, (int64_t)ret);
+
 			c->tbuf_len = sb.cur_len;
 			if (c->tbuf_len > 0) {
 				/*
@@ -2380,7 +2398,9 @@ static int handle_event_tcp_target_data(struct server_wrk *w, struct epoll_event
 				return 0;
 			}
 
-			atomic_fetch_sub(&c->tbucket->upload_tokens, (int64_t)ret);
+			if (w->ctx->cfg.using_rate_limit)
+				atomic_fetch_sub(&c->tbucket->upload_tokens, (int64_t)ret);
+
 			c->cbuf_len = sb.cur_len;
 			if (c->cbuf_len == 0) {
 				/*
@@ -2446,7 +2466,9 @@ static int handle_event_tcp_client_data(struct server_wrk *w, struct epoll_event
 				return 0;
 			}
 
-			atomic_fetch_sub(&c->tbucket->upload_tokens, (int64_t)ret);
+			if (w->ctx->cfg.using_rate_limit)
+				atomic_fetch_sub(&c->tbucket->upload_tokens, (int64_t)ret);
+
 			c->cbuf_len = sb.cur_len;
 			if (c->cbuf_len > 0) {
 				/*
@@ -2495,7 +2517,9 @@ static int handle_event_tcp_client_data(struct server_wrk *w, struct epoll_event
 				return 0;
 			}
 
-			atomic_fetch_sub(&c->tbucket->download_tokens, (int64_t)ret);
+			if (w->ctx->cfg.using_rate_limit)
+				atomic_fetch_sub(&c->tbucket->download_tokens, (int64_t)ret);
+
 			c->tbuf_len = sb.cur_len;
 			if (c->tbuf_len == 0) {
 				/*
