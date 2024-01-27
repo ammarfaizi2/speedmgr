@@ -78,10 +78,10 @@ struct client_state;
 struct token_bucket {
 	pthread_mutex_t		lock;
 	int			timer_fd;
-	_Atomic(uint64_t)	upload_tokens;
-	_Atomic(uint64_t)	download_tokens;
-	uint64_t		max_upload_tokens;
-	uint64_t		max_download_tokens;
+	_Atomic(int64_t)	upload_tokens;
+	_Atomic(int64_t)	download_tokens;
+	int64_t			max_upload_tokens;
+	int64_t			max_download_tokens;
 	uint32_t		ref_cnt;	/* Protected by lock. */
 	uint32_t		nr_clients;	/* Protected by lock. */
 	struct client_state	**clients;	/* Protected by lock. */
@@ -148,8 +148,8 @@ struct server_cfg {
 	bool			run_as_tproxy_udp;
 	int			tcp_backlog;
 	uint32_t		nr_workers;
-	uint64_t		max_upload_speed;
-	uint64_t		max_download_speed;
+	int64_t			max_upload_speed;
+	int64_t			max_download_speed;
 	uint32_t		interval_ms;
 	struct sockaddr_in46	tcp_bind_addr;
 	struct sockaddr_in46	tcp_target_addr;
@@ -438,12 +438,12 @@ static int parse_args(int argc, char *argv[], struct server_cfg *cfg)
 			break;
 
 		case 'u':
-			cfg->max_download_speed = (uint64_t)strtoull(optarg, NULL, 10);
+			cfg->max_download_speed = (int64_t)atoll(optarg);
 			p.got_max_download_speed = true;
 			break;
 
 		case 'd':
-			cfg->max_upload_speed = (uint64_t)strtoull(optarg, NULL, 10);
+			cfg->max_upload_speed = (int64_t)atoll(optarg);
 			p.got_max_upload_speed = true;
 			break;
 
@@ -1815,7 +1815,7 @@ static int handle_event_tcp_target_data(struct server_wrk *w, struct epoll_event
 	ssize_t ret;
 	int err;
 
-	if (unlikely(events & (EPOLLERR | EPOLLHUP))) {
+	if (events & (EPOLLERR | EPOLLHUP)) {
 		put_client_slot(w, c);
 		return 0;
 	}
@@ -1908,7 +1908,7 @@ static int handle_event_tcp_client_data(struct server_wrk *w, struct epoll_event
 	ssize_t ret;
 	int err;
 
-	if (unlikely(events & (EPOLLERR | EPOLLHUP))) {
+	if (events & (EPOLLERR | EPOLLHUP)) {
 		put_client_slot(w, c);
 		return 0;
 	}
