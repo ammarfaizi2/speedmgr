@@ -2447,6 +2447,9 @@ static int fill_token_bucket(struct server_wrk *w, struct token_bucket *tb)
 		return 0;
 	}
 
+	atomic_store(&tb->download_tokens, tb->max_download_tokens);
+	atomic_store(&tb->upload_tokens, tb->max_upload_tokens);
+
 	n = atomic_load(&tb->nr_down_rate_limted);
 	if (n) {
 		for (i = 0; i < tb->nr_clients; i++) {
