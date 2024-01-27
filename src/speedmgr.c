@@ -96,6 +96,8 @@ struct token_bucket {
 	_Atomic(int64_t)	download_tokens;
 	int64_t			max_upload_tokens;
 	int64_t			max_download_tokens;
+	_Atomic(uint32_t)	nr_up_rate_limted;
+	_Atomic(uint32_t)	nr_down_rate_limted;
 	uint32_t		ref_cnt;	/* Protected by lock. */
 	uint32_t		nr_clients;	/* Protected by lock. */
 	struct client_state	**clients;	/* Protected by lock. */
@@ -110,6 +112,8 @@ struct rate_limit {
 	ip_map_t		ip_map;
 };
 
+struct server_wrk;
+
 struct client_state {
 	int			client_fd;
 	int			target_fd;
@@ -123,7 +127,9 @@ struct client_state {
 	struct sockaddr_in46	client_addr;
 	struct sockaddr_in46	target_addr;
 	struct token_bucket	*tbucket;
-	bool			is_rate_limited;
+	struct server_wrk	*wrk_ref;
+	bool			is_up_rate_limited;
+	bool			is_down_rate_limited;
 };
 
 struct client_stack {
@@ -1449,7 +1455,8 @@ static void init_client(struct client_state *c)
 	memset(&c->client_addr, 0, sizeof(c->client_addr));
 	memset(&c->target_addr, 0, sizeof(c->target_addr));
 	c->tbucket = NULL;
-	c->is_rate_limited = false;
+	c->is_up_rate_limited = false;
+	c->is_down_rate_limited = false;
 }
 
 static int init_clients(struct server_wrk *w)
@@ -1762,7 +1769,11 @@ static void put_client_slot(struct server_wrk *w, struct client_state *c)
 	if (unlikely(handle_events_should_break && w->ctx->accept_need_rearm))
 		rearm_tcp_accept(w->ctx);
 
-	c->is_rate_limited = false;
+	c->is_up_rate_limited = false;
+	c->is_down_rate_limited = false;
+	c->wrk_ref = NULL;
+	c->cpoll_mask = 0;
+	c->tpoll_mask = 0;
 	w->handle_events_should_break = handle_events_should_break;
 	atomic_fetch_sub(&w->nr_active_clients, 1u);
 
@@ -1872,6 +1883,8 @@ static int register_new_tcp_client(struct server_ctx *ctx, int fd,
 			 fd, sockaddr_to_str(addr), w->idx);
 		return -EAGAIN;
 	}
+
+	c->wrk_ref = w;
 
 	if (ctx->cfg.using_rate_limit) {
 		struct in46_addr key_addr;
@@ -2403,8 +2416,7 @@ static int handle_event_tcp_client_data(struct server_wrk *w, struct epoll_event
 
 static int fill_token_bucket(struct server_wrk *w, struct token_bucket *tb)
 {
-	struct client_state *c;
-	uint32_t i;
+	uint32_t i, n;
 
 	pthread_mutex_lock(&tb->lock);
 	pr_debug("NR clients of (%s): %u", addr_to_str(&tb->addr), tb->nr_clients);
@@ -2432,7 +2444,65 @@ static int fill_token_bucket(struct server_wrk *w, struct token_bucket *tb)
 
 		pthread_mutex_unlock(&tb->lock);
 		pthread_mutex_unlock(&w->ctx->rl.lock);
+		return 0;
 	}
+
+	n = atomic_load(&tb->nr_down_rate_limted);
+	if (n) {
+		for (i = 0; i < tb->nr_clients; i++) {
+			struct client_state *c = tb->clients[i];
+			struct server_wrk *cw = c->wrk_ref;
+			union epoll_data data;
+			int ret;
+
+			if (!n)
+				break;
+
+			if (!c->is_down_rate_limited)
+				continue;
+
+			c->is_down_rate_limited = false;
+			atomic_fetch_sub(&tb->nr_down_rate_limted, 1u);
+			n--;
+
+			data.u64 = 0;
+			data.ptr = c;
+			data.u64 |= EPL_DT_MASK_TARGET_TCP_DATA;
+			c->tpoll_mask |= EPOLLIN;
+			ret = epoll_mod(cw, c->target_fd, c->tpoll_mask, data);
+			assert(!ret);
+			(void)ret;
+		}
+	}
+
+	n = atomic_load(&tb->nr_up_rate_limted);
+	if (n) {
+		for (i = 0; i < tb->nr_clients; i++) {
+			struct client_state *c = tb->clients[i];
+			struct server_wrk *cw = c->wrk_ref;
+			union epoll_data data;
+			int ret;
+
+			if (!n)
+				break;
+
+			if (!c->is_up_rate_limited)
+				continue;
+
+			c->is_up_rate_limited = false;
+			atomic_fetch_sub(&tb->nr_up_rate_limted, 1u);
+			n--;
+
+			data.u64 = 0;
+			data.ptr = c;
+			data.u64 |= EPL_DT_MASK_CLIENT_TCP_DATA;
+			c->cpoll_mask |= EPOLLIN;
+			ret = epoll_mod(cw, c->client_fd, c->cpoll_mask, data);
+			assert(!ret);
+			(void)ret;
+		}
+	}
+
 	pthread_mutex_unlock(&tb->lock);
 	return 0;
 }
