@@ -99,7 +99,7 @@ struct token_bucket {
 	_Atomic(uint32_t)	nr_up_rate_limted;
 	_Atomic(uint32_t)	nr_down_rate_limted;
 	uint32_t		ref_cnt;	/* Protected by lock. */
-	uint32_t		nr_clients;	/* Protected by lock. */
+	_Atomic(uint32_t)	nr_clients;	/* Protected by lock. */
 	struct client_state	**clients;	/* Protected by lock. */
 	struct in46_addr	addr;
 };
@@ -592,6 +592,7 @@ static const char *addr_to_str(const struct in46_addr *addr)
 	if (addr->family == 4)
 		return inet_ntop(AF_INET, &addr->in4, buf, sizeof(__buf[0]));
 
+	memset(buf, 0, sizeof(__buf[0]));
 	buf[0] = '[';
 	inet_ntop(AF_INET6, &addr->in6, buf + 1, sizeof(addr->in6));
 	strcat(buf, "]");
@@ -1050,6 +1051,10 @@ static int start_token_bucket_timer(struct server_ctx *ctx, struct token_bucket 
 		return ret;
 	}
 
+	tb->max_upload_tokens = ctx->cfg.max_upload_speed;
+	tb->max_download_tokens = ctx->cfg.max_download_speed;
+	atomic_store(&tb->upload_tokens, tb->max_upload_tokens);
+	atomic_store(&tb->download_tokens, tb->max_download_tokens);
 	return 0;
 }
 
@@ -2227,6 +2232,76 @@ do_send:
 	return ret;
 }
 
+static size_t get_max_down_bytes(struct token_bucket *tb)
+{
+	int64_t tokens = atomic_load(&tb->download_tokens);
+	uint32_t nr = atomic_load(&tb->nr_clients);
+	size_t ret;
+
+	assert(nr > 0);
+	if (tokens <= 0)
+		return 0;
+
+	ret = (size_t)(tokens / nr);
+	if (!ret)
+		ret = 1;
+
+	return ret;
+}
+
+static size_t get_max_up_bytes(struct token_bucket *tb)
+{
+	int64_t tokens = atomic_load(&tb->upload_tokens);
+	uint32_t nr = atomic_load(&tb->nr_clients);
+	size_t ret;
+
+	assert(nr > 0);
+	if (tokens <= 0)
+		return 0;
+
+	ret = (size_t)(tokens / nr);
+	if (!ret)
+		ret = 1;
+
+	return ret;
+}
+
+static int mark_client_up_rate_limited(struct client_state *c)
+{
+	struct server_wrk *w = c->wrk_ref;
+	union epoll_data data;
+	int ret;
+
+	assert(!c->is_up_rate_limited);
+
+	data.u64 = 0;
+	data.ptr = c;
+	data.u64 |= EPL_DT_MASK_CLIENT_TCP_DATA;
+	c->cpoll_mask &= ~EPOLLIN;
+	ret = epoll_mod(w, c->client_fd, c->cpoll_mask, data);
+	c->is_up_rate_limited = true;
+	atomic_fetch_add(&c->tbucket->nr_up_rate_limted, 1u);
+	return ret;
+}
+
+static int mark_client_down_rate_limited(struct client_state *c)
+{
+	struct server_wrk *w = c->wrk_ref;
+	union epoll_data data;
+	int ret;
+
+	assert(!c->is_down_rate_limited);
+
+	data.u64 = 0;
+	data.ptr = c;
+	data.u64 |= EPL_DT_MASK_TARGET_TCP_DATA;
+	c->tpoll_mask &= ~EPOLLIN;
+	ret = epoll_mod(w, c->target_fd, c->tpoll_mask, data);
+	c->is_down_rate_limited = true;
+	atomic_fetch_add(&c->tbucket->nr_down_rate_limted, 1u);
+	return ret;
+}
+
 static int handle_event_tcp_target_data(struct server_wrk *w, struct epoll_event *ev)
 {
 	struct client_state *c = ev->data.ptr;
@@ -2242,78 +2317,100 @@ static int handle_event_tcp_target_data(struct server_wrk *w, struct epoll_event
 	}
 
 	if (events & EPOLLIN) {
-		sb.buf = c->tbuf;
-		sb.cur_len = c->tbuf_len;
-		sb.max_len = SPLICE_BUF_SIZE;
-		sb.max_recv = sb.max_len;
-		sb.max_send = sb.max_len;
-		ret = do_tcp_splice(c->target_fd, c->client_fd, &sb);
-		if (unlikely(ret < 0)) {
-			put_client_slot(w, c);
-			return 0;
-		}
+		size_t max_down = get_max_down_bytes(c->tbucket);
 
-		c->tbuf_len = sb.cur_len;
-		if (c->tbuf_len > 0) {
-			/*
-			 * Client is not ready to receive more data, so we
-			 * need to wait for EPOLLOUT.
-			 */
-			data.ptr = c;
-			data.u64 |= EPL_DT_MASK_CLIENT_TCP_DATA;
-			c->cpoll_mask |= EPOLLOUT;
-			err = epoll_mod(w, c->client_fd, c->cpoll_mask, data);
-			assert(!err);
-		}
+		if (max_down > 0) {
+			sb.buf = c->tbuf;
+			sb.cur_len = c->tbuf_len;
+			sb.max_len = SPLICE_BUF_SIZE;
+			sb.max_recv = max_down;
+			sb.max_send = max_down;
+			ret = do_tcp_splice(c->target_fd, c->client_fd, &sb);
+			if (unlikely(ret < 0)) {
+				put_client_slot(w, c);
+				return 0;
+			}
 
-		if (c->tbuf_len == SPLICE_BUF_SIZE) {
-			/*
-			 * Target buffer is full, stop reading from target
-			 * until we have more space.
-			 */
-			data.ptr = c;
-			data.u64 |= EPL_DT_MASK_TARGET_TCP_DATA;
-			c->tpoll_mask &= ~EPOLLIN;
-			err = epoll_mod(w, c->target_fd, c->tpoll_mask, data);
-			assert(!err);
+			atomic_fetch_sub(&c->tbucket->download_tokens, (int64_t)ret);
+			c->tbuf_len = sb.cur_len;
+			if (c->tbuf_len > 0) {
+				/*
+				* Client is not ready to receive more data, so we
+				* need to wait for EPOLLOUT.
+				*/
+				data.ptr = c;
+				data.u64 |= EPL_DT_MASK_CLIENT_TCP_DATA;
+				c->cpoll_mask |= EPOLLOUT;
+				err = epoll_mod(w, c->client_fd, c->cpoll_mask, data);
+				assert(!err);
+			}
+
+			if (c->tbuf_len == SPLICE_BUF_SIZE) {
+				/*
+				* Target buffer is full, stop reading from target
+				* until we have more space.
+				*/
+				data.ptr = c;
+				data.u64 |= EPL_DT_MASK_TARGET_TCP_DATA;
+				c->tpoll_mask &= ~EPOLLIN;
+				err = epoll_mod(w, c->target_fd, c->tpoll_mask, data);
+				assert(!err);
+			}
+		} else {
+			ret = mark_client_down_rate_limited(c);
+			if (unlikely(ret)) {
+				put_client_slot(w, c);
+				return 0;
+			}
 		}
 	}
 
 	if (events & EPOLLOUT) {
-		sb.buf = c->cbuf;
-		sb.cur_len = c->cbuf_len;
-		sb.max_len = SPLICE_BUF_SIZE;
-		sb.max_recv = sb.max_len;
-		sb.max_send = sb.max_len;
-		ret = do_tcp_splice(c->client_fd, c->target_fd, &sb);
-		if (unlikely(ret < 0)) {
-			put_client_slot(w, c);
-			return 0;
-		}
+		size_t max_up = get_max_up_bytes(c->tbucket);
 
-		c->cbuf_len = sb.cur_len;
-		if (c->cbuf_len == 0) {
-			/*
-			 * Buffer is fully flushed to the target, stop
-			 * the EPOLLOUT event.
-			 */
-			data.ptr = c;
-			data.u64 |= EPL_DT_MASK_TARGET_TCP_DATA;
-			c->tpoll_mask &= ~EPOLLOUT;
-			err = epoll_mod(w, c->target_fd, c->tpoll_mask, data);
-			assert(!err);
-		}
+		if (max_up > 0) {
+			sb.buf = c->cbuf;
+			sb.cur_len = c->cbuf_len;
+			sb.max_len = SPLICE_BUF_SIZE;
+			sb.max_recv = max_up;
+			sb.max_send = max_up;
+			ret = do_tcp_splice(c->client_fd, c->target_fd, &sb);
+			if (unlikely(ret < 0)) {
+				put_client_slot(w, c);
+				return 0;
+			}
 
-		if (c->cbuf_len < SPLICE_BUF_SIZE && !(c->cpoll_mask & EPOLLIN)) {
-			/*
-			 * Client is ready to receive more data, start
-			 * reading from client again.
-			 */
-			data.ptr = c;
-			data.u64 |= EPL_DT_MASK_CLIENT_TCP_DATA;
-			c->cpoll_mask |= EPOLLIN;
-			err = epoll_mod(w, c->client_fd, c->cpoll_mask, data);
-			assert(!err);
+			atomic_fetch_sub(&c->tbucket->upload_tokens, (int64_t)ret);
+			c->cbuf_len = sb.cur_len;
+			if (c->cbuf_len == 0) {
+				/*
+				* Buffer is fully flushed to the target, stop
+				* the EPOLLOUT event.
+				*/
+				data.ptr = c;
+				data.u64 |= EPL_DT_MASK_TARGET_TCP_DATA;
+				c->tpoll_mask &= ~EPOLLOUT;
+				err = epoll_mod(w, c->target_fd, c->tpoll_mask, data);
+				assert(!err);
+			}
+
+			if (c->cbuf_len < SPLICE_BUF_SIZE && !(c->cpoll_mask & EPOLLIN)) {
+				/*
+				* Client is ready to receive more data, start
+				* reading from client again.
+				*/
+				data.ptr = c;
+				data.u64 |= EPL_DT_MASK_CLIENT_TCP_DATA;
+				c->cpoll_mask |= EPOLLIN;
+				err = epoll_mod(w, c->client_fd, c->cpoll_mask, data);
+				assert(!err);
+			}
+		} else {
+			ret = mark_client_up_rate_limited(c);
+			if (unlikely(ret)) {
+				put_client_slot(w, c);
+				return 0;
+			}
 		}
 	}
 
@@ -2335,78 +2432,100 @@ static int handle_event_tcp_client_data(struct server_wrk *w, struct epoll_event
 	}
 
 	if (events & EPOLLIN) {
-		sb.buf = c->cbuf;
-		sb.cur_len = c->cbuf_len;
-		sb.max_len = SPLICE_BUF_SIZE;
-		sb.max_recv = sb.max_len;
-		sb.max_send = sb.max_len;
-		ret = do_tcp_splice(c->client_fd, c->target_fd, &sb);
-		if (unlikely(ret < 0)) {
-			put_client_slot(w, c);
-			return 0;
-		}
+		size_t max_up = get_max_up_bytes(c->tbucket);
 
-		c->cbuf_len = sb.cur_len;
-		if (c->cbuf_len > 0) {
-			/*
-			 * Target is not ready to receive more data, so we
-			 * need to wait for EPOLLOUT.
-			 */
-			data.ptr = c;
-			data.u64 |= EPL_DT_MASK_TARGET_TCP_DATA;
-			c->tpoll_mask |= EPOLLOUT;
-			err = epoll_mod(w, c->target_fd, c->tpoll_mask, data);
-			assert(!err);
-		}
+		if (max_up > 0) {
+			sb.buf = c->cbuf;
+			sb.cur_len = c->cbuf_len;
+			sb.max_len = SPLICE_BUF_SIZE;
+			sb.max_recv = max_up;
+			sb.max_send = max_up;
+			ret = do_tcp_splice(c->client_fd, c->target_fd, &sb);
+			if (unlikely(ret < 0)) {
+				put_client_slot(w, c);
+				return 0;
+			}
 
-		if (c->cbuf_len == SPLICE_BUF_SIZE) {
-			/*
-			 * Client buffer is full, stop reading from client
-			 * until we have more space.
-			 */
-			data.ptr = c;
-			data.u64 |= EPL_DT_MASK_CLIENT_TCP_DATA;
-			c->cpoll_mask &= ~EPOLLIN;
-			err = epoll_mod(w, c->client_fd, c->cpoll_mask, data);
-			assert(!err);
+			atomic_fetch_sub(&c->tbucket->upload_tokens, (int64_t)ret);
+			c->cbuf_len = sb.cur_len;
+			if (c->cbuf_len > 0) {
+				/*
+				* Target is not ready to receive more data, so we
+				* need to wait for EPOLLOUT.
+				*/
+				data.ptr = c;
+				data.u64 |= EPL_DT_MASK_TARGET_TCP_DATA;
+				c->tpoll_mask |= EPOLLOUT;
+				err = epoll_mod(w, c->target_fd, c->tpoll_mask, data);
+				assert(!err);
+			}
+
+			if (c->cbuf_len == SPLICE_BUF_SIZE) {
+				/*
+				* Client buffer is full, stop reading from client
+				* until we have more space.
+				*/
+				data.ptr = c;
+				data.u64 |= EPL_DT_MASK_CLIENT_TCP_DATA;
+				c->cpoll_mask &= ~EPOLLIN;
+				err = epoll_mod(w, c->client_fd, c->cpoll_mask, data);
+				assert(!err);
+			}
+		} else {
+			ret = mark_client_up_rate_limited(c);
+			if (unlikely(ret)) {
+				put_client_slot(w, c);
+				return 0;
+			}
 		}
 	}
 
 	if (events & EPOLLOUT) {
-		sb.buf = c->tbuf;
-		sb.cur_len = c->tbuf_len;
-		sb.max_len = SPLICE_BUF_SIZE;
-		sb.max_recv = sb.max_len;
-		sb.max_send = sb.max_len;
-		ret = do_tcp_splice(c->target_fd, c->client_fd, &sb);
-		if (unlikely(ret < 0)) {
-			put_client_slot(w, c);
-			return 0;
-		}
+		size_t max_down = get_max_down_bytes(c->tbucket);
 
-		c->tbuf_len = sb.cur_len;
-		if (c->tbuf_len == 0) {
-			/*
-			 * Buffer is fully flushed to the client, stop
-			 * the EPOLLOUT event.
-			 */
-			data.ptr = c;
-			data.u64 |= EPL_DT_MASK_CLIENT_TCP_DATA;
-			c->cpoll_mask &= ~EPOLLOUT;
-			err = epoll_mod(w, c->client_fd, c->cpoll_mask, data);
-			assert(!err);
-		}
+		if (max_down > 0) {
+			sb.buf = c->tbuf;
+			sb.cur_len = c->tbuf_len;
+			sb.max_len = SPLICE_BUF_SIZE;
+			sb.max_recv = max_down;
+			sb.max_send = max_down;
+			ret = do_tcp_splice(c->target_fd, c->client_fd, &sb);
+			if (unlikely(ret < 0)) {
+				put_client_slot(w, c);
+				return 0;
+			}
 
-		if (c->tbuf_len < SPLICE_BUF_SIZE && !(c->tpoll_mask & EPOLLIN)) {
-			/*
-			 * Target is ready to receive more data, start
-			 * reading from target again.
-			 */
-			data.ptr = c;
-			data.u64 |= EPL_DT_MASK_TARGET_TCP_DATA;
-			c->tpoll_mask |= EPOLLIN;
-			err = epoll_mod(w, c->target_fd, c->tpoll_mask, data);
-			assert(!err);
+			atomic_fetch_sub(&c->tbucket->download_tokens, (int64_t)ret);
+			c->tbuf_len = sb.cur_len;
+			if (c->tbuf_len == 0) {
+				/*
+				* Buffer is fully flushed to the client, stop
+				* the EPOLLOUT event.
+				*/
+				data.ptr = c;
+				data.u64 |= EPL_DT_MASK_CLIENT_TCP_DATA;
+				c->cpoll_mask &= ~EPOLLOUT;
+				err = epoll_mod(w, c->client_fd, c->cpoll_mask, data);
+				assert(!err);
+			}
+
+			if (c->tbuf_len < SPLICE_BUF_SIZE && !(c->tpoll_mask & EPOLLIN)) {
+				/*
+				* Target is ready to receive more data, start
+				* reading from target again.
+				*/
+				data.ptr = c;
+				data.u64 |= EPL_DT_MASK_TARGET_TCP_DATA;
+				c->tpoll_mask |= EPOLLIN;
+				err = epoll_mod(w, c->target_fd, c->tpoll_mask, data);
+				assert(!err);
+			}
+		} else {
+			ret = mark_client_down_rate_limited(c);
+			if (unlikely(ret)) {
+				put_client_slot(w, c);
+				return 0;
+			}
 		}
 	}
 
