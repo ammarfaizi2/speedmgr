@@ -2404,9 +2404,9 @@ static int handle_event_tcp_target_data(struct server_wrk *w, struct epoll_event
 			c->cbuf_len = sb.cur_len;
 			if (c->cbuf_len == 0) {
 				/*
-				* Buffer is fully flushed to the target, stop
-				* the EPOLLOUT event.
-				*/
+				 * Buffer is fully flushed to the target, stop
+				 * the EPOLLOUT event.
+				 */
 				data.ptr = c;
 				data.u64 |= EPL_DT_MASK_TARGET_TCP_DATA;
 				c->tpoll_mask &= ~EPOLLOUT;
@@ -2416,9 +2416,9 @@ static int handle_event_tcp_target_data(struct server_wrk *w, struct epoll_event
 
 			if (c->cbuf_len < SPLICE_BUF_SIZE && !(c->cpoll_mask & EPOLLIN)) {
 				/*
-				* Client is ready to receive more data, start
-				* reading from client again.
-				*/
+				 * Client is ready to receive more data, start
+				 * reading from client again.
+				 */
 				data.ptr = c;
 				data.u64 |= EPL_DT_MASK_CLIENT_TCP_DATA;
 				c->cpoll_mask |= EPOLLIN;
@@ -2472,9 +2472,9 @@ static int handle_event_tcp_client_data(struct server_wrk *w, struct epoll_event
 			c->cbuf_len = sb.cur_len;
 			if (c->cbuf_len > 0) {
 				/*
-				* Target is not ready to receive more data, so we
-				* need to wait for EPOLLOUT.
-				*/
+				 * Target is not ready to receive more data, so we
+				 * need to wait for EPOLLOUT.
+				 */
 				data.ptr = c;
 				data.u64 |= EPL_DT_MASK_TARGET_TCP_DATA;
 				c->tpoll_mask |= EPOLLOUT;
@@ -2484,9 +2484,9 @@ static int handle_event_tcp_client_data(struct server_wrk *w, struct epoll_event
 
 			if (c->cbuf_len == SPLICE_BUF_SIZE) {
 				/*
-				* Client buffer is full, stop reading from client
-				* until we have more space.
-				*/
+				 * Client buffer is full, stop reading from client
+				 * until we have more space.
+				 */
 				data.ptr = c;
 				data.u64 |= EPL_DT_MASK_CLIENT_TCP_DATA;
 				c->cpoll_mask &= ~EPOLLIN;
@@ -2523,9 +2523,9 @@ static int handle_event_tcp_client_data(struct server_wrk *w, struct epoll_event
 			c->tbuf_len = sb.cur_len;
 			if (c->tbuf_len == 0) {
 				/*
-				* Buffer is fully flushed to the client, stop
-				* the EPOLLOUT event.
-				*/
+				 * Buffer is fully flushed to the client, stop
+				 * the EPOLLOUT event.
+				 */
 				data.ptr = c;
 				data.u64 |= EPL_DT_MASK_CLIENT_TCP_DATA;
 				c->cpoll_mask &= ~EPOLLOUT;
@@ -2535,9 +2535,9 @@ static int handle_event_tcp_client_data(struct server_wrk *w, struct epoll_event
 
 			if (c->tbuf_len < SPLICE_BUF_SIZE && !(c->tpoll_mask & EPOLLIN)) {
 				/*
-				* Target is ready to receive more data, start
-				* reading from target again.
-				*/
+				 * Target is ready to receive more data, start
+				 * reading from target again.
+				 */
 				data.ptr = c;
 				data.u64 |= EPL_DT_MASK_TARGET_TCP_DATA;
 				c->tpoll_mask |= EPOLLIN;
