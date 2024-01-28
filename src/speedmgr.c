@@ -42,7 +42,7 @@
 #define __releases(x)
 #endif
 
-#define SPEEDMGR_DEBUG		1
+#define SPEEDMGR_DEBUG		0
 #define NR_CLIENTS		20480
 #define NR_INIT_BUCKETS		4
 #define SPLICE_BUF_SIZE		8192
@@ -589,13 +589,14 @@ static const char *addr_to_str(const struct in46_addr *addr)
 	static __thread uint8_t __idx;
 	char *buf = __buf[__idx++ % 8];
 
-	if (addr->family == 4)
-		return inet_ntop(AF_INET, &addr->in4, buf, sizeof(__buf[0]));
+	if (addr->family == 4) {
+		inet_ntop(AF_INET, &addr->in4, buf, INET_ADDRSTRLEN);
+	} else {
+		*buf = '[';
+		inet_ntop(AF_INET6, &addr->in6, buf + 1, INET6_ADDRSTRLEN);
+		strcat(buf, "]");
+	}
 
-	memset(buf, 0, sizeof(__buf[0]));
-	buf[0] = '[';
-	inet_ntop(AF_INET6, &addr->in6, buf + 1, sizeof(addr->in6));
-	strcat(buf, "]");
 	return buf;
 }
 
@@ -2245,12 +2246,13 @@ static size_t get_max_down_bytes(struct token_bucket *tb)
 	nr = atomic_load(&tb->nr_clients);
 
 	assert(nr > 0);
-	if (tokens <= 0)
-		return 0;
-
-	ret = (size_t)(tokens / nr);
-	if (!ret)
-		ret = 1;
+	if (tokens <= 0) {
+		ret = 0;
+	} else {
+		ret = (size_t)(tokens / nr) / 2;
+		if (!ret)
+			ret = 1;
+	}
 
 	return ret;
 }
@@ -2268,12 +2270,13 @@ static size_t get_max_up_bytes(struct token_bucket *tb)
 	nr = atomic_load(&tb->nr_clients);
 
 	assert(nr > 0);
-	if (tokens <= 0)
-		return 0;
-
-	ret = (size_t)(tokens / nr);
-	if (!ret)
-		ret = 1;
+	if (tokens <= 0) {
+		ret = 0;
+	} else {
+		ret = (size_t)(tokens / nr) / 2;
+		if (!ret)
+			ret = 1;
+	}
 
 	return ret;
 }
@@ -2560,6 +2563,7 @@ static int handle_event_tcp_client_data(struct server_wrk *w, struct epoll_event
 static int fill_token_bucket(struct server_wrk *w, struct token_bucket *tb)
 {
 	uint32_t i, n;
+	int64_t tmp;
 
 	pthread_mutex_lock(&tb->lock);
 	pr_debug("NR clients of (%s): %u", addr_to_str(&tb->addr), tb->nr_clients);
@@ -2590,8 +2594,11 @@ static int fill_token_bucket(struct server_wrk *w, struct token_bucket *tb)
 		return 0;
 	}
 
-	atomic_store(&tb->download_tokens, tb->max_download_tokens);
-	atomic_store(&tb->upload_tokens, tb->max_upload_tokens);
+	tmp = atomic_load(&tb->download_tokens);
+	tmp += tb->max_download_tokens;
+	if (tmp > tb->max_download_tokens)
+		tmp = tb->max_download_tokens;
+	atomic_store(&tb->download_tokens, tmp);
 
 	n = atomic_load(&tb->nr_down_rate_limted);
 	if (n) {
@@ -2620,6 +2627,12 @@ static int fill_token_bucket(struct server_wrk *w, struct token_bucket *tb)
 			(void)ret;
 		}
 	}
+
+	tmp = atomic_load(&tb->upload_tokens);
+	tmp += tb->max_upload_tokens;
+	if (tmp > tb->max_upload_tokens)
+		tmp = tb->max_upload_tokens;
+	atomic_store(&tb->upload_tokens, tmp);
 
 	n = atomic_load(&tb->nr_up_rate_limted);
 	if (n) {
@@ -2670,7 +2683,6 @@ static int handle_event_timer(struct server_wrk *w, struct epoll_event *ev)
 		pr_warn("Unexpected read size from timer FD %s: %zd", addr_to_str(&tb->addr), ret);
 	}
 
-	pr_debug("Timer expired for %s", addr_to_str(&tb->addr));
 	return fill_token_bucket(w, tb);
 }
 
