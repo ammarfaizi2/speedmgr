@@ -2568,7 +2568,7 @@ static int fill_token_bucket(struct server_wrk *w, struct token_bucket *tb)
 	int64_t tmp;
 
 	pthread_mutex_lock(&tb->lock);
-	pr_debug("NR clients of (%s): %u", addr_to_str(&tb->addr), tb->nr_clients);
+	pr_debug("NR clients of %s: %u", addr_to_str(&tb->addr), tb->nr_clients);
 	if (tb->nr_clients == 0) {
 		/*
 		 * Keep the lock ordering: w->ctx->rl.lock -> tb->lock
