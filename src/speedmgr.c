@@ -42,7 +42,7 @@
 #define __releases(x)
 #endif
 
-#define SPEEDMGR_DEBUG		0
+#define SPEEDMGR_DEBUG		1
 #define NR_CLIENTS		20480
 #define NR_INIT_BUCKETS		4
 #define SPLICE_BUF_SIZE		8192
@@ -936,6 +936,7 @@ static struct token_bucket *__find_token_bucket(struct rate_limit *rl,
 
 static int add_token_bucket_to_rl(struct rate_limit *rl, struct token_bucket *tb)
 	__must_hold(&rl->lock)
+	__must_hold(&tb->lock)
 {
 	const struct in46_addr *addr = &tb->addr;
 	uint32_t nr_allocated, nr_tbuckets;
@@ -1094,16 +1095,17 @@ static struct token_bucket *create_token_bucket(struct server_ctx *ctx,
 	tb->clients = NULL;
 	tb->nr_clients = 0;
 	tb->ref_cnt = 1;
-	pthread_mutex_unlock(&tb->lock);
 
 	ret = add_token_bucket_to_rl(&ctx->rl, tb);
 	if (unlikely(ret)) {
 		pr_error("Failed to add token bucket to rate limit: %s", strerror(-ret));
+		pthread_mutex_unlock(&tb->lock);
 		pthread_mutex_destroy(&tb->lock);
 		free(tb);
 		return NULL;
 	}
 
+	pthread_mutex_unlock(&tb->lock);
 	return tb;
 }
 
@@ -1265,13 +1267,12 @@ static void free_rate_limit(struct server_ctx *ctx)
 		return;
 
 	pthread_mutex_lock(&rl->lock);
-	pthread_mutex_unlock(&rl->lock);
-
-	for (i = 0; i < rl->nr_tbuckets; i++) {
+	i = rl->nr_tbuckets;
+	while (i--) {
 		struct token_bucket *tb = rl->tbuckets[i];
 		uint32_t ref;
 
-		ref = put_token_bucket(ctx, tb, NULL);
+		ref = __put_token_bucket(ctx, tb, NULL);
 		if (ref > 0)
 			pr_warn("Token bucket still has %u references", ref);
 	}
@@ -1280,6 +1281,7 @@ static void free_rate_limit(struct server_ctx *ctx)
 	rl->tbuckets = NULL;
 	rl->nr_allocated = 0;
 	rl->nr_tbuckets = 0;
+	pthread_mutex_unlock(&rl->lock);
 	pthread_mutex_destroy(&rl->lock);
 	ip_map_destroy(&rl->ip_map);
 }
