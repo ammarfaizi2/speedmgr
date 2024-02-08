@@ -12,6 +12,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <assert.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <errno.h>
 
@@ -30,6 +31,19 @@
 #include <unistd.h>
 #include <fcntl.h>
 
+#ifdef __CHECKER__
+#ifndef __must_hold
+#define __must_hold(x)		__attribute__((__context__(x,1,1)))
+#endif
+
+#ifndef __acquires
+#define __acquires(x)		__attribute__((__context__(x,0,1)))
+#endif
+
+#ifndef __releases
+#define __releases(x)		__attribute__((__context__(x,1,0)))
+#endif
+#else /* __CHECKER__ */
 #ifndef __must_hold
 #define __must_hold(x)
 #endif
@@ -41,8 +55,9 @@
 #ifndef __releases
 #define __releases(x)
 #endif
+#endif /* __CHECKER__ */
 
-#define SPEEDMGR_DEBUG		1
+#define SPEEDMGR_DEBUG		0
 #define NR_CLIENTS		20480
 #define NR_INIT_BUCKETS		4
 #define SPLICE_BUF_SIZE		8192
@@ -52,14 +67,14 @@
 #endif
 
 #if SPEEDMGR_DEBUG
-#define pr_debug(fmt, ...) printf("[%08d][D]: " fmt "\n", gettid(), ##__VA_ARGS__)
+#define pr_debug(fmt, ...) do { __pr('D', fmt, ##__VA_ARGS__); } while (0)
 #else
-#define pr_debug(fmt, ...) do {} while (0)
+#define pr_debug(fmt, ...) do { if (0) { __pr('D', fmt, ##__VA_ARGS__); } } while (0)
 #endif
 
-#define pr_info(fmt, ...)	printf("[%08d][I]: " fmt "\n", gettid(), ##__VA_ARGS__)
-#define pr_error(fmt, ...)	printf("[%08d][E]: " fmt "\n", gettid(), ##__VA_ARGS__)
-#define pr_warn(fmt, ...)	printf("[%08d][w]: " fmt "\n", gettid(), ##__VA_ARGS__)
+#define pr_info(fmt, ...)	do { __pr('I', fmt, ##__VA_ARGS__); } while (0)
+#define pr_error(fmt, ...)	do { __pr('E', fmt, ##__VA_ARGS__); } while (0)
+#define pr_warn(fmt, ...)	do { __pr('W', fmt, ##__VA_ARGS__); } while (0)
 #define pr_vinfo(fmt, ...)	do { if (g_verbose) pr_info(fmt, ##__VA_ARGS__); } while (0)
 #define pr_verror(fmt, ...)	do { if (g_verbose) pr_error(fmt, ##__VA_ARGS__); } while (0)
 #define pr_vwarn(fmt, ...)	do { if (g_verbose) pr_warn(fmt, ##__VA_ARGS__); } while (0)
@@ -263,6 +278,19 @@ static void show_version(void)
 	printf("speedmgr version 0.0.1\n");
 }
 
+__attribute__((__noinline__, __format__(__printf__, 2, 3)))
+static void __pr(char prefix, const char *fmt, ...)
+{
+	char buf[4096];
+	va_list ap;
+	int ret;
+
+	va_start(ap, fmt);
+	ret = snprintf(buf, sizeof(buf), "[%08d][%c]: ", (int)gettid(), prefix);
+	vsnprintf(buf + ret, sizeof(buf) - ret, fmt, ap);
+	va_end(ap);
+	puts(buf);
+}
 
 static inline socklen_t get_sockaddr_len(struct sockaddr_in46 *addr)
 {
