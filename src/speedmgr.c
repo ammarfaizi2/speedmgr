@@ -12,6 +12,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <assert.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <errno.h>
 
@@ -30,6 +31,32 @@
 #include <unistd.h>
 #include <fcntl.h>
 
+#ifdef __CHECKER__
+#ifndef __must_hold
+#define __must_hold(x)		__attribute__((__context__(x,1,1)))
+#endif
+
+#ifndef __acquires
+#define __acquires(x)		__attribute__((__context__(x,0,1)))
+#endif
+
+#ifndef __releases
+#define __releases(x)		__attribute__((__context__(x,1,0)))
+#endif
+#else /* __CHECKER__ */
+#ifndef __must_hold
+#define __must_hold(x)
+#endif
+
+#ifndef __acquires
+#define __acquires(x)
+#endif
+
+#ifndef __releases
+#define __releases(x)
+#endif
+#endif /* __CHECKER__ */
+
 #define SPEEDMGR_DEBUG		0
 #define NR_CLIENTS		20480
 #define NR_INIT_BUCKETS		4
@@ -40,14 +67,14 @@
 #endif
 
 #if SPEEDMGR_DEBUG
-#define pr_debug(fmt, ...) printf("[%08d][D]: " fmt "\n", gettid(), ##__VA_ARGS__)
+#define pr_debug(fmt, ...) do { __pr('D', fmt, ##__VA_ARGS__); } while (0)
 #else
-#define pr_debug(fmt, ...) do {} while (0)
+#define pr_debug(fmt, ...) do { if (0) { __pr('D', fmt, ##__VA_ARGS__); } } while (0)
 #endif
 
-#define pr_info(fmt, ...)	printf("[%08d][I]: " fmt "\n", gettid(), ##__VA_ARGS__)
-#define pr_error(fmt, ...)	printf("[%08d][E]: " fmt "\n", gettid(), ##__VA_ARGS__)
-#define pr_warn(fmt, ...)	printf("[%08d][w]: " fmt "\n", gettid(), ##__VA_ARGS__)
+#define pr_info(fmt, ...)	do { __pr('I', fmt, ##__VA_ARGS__); } while (0)
+#define pr_error(fmt, ...)	do { __pr('E', fmt, ##__VA_ARGS__); } while (0)
+#define pr_warn(fmt, ...)	do { __pr('W', fmt, ##__VA_ARGS__); } while (0)
 #define pr_vinfo(fmt, ...)	do { if (g_verbose) pr_info(fmt, ##__VA_ARGS__); } while (0)
 #define pr_verror(fmt, ...)	do { if (g_verbose) pr_error(fmt, ##__VA_ARGS__); } while (0)
 #define pr_vwarn(fmt, ...)	do { if (g_verbose) pr_warn(fmt, ##__VA_ARGS__); } while (0)
@@ -67,6 +94,8 @@ struct sockaddr_in46 {
 };
 
 struct in46_addr {
+	/* Family is 4 or 6 (not using AF_INET/AF_INET6.)*/
+	char family;
 	union {
 		struct in_addr in4;
 		struct in6_addr in6;
@@ -78,12 +107,14 @@ struct client_state;
 struct token_bucket {
 	pthread_mutex_t		lock;
 	int			timer_fd;
-	_Atomic(uint64_t)	upload_tokens;
-	_Atomic(uint64_t)	download_tokens;
-	uint64_t		max_upload_tokens;
-	uint64_t		max_download_tokens;
+	_Atomic(int64_t)	upload_tokens;
+	_Atomic(int64_t)	download_tokens;
+	int64_t			max_upload_tokens;
+	int64_t			max_download_tokens;
+	_Atomic(uint32_t)	nr_up_rate_limted;
+	_Atomic(uint32_t)	nr_down_rate_limted;
 	uint32_t		ref_cnt;	/* Protected by lock. */
-	uint32_t		nr_clients;	/* Protected by lock. */
+	_Atomic(uint32_t)	nr_clients;	/* Protected by lock. */
 	struct client_state	**clients;	/* Protected by lock. */
 	struct in46_addr	addr;
 };
@@ -95,6 +126,8 @@ struct rate_limit {
 	struct token_bucket	**tbuckets;
 	ip_map_t		ip_map;
 };
+
+struct server_wrk;
 
 struct client_state {
 	int			client_fd;
@@ -109,7 +142,9 @@ struct client_state {
 	struct sockaddr_in46	client_addr;
 	struct sockaddr_in46	target_addr;
 	struct token_bucket	*tbucket;
-	bool			is_rate_limited;
+	struct server_wrk	*wrk_ref;
+	volatile bool		is_up_rate_limited;
+	volatile bool		is_down_rate_limited;
 };
 
 struct client_stack {
@@ -148,8 +183,8 @@ struct server_cfg {
 	bool			run_as_tproxy_udp;
 	int			tcp_backlog;
 	uint32_t		nr_workers;
-	uint64_t		max_upload_speed;
-	uint64_t		max_download_speed;
+	int64_t			max_upload_speed;
+	int64_t			max_download_speed;
 	uint32_t		interval_ms;
 	struct sockaddr_in46	tcp_bind_addr;
 	struct sockaddr_in46	tcp_target_addr;
@@ -243,6 +278,19 @@ static void show_version(void)
 	printf("speedmgr version 0.0.1\n");
 }
 
+__attribute__((__noinline__, __format__(__printf__, 2, 3)))
+static void __pr(char prefix, const char *fmt, ...)
+{
+	char buf[4096];
+	va_list ap;
+	int ret;
+
+	va_start(ap, fmt);
+	ret = snprintf(buf, sizeof(buf), "[%08d][%c]: ", (int)gettid(), prefix);
+	vsnprintf(buf + ret, sizeof(buf) - ret, fmt, ap);
+	va_end(ap);
+	puts(buf);
+}
 
 static inline socklen_t get_sockaddr_len(struct sockaddr_in46 *addr)
 {
@@ -438,12 +486,12 @@ static int parse_args(int argc, char *argv[], struct server_cfg *cfg)
 			break;
 
 		case 'u':
-			cfg->max_download_speed = (uint64_t)strtoull(optarg, NULL, 10);
+			cfg->max_download_speed = (int64_t)atoll(optarg);
 			p.got_max_download_speed = true;
 			break;
 
 		case 'd':
-			cfg->max_upload_speed = (uint64_t)strtoull(optarg, NULL, 10);
+			cfg->max_upload_speed = (int64_t)atoll(optarg);
 			p.got_max_upload_speed = true;
 			break;
 
@@ -561,6 +609,23 @@ static int try_increase_rlimit_nofile(void)
 	}
 
 	return 0;
+}
+
+static const char *addr_to_str(const struct in46_addr *addr)
+{
+	static __thread char __buf[8][INET6_ADDRSTRLEN + sizeof("[]")];
+	static __thread uint8_t __idx;
+	char *buf = __buf[__idx++ % 8];
+
+	if (addr->family == 4) {
+		inet_ntop(AF_INET, &addr->in4, buf, INET_ADDRSTRLEN);
+	} else {
+		*buf = '[';
+		inet_ntop(AF_INET6, &addr->in6, buf + 1, INET6_ADDRSTRLEN);
+		strcat(buf, "]");
+	}
+
+	return buf;
 }
 
 static const char *sockaddr_to_str(struct sockaddr_in46 *addr)
@@ -785,90 +850,6 @@ static void free_socket(struct server_ctx *ctx)
 	free_socket_udp(ctx);
 }
 
-static int init_rate_limit(struct server_ctx *ctx)
-{
-	struct rate_limit *rl = &ctx->rl;
-	struct token_bucket **tbuckets;
-	int ret;
-
-	rl->nr_tbuckets = 0;
-	rl->nr_allocated = NR_INIT_BUCKETS;
-	tbuckets = calloc(rl->nr_allocated, sizeof(*tbuckets));
-	if (!tbuckets)
-		return -ENOMEM;
-
-	ret = pthread_mutex_init(&rl->lock, NULL);
-	if (ret) {
-		pr_error("Failed to initialize rate limit mutex: %s", strerror(ret));
-		free(tbuckets);
-		return -ret;
-	}
-
-	ret = ip_map_init(&rl->ip_map);
-	if (ret) {
-		pr_error("Failed to initialize IP map: %s", strerror(ret));
-		free(tbuckets);
-		pthread_mutex_destroy(&rl->lock);
-		return ret;
-	}
-
-	rl->tbuckets = tbuckets;
-	return 0;
-}
-
-static void free_rate_limit(struct server_ctx *ctx)
-{
-	struct rate_limit *rl = &ctx->rl;
-
-	if (!rl->tbuckets)
-		return;
-
-	pthread_mutex_lock(&rl->lock);
-	pthread_mutex_unlock(&rl->lock);
-	free(rl->tbuckets);
-	rl->tbuckets = NULL;
-	rl->nr_allocated = 0;
-	rl->nr_tbuckets = 0;
-	pthread_mutex_destroy(&rl->lock);
-	ip_map_destroy(&rl->ip_map);
-}
-
-static int send_event_fd(struct server_wrk *w)
-{
-	uint64_t val = 1;
-	ssize_t ret;
-
-	ret = write(w->ev_fd, &val, sizeof(val));
-	if (ret != sizeof(val)) {
-		ret = errno;
-		if (ret == EAGAIN)
-			return 0;
-
-		pr_error("Failed to write to event FD: (ret = %zd): %s (thread %u)", ret, strerror(ret), w->idx);
-		return -ret;
-	}
-
-	return 0;
-}
-
-static int consume_event_fd(struct server_wrk *w)
-{
-	uint64_t val;
-	int ret;
-
-	ret = read(w->ev_fd, &val, sizeof(val));
-	if (ret != sizeof(val)) {
-		ret = errno;
-		if (ret == EAGAIN)
-			return 0;
-
-		pr_error("Failed to read from event FD: %s (thread %u)", strerror(ret), w->idx);
-		return -ret;
-	}
-
-	return 0;
-}
-
 static int epoll_add(struct server_wrk *w, int fd, uint32_t events,
 		     union epoll_data data)
 {
@@ -921,6 +902,449 @@ static int epoll_mod(struct server_wrk *w, int fd, uint32_t events,
 			 fd, w->ep_fd, strerror(ret), w->idx);
 		return -ret;
 	
+	}
+
+	return 0;
+}
+
+static int init_rate_limit(struct server_ctx *ctx)
+{
+	struct rate_limit *rl = &ctx->rl;
+	struct token_bucket **tbuckets;
+	int ret;
+
+	rl->nr_tbuckets = 0;
+	rl->nr_allocated = NR_INIT_BUCKETS;
+	tbuckets = calloc(rl->nr_allocated, sizeof(*tbuckets));
+	if (!tbuckets)
+		return -ENOMEM;
+
+	ret = pthread_mutex_init(&rl->lock, NULL);
+	if (ret) {
+		pr_error("Failed to initialize rate limit mutex: %s", strerror(ret));
+		free(tbuckets);
+		return -ret;
+	}
+
+	ret = ip_map_init(&rl->ip_map);
+	if (ret) {
+		pr_error("Failed to initialize IP map: %s", strerror(ret));
+		free(tbuckets);
+		pthread_mutex_destroy(&rl->lock);
+		return ret;
+	}
+
+	rl->tbuckets = tbuckets;
+	return 0;
+}
+
+static struct token_bucket *__find_token_bucket(struct rate_limit *rl,
+						const struct in46_addr *addr)
+	__must_hold(&rl->lock)
+{
+	int family = addr->family;
+	struct token_bucket *tb;
+	const void *key;
+	int ret;
+
+	if (family == 4)
+		key = &addr->in4;
+	else
+		key = &addr->in6;
+
+	ret = ip_map_get(&rl->ip_map, key, family, (void **)&tb);
+	if (ret == 0)
+		return tb;
+
+	if (unlikely(ret != -ENOENT))
+		pr_error("Failed to get token bucket from IP map: %s", strerror(-ret));
+
+	return NULL;
+}
+
+static int add_token_bucket_to_rl(struct rate_limit *rl, struct token_bucket *tb)
+	__must_hold(&rl->lock)
+	__must_hold(&tb->lock)
+{
+	const struct in46_addr *addr = &tb->addr;
+	uint32_t nr_allocated, nr_tbuckets;
+	struct token_bucket **tbuckets;
+	const void *ip_key;
+	int ret;
+
+	if (addr->family == 4)
+		ip_key = &addr->in4;
+	else
+		ip_key = &addr->in6;
+
+	ret = ip_map_add(&rl->ip_map, ip_key, addr->family, tb);
+	if (unlikely(ret))
+		return ret;
+
+	nr_allocated = rl->nr_allocated;
+	nr_tbuckets = rl->nr_tbuckets;
+	if (nr_tbuckets == nr_allocated) {
+		nr_allocated *= 2;
+		tbuckets = realloc(rl->tbuckets, sizeof(*tbuckets) * nr_allocated);
+		if (!tbuckets) {
+			pr_error("Failed to reallocate memory for token buckets");
+			ip_map_del(&rl->ip_map, ip_key, addr->family);
+			return -ENOMEM;
+		}
+
+		rl->tbuckets = tbuckets;
+		rl->nr_allocated = nr_allocated;
+	}
+
+	rl->tbuckets[nr_tbuckets++] = tb;
+	rl->nr_tbuckets = nr_tbuckets;
+	return 0;
+}
+
+static int del_token_bucket_from_rl(struct rate_limit *rl, struct token_bucket *tb)
+	__must_hold(&rl->lock)
+	__must_hold(&tb->lock)
+{
+	const struct in46_addr *addr = &tb->addr;
+	uint32_t nr_tbuckets, i;
+	const void *ip_key;
+	int ret;
+
+	nr_tbuckets = rl->nr_tbuckets;
+	for (i = 0; i < nr_tbuckets; i++) {
+		if (rl->tbuckets[i] == tb)
+			break;
+	}
+
+	if (i == nr_tbuckets) {
+		pr_error("Token bucket not found in rate limit");
+		return -ENOENT;
+	}
+
+	if (i != nr_tbuckets - 1)
+		rl->tbuckets[i] = rl->tbuckets[nr_tbuckets - 1];
+
+	nr_tbuckets--;
+	rl->nr_tbuckets = nr_tbuckets;
+
+	if (addr->family == 4)
+		ip_key = &addr->in4;
+	else
+		ip_key = &addr->in6;
+
+	ret = ip_map_del(&rl->ip_map, ip_key, addr->family);
+	if (unlikely(ret))
+		pr_error("Failed to delete token bucket from IP map: %s", strerror(-ret));
+
+	return 0;
+}
+
+static inline void ms_to_timespec(uint64_t ms, struct timespec *ts)
+{
+	ts->tv_sec = ms / 1000;
+	ts->tv_nsec = (ms % 1000) * 1000000;
+}
+
+static int start_token_bucket_timer(struct server_ctx *ctx, struct token_bucket *tb)
+	__must_hold(&ctx->rl.lock)
+	__must_hold(&tb->lock)
+{
+	union epoll_data data;
+	struct itimerspec its;
+	int ret, timer_fd;
+
+	timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+	if (timer_fd < 0) {
+		ret = errno;
+		pr_error("Failed to create timer FD: %s", strerror(ret));
+		return -ret;
+	}
+
+	ms_to_timespec(ctx->cfg.interval_ms, &its.it_interval);
+	its.it_value = its.it_interval;
+	ret = timerfd_settime(timer_fd, 0, &its, NULL);
+	if (ret) {
+		ret = errno;
+		pr_error("Failed to set timer FD: %s", strerror(ret));
+		close_fd_p(&timer_fd);
+		return -ret;
+	}
+
+	tb->timer_fd = timer_fd;
+	data.u64 = 0;
+	data.ptr = tb;
+	data.u64 |= EPL_DT_MASK_TIMER;
+	ret = epoll_add(&ctx->workers[0], timer_fd, EPOLLIN, data);
+	if (ret) {
+		pr_error("Failed to add timer FD to epoll: %s", strerror(-ret));
+		close_fd_p(&timer_fd);
+		return ret;
+	}
+
+	tb->max_upload_tokens = ctx->cfg.max_upload_speed;
+	tb->max_download_tokens = ctx->cfg.max_download_speed;
+	atomic_store(&tb->upload_tokens, tb->max_upload_tokens);
+	atomic_store(&tb->download_tokens, tb->max_download_tokens);
+	return 0;
+}
+
+static struct token_bucket *create_token_bucket(struct server_ctx *ctx,
+						const struct in46_addr *addr)
+	__must_hold(&ctx->rl.lock)
+{
+	struct token_bucket *tb;
+	int ret;
+
+	pr_vdebug("Creating token bucket for %s", addr_to_str(addr));
+	tb = calloc(1, sizeof(*tb));
+	if (!tb) {
+		pr_error("Failed to allocate memory for token bucket");
+		return NULL;
+	}
+
+	ret = pthread_mutex_init(&tb->lock, NULL);
+	if (ret) {
+		pr_error("Failed to initialize token bucket mutex: %s", strerror(ret));
+		free(tb);
+		return NULL;
+	}
+
+	pthread_mutex_lock(&tb->lock);
+	ret = start_token_bucket_timer(ctx, tb);
+	if (unlikely(ret)) {
+		pr_error("Failed to start token bucket timer: %s", strerror(-ret));
+		pthread_mutex_unlock(&tb->lock);
+		pthread_mutex_destroy(&tb->lock);
+		free(tb);
+		return NULL;
+	}
+
+	tb->addr = *addr;
+	tb->clients = NULL;
+	tb->nr_clients = 0;
+	tb->ref_cnt = 1;
+
+	ret = add_token_bucket_to_rl(&ctx->rl, tb);
+	if (unlikely(ret)) {
+		pr_error("Failed to add token bucket to rate limit: %s", strerror(-ret));
+		pthread_mutex_unlock(&tb->lock);
+		pthread_mutex_destroy(&tb->lock);
+		free(tb);
+		return NULL;
+	}
+
+	pthread_mutex_unlock(&tb->lock);
+	return tb;
+}
+
+static int add_client_to_tbucket(struct token_bucket *tb, struct client_state *c)
+	__must_hold(&tb->lock)
+{
+	struct client_state **clients;
+	uint32_t nr_clients;
+
+	nr_clients = tb->nr_clients + 1;
+	clients = realloc(tb->clients, sizeof(*clients) * nr_clients);
+	if (!clients) {
+		pr_error("Failed to reallocate memory for clients");
+		return -ENOMEM;
+	}
+
+	tb->clients = clients;
+	tb->clients[tb->nr_clients++] = c;
+	return 0;
+}
+
+static int del_client_from_tbucket(struct token_bucket *tb, struct client_state *c)
+	__must_hold(&tb->lock)
+{
+	struct client_state **clients;
+	uint32_t nr_clients, i;
+
+	nr_clients = tb->nr_clients;
+	clients = tb->clients;
+	for (i = 0; i < nr_clients; i++) {
+		if (clients[i] == c)
+			break;
+	}
+
+	if (i == nr_clients) {
+		pr_error("Client not found in token bucket");
+		return -ENOENT;
+	}
+
+	if (i != nr_clients - 1)
+		clients[i] = clients[nr_clients - 1];
+
+	nr_clients--;
+	tb->nr_clients = nr_clients;
+	if (nr_clients == 0) {
+		free(clients);
+		tb->clients = NULL;
+	} else {
+		clients = realloc(clients, sizeof(*clients) * nr_clients);
+		if (!clients) {
+			pr_warn("Failed to shrink memory for clients");
+			return 0;
+		}
+
+		tb->clients = clients;
+	}
+
+	return 0;
+}
+
+static uint32_t ____put_token_bucket(struct server_ctx *ctx,
+				     struct token_bucket *tb,
+				     struct client_state *c)
+	__must_hold(&ctx->rl.lock)
+	__must_hold(&tb->lock)
+{
+	uint32_t ref;
+
+	if (c) {
+		assert(tb->nr_clients > 0);
+		assert(tb->ref_cnt >= 2);
+		del_client_from_tbucket(tb, c);
+	}
+
+	ref = --tb->ref_cnt;
+	if (ref == 0) {
+		assert(tb->nr_clients == 0);
+		assert(tb->timer_fd >= 0);
+		del_token_bucket_from_rl(&ctx->rl, tb);
+		pthread_mutex_unlock(&tb->lock);
+		pthread_mutex_destroy(&tb->lock);
+		close_fd_p(&tb->timer_fd);
+		pr_debug("put: Token bucket destroyed (addr=%s)", addr_to_str(&tb->addr));
+		free(tb);
+		return 0;
+	} else {
+		pr_debug("put: Token bucket ref count: %u (addr=%s)", ref, addr_to_str(&tb->addr));
+		return ref;
+	}
+}
+
+static uint32_t __put_token_bucket(struct server_ctx *ctx, struct token_bucket *tb,
+				   struct client_state *c)
+	__must_hold(&ctx->rl.lock)
+{
+	uint32_t ref;
+
+	pthread_mutex_lock(&tb->lock);
+
+	/*
+	 * If it returns 0, it means that the token bucket has
+	 * been destroyed. No need to unlock the mutex.
+	 */
+	ref = ____put_token_bucket(ctx, tb, c);
+	if (ref > 0)
+		pthread_mutex_unlock(&tb->lock);
+
+	return ref;
+}
+
+static uint32_t put_token_bucket(struct server_ctx *ctx, struct token_bucket *tb,
+				 struct client_state *c)
+{
+	uint32_t ref;
+
+	pthread_mutex_lock(&ctx->rl.lock);
+	ref = __put_token_bucket(ctx, tb, c);
+	pthread_mutex_unlock(&ctx->rl.lock);
+	return ref;
+}
+
+static struct token_bucket *find_or_create_token_bucket(struct server_ctx *ctx,
+							const struct in46_addr *addr,
+							struct client_state *c)
+{
+	struct token_bucket *tb;
+	int ret;
+
+	pthread_mutex_lock(&ctx->rl.lock);
+	tb = __find_token_bucket(&ctx->rl, addr);
+	if (!tb) {
+		tb = create_token_bucket(ctx, addr);
+		if (unlikely(!tb))
+			goto out;
+	}
+
+	pthread_mutex_lock(&tb->lock);
+	ret = add_client_to_tbucket(tb, c);
+	if (unlikely(ret)) {
+		pr_error("Failed to add client to token bucket: %s", strerror(-ret));
+		tb = NULL;
+	} else {
+		tb->ref_cnt++;
+		assert(tb->ref_cnt >= 2);
+	}
+	pthread_mutex_unlock(&tb->lock);
+
+out:
+	pthread_mutex_unlock(&ctx->rl.lock);
+	return tb;
+}
+
+static void free_rate_limit(struct server_ctx *ctx)
+{
+	struct rate_limit *rl = &ctx->rl;
+	uint32_t i;
+
+	if (!rl->tbuckets)
+		return;
+
+	pthread_mutex_lock(&rl->lock);
+	i = rl->nr_tbuckets;
+	while (i--) {
+		struct token_bucket *tb = rl->tbuckets[i];
+		uint32_t ref;
+
+		ref = __put_token_bucket(ctx, tb, NULL);
+		if (ref > 0)
+			pr_warn("Token bucket still has %u references", ref);
+	}
+
+	free(rl->tbuckets);
+	rl->tbuckets = NULL;
+	rl->nr_allocated = 0;
+	rl->nr_tbuckets = 0;
+	pthread_mutex_unlock(&rl->lock);
+	pthread_mutex_destroy(&rl->lock);
+	ip_map_destroy(&rl->ip_map);
+}
+
+static int send_event_fd(struct server_wrk *w)
+{
+	uint64_t val = 1;
+	ssize_t ret;
+
+	ret = write(w->ev_fd, &val, sizeof(val));
+	if (ret != sizeof(val)) {
+		ret = errno;
+		if (ret == EAGAIN)
+			return 0;
+
+		pr_error("Failed to write to event FD: (ret = %zd): %s (thread %u)", ret, strerror(ret), w->idx);
+		return -ret;
+	}
+
+	return 0;
+}
+
+static int consume_event_fd(struct server_wrk *w)
+{
+	uint64_t val;
+	int ret;
+
+	ret = read(w->ev_fd, &val, sizeof(val));
+	if (ret != sizeof(val)) {
+		ret = errno;
+		if (ret == EAGAIN)
+			return 0;
+
+		pr_error("Failed to read from event FD: %s (thread %u)", strerror(ret), w->idx);
+		return -ret;
 	}
 
 	return 0;
@@ -1067,7 +1491,8 @@ static void init_client(struct client_state *c)
 	memset(&c->client_addr, 0, sizeof(c->client_addr));
 	memset(&c->target_addr, 0, sizeof(c->target_addr));
 	c->tbucket = NULL;
-	c->is_rate_limited = false;
+	c->is_up_rate_limited = false;
+	c->is_down_rate_limited = false;
 }
 
 static int init_clients(struct server_wrk *w)
@@ -1105,7 +1530,7 @@ static int init_clients(struct server_wrk *w)
 
 static void free_clients(struct server_wrk *w)
 {
-	uint32_t i, tmp;
+	uint32_t i;
 
 	if (!w->clients)
 		return;
@@ -1125,13 +1550,8 @@ static void free_clients(struct server_wrk *w)
 		if (c->tbuf)
 			free(c->tbuf);
 
-		if (c->tbucket) {
-			pthread_mutex_lock(&c->tbucket->lock);
-			tmp = c->tbucket->ref_cnt--;
-			pthread_mutex_unlock(&c->tbucket->lock);
-			if (tmp == 1)
-				free(c->tbucket);
-		}
+		if (c->tbucket)
+			put_token_bucket(w->ctx, c->tbucket, c);
 	}
 
 	free_client_stack(w);
@@ -1345,6 +1765,12 @@ static void put_client_slot(struct server_wrk *w, struct client_state *c)
 	bool handle_events_should_break = false;
 	int ret, tmp;
 
+	if (c->tbucket) {
+		assert(w->ctx->cfg.using_rate_limit);
+		put_token_bucket(w->ctx, c->tbucket, c);
+		c->tbucket = NULL;
+	}
+
 	if (c->cbuf) {
 		free(c->cbuf);
 		c->cbuf = NULL;
@@ -1385,7 +1811,11 @@ static void put_client_slot(struct server_wrk *w, struct client_state *c)
 	if (unlikely(handle_events_should_break && w->ctx->accept_need_rearm))
 		rearm_tcp_accept(w->ctx);
 
-	c->is_rate_limited = false;
+	c->is_up_rate_limited = false;
+	c->is_down_rate_limited = false;
+	c->wrk_ref = NULL;
+	c->cpoll_mask = 0;
+	c->tpoll_mask = 0;
 	w->handle_events_should_break = handle_events_should_break;
 	atomic_fetch_sub(&w->nr_active_clients, 1u);
 
@@ -1477,6 +1907,7 @@ static int register_new_tcp_client(struct server_ctx *ctx, int fd,
 {
 	int target_fd, ret, family_hint;
 	struct sockaddr_in46 taddr;
+	struct token_bucket *tb;
 	struct client_state *c;
 	union epoll_data data;
 	struct server_wrk *w;
@@ -1487,6 +1918,32 @@ static int register_new_tcp_client(struct server_ctx *ctx, int fd,
 		pr_error("Failed to get a free client slot (cfd=%d; src=%s; thread=%u)",
 			 fd, sockaddr_to_str(addr), w->idx);
 		return -EAGAIN;
+	}
+
+	c->wrk_ref = w;
+
+	if (ctx->cfg.using_rate_limit) {
+		struct in46_addr key_addr;
+
+		if (addr->sa.sa_family == AF_INET6) {
+			if (IN6_IS_ADDR_V4MAPPED(&addr->in6.sin6_addr)) {
+				key_addr.family = 4;
+				memcpy(&key_addr.in4, &addr->in6.sin6_addr.s6_addr[12], sizeof(key_addr.in4));
+			} else {
+				key_addr.family = 6;
+				key_addr.in6 = addr->in6.sin6_addr;
+			}
+		} else {
+			key_addr.family = 4;
+			key_addr.in4 = addr->in4.sin_addr;
+		}
+
+		tb = find_or_create_token_bucket(ctx, &key_addr, c);
+		if (unlikely(!tb)) {
+			put_client_slot(w, c);
+			return -ENOMEM;
+		}
+		c->tbucket = tb;
 	}
 
 	if (ctx->cfg.run_as_tproxy_tcp) {
@@ -1806,6 +2263,94 @@ do_send:
 	return ret;
 }
 
+static size_t get_max_down_bytes(struct token_bucket *tb)
+{
+	int64_t tokens;
+	uint32_t nr;
+	size_t ret;
+
+	if (!tb)
+		return SPLICE_BUF_SIZE;
+
+	tokens = atomic_load(&tb->download_tokens);
+	nr = atomic_load(&tb->nr_clients);
+
+	assert(nr > 0);
+	if (tokens <= 0) {
+		ret = 0;
+	} else {
+		ret = (size_t)(tokens / nr) / 2;
+		if (!ret)
+			ret = 1;
+	}
+
+	return ret;
+}
+
+static size_t get_max_up_bytes(struct token_bucket *tb)
+{
+	int64_t tokens;
+	uint32_t nr;
+	size_t ret;
+
+	if (!tb)
+		return SPLICE_BUF_SIZE;
+
+	tokens = atomic_load(&tb->upload_tokens);
+	nr = atomic_load(&tb->nr_clients);
+
+	assert(nr > 0);
+	if (tokens <= 0) {
+		ret = 0;
+	} else {
+		ret = (size_t)(tokens / nr) / 2;
+		if (!ret)
+			ret = 1;
+	}
+
+	return ret;
+}
+
+static int mark_client_up_rate_limited(struct client_state *c)
+{
+	struct server_wrk *w = c->wrk_ref;
+	union epoll_data data;
+	int ret;
+
+	if (c->is_up_rate_limited)
+		return 0;
+
+	data.u64 = 0;
+	data.ptr = c;
+	data.u64 |= EPL_DT_MASK_CLIENT_TCP_DATA;
+	c->cpoll_mask &= ~EPOLLIN;
+	ret = epoll_mod(w, c->client_fd, c->cpoll_mask, data);
+	c->is_up_rate_limited = true;
+	atomic_fetch_add(&c->tbucket->nr_up_rate_limted, 1u);
+	pr_debug("Client %s is upload rate limited", sockaddr_to_str(&c->client_addr));
+	return ret;
+}
+
+static int mark_client_down_rate_limited(struct client_state *c)
+{
+	struct server_wrk *w = c->wrk_ref;
+	union epoll_data data;
+	int ret;
+
+	if (c->is_down_rate_limited)
+		return 0;
+
+	data.u64 = 0;
+	data.ptr = c;
+	data.u64 |= EPL_DT_MASK_TARGET_TCP_DATA;
+	c->tpoll_mask &= ~EPOLLIN;
+	ret = epoll_mod(w, c->target_fd, c->tpoll_mask, data);
+	c->is_down_rate_limited = true;
+	atomic_fetch_add(&c->tbucket->nr_down_rate_limted, 1u);
+	pr_debug("Client %s is download rate limited", sockaddr_to_str(&c->client_addr));
+	return ret;
+}
+
 static int handle_event_tcp_target_data(struct server_wrk *w, struct epoll_event *ev)
 {
 	struct client_state *c = ev->data.ptr;
@@ -1815,84 +2360,110 @@ static int handle_event_tcp_target_data(struct server_wrk *w, struct epoll_event
 	ssize_t ret;
 	int err;
 
-	if (unlikely(events & (EPOLLERR | EPOLLHUP))) {
+	if (events & (EPOLLERR | EPOLLHUP)) {
 		put_client_slot(w, c);
 		return 0;
 	}
 
 	if (events & EPOLLIN) {
-		sb.buf = c->tbuf;
-		sb.cur_len = c->tbuf_len;
-		sb.max_len = SPLICE_BUF_SIZE;
-		sb.max_recv = sb.max_len;
-		sb.max_send = sb.max_len;
-		ret = do_tcp_splice(c->target_fd, c->client_fd, &sb);
-		if (unlikely(ret < 0)) {
-			put_client_slot(w, c);
-			return 0;
-		}
+		size_t max_down = get_max_down_bytes(c->tbucket);
 
-		c->tbuf_len = sb.cur_len;
-		if (c->tbuf_len > 0) {
-			/*
-			 * Client is not ready to receive more data, so we
-			 * need to wait for EPOLLOUT.
-			 */
-			data.ptr = c;
-			data.u64 |= EPL_DT_MASK_CLIENT_TCP_DATA;
-			c->cpoll_mask |= EPOLLOUT;
-			err = epoll_mod(w, c->client_fd, c->cpoll_mask, data);
-			assert(!err);
-		}
+		if (max_down > 0) {
+			sb.buf = c->tbuf;
+			sb.cur_len = c->tbuf_len;
+			sb.max_len = SPLICE_BUF_SIZE;
+			sb.max_recv = max_down;
+			sb.max_send = max_down;
+			ret = do_tcp_splice(c->target_fd, c->client_fd, &sb);
+			if (unlikely(ret < 0)) {
+				put_client_slot(w, c);
+				return 0;
+			}
 
-		if (c->tbuf_len == SPLICE_BUF_SIZE) {
-			/*
-			 * Target buffer is full, stop reading from target
-			 * until we have more space.
-			 */
-			data.ptr = c;
-			data.u64 |= EPL_DT_MASK_TARGET_TCP_DATA;
-			c->tpoll_mask &= ~EPOLLIN;
-			err = epoll_mod(w, c->target_fd, c->tpoll_mask, data);
-			assert(!err);
+			if (w->ctx->cfg.using_rate_limit)
+				atomic_fetch_sub(&c->tbucket->download_tokens, (int64_t)ret);
+
+			c->tbuf_len = sb.cur_len;
+			if (c->tbuf_len > 0) {
+				/*
+				* Client is not ready to receive more data, so we
+				* need to wait for EPOLLOUT.
+				*/
+				data.ptr = c;
+				data.u64 |= EPL_DT_MASK_CLIENT_TCP_DATA;
+				c->cpoll_mask |= EPOLLOUT;
+				err = epoll_mod(w, c->client_fd, c->cpoll_mask, data);
+				assert(!err);
+			}
+
+			if (c->tbuf_len == SPLICE_BUF_SIZE) {
+				/*
+				* Target buffer is full, stop reading from target
+				* until we have more space.
+				*/
+				data.ptr = c;
+				data.u64 |= EPL_DT_MASK_TARGET_TCP_DATA;
+				c->tpoll_mask &= ~EPOLLIN;
+				err = epoll_mod(w, c->target_fd, c->tpoll_mask, data);
+				assert(!err);
+			}
+		} else {
+			ret = mark_client_down_rate_limited(c);
+			if (unlikely(ret)) {
+				put_client_slot(w, c);
+				return 0;
+			}
 		}
 	}
 
 	if (events & EPOLLOUT) {
-		sb.buf = c->cbuf;
-		sb.cur_len = c->cbuf_len;
-		sb.max_len = SPLICE_BUF_SIZE;
-		sb.max_recv = sb.max_len;
-		sb.max_send = sb.max_len;
-		ret = do_tcp_splice(c->client_fd, c->target_fd, &sb);
-		if (unlikely(ret < 0)) {
-			put_client_slot(w, c);
-			return 0;
-		}
+		size_t max_up = get_max_up_bytes(c->tbucket);
 
-		c->cbuf_len = sb.cur_len;
-		if (c->cbuf_len == 0) {
-			/*
-			 * Buffer is fully flushed to the target, stop
-			 * the EPOLLOUT event.
-			 */
-			data.ptr = c;
-			data.u64 |= EPL_DT_MASK_TARGET_TCP_DATA;
-			c->tpoll_mask &= ~EPOLLOUT;
-			err = epoll_mod(w, c->target_fd, c->tpoll_mask, data);
-			assert(!err);
-		}
+		if (max_up > 0) {
+			sb.buf = c->cbuf;
+			sb.cur_len = c->cbuf_len;
+			sb.max_len = SPLICE_BUF_SIZE;
+			sb.max_recv = max_up;
+			sb.max_send = max_up;
+			ret = do_tcp_splice(c->client_fd, c->target_fd, &sb);
+			if (unlikely(ret < 0)) {
+				put_client_slot(w, c);
+				return 0;
+			}
 
-		if (c->cbuf_len < SPLICE_BUF_SIZE && !(c->cpoll_mask & EPOLLIN)) {
-			/*
-			 * Client is ready to receive more data, start
-			 * reading from client again.
-			 */
-			data.ptr = c;
-			data.u64 |= EPL_DT_MASK_CLIENT_TCP_DATA;
-			c->cpoll_mask |= EPOLLIN;
-			err = epoll_mod(w, c->client_fd, c->cpoll_mask, data);
-			assert(!err);
+			if (w->ctx->cfg.using_rate_limit)
+				atomic_fetch_sub(&c->tbucket->upload_tokens, (int64_t)ret);
+
+			c->cbuf_len = sb.cur_len;
+			if (c->cbuf_len == 0) {
+				/*
+				 * Buffer is fully flushed to the target, stop
+				 * the EPOLLOUT event.
+				 */
+				data.ptr = c;
+				data.u64 |= EPL_DT_MASK_TARGET_TCP_DATA;
+				c->tpoll_mask &= ~EPOLLOUT;
+				err = epoll_mod(w, c->target_fd, c->tpoll_mask, data);
+				assert(!err);
+			}
+
+			if (c->cbuf_len < SPLICE_BUF_SIZE && !(c->cpoll_mask & EPOLLIN)) {
+				/*
+				 * Client is ready to receive more data, start
+				 * reading from client again.
+				 */
+				data.ptr = c;
+				data.u64 |= EPL_DT_MASK_CLIENT_TCP_DATA;
+				c->cpoll_mask |= EPOLLIN;
+				err = epoll_mod(w, c->client_fd, c->cpoll_mask, data);
+				assert(!err);
+			}
+		} else {
+			ret = mark_client_up_rate_limited(c);
+			if (unlikely(ret)) {
+				put_client_slot(w, c);
+				return 0;
+			}
 		}
 	}
 
@@ -1908,88 +2479,241 @@ static int handle_event_tcp_client_data(struct server_wrk *w, struct epoll_event
 	ssize_t ret;
 	int err;
 
-	if (unlikely(events & (EPOLLERR | EPOLLHUP))) {
+	if (events & (EPOLLERR | EPOLLHUP)) {
 		put_client_slot(w, c);
 		return 0;
 	}
 
 	if (events & EPOLLIN) {
-		sb.buf = c->cbuf;
-		sb.cur_len = c->cbuf_len;
-		sb.max_len = SPLICE_BUF_SIZE;
-		sb.max_recv = sb.max_len;
-		sb.max_send = sb.max_len;
-		ret = do_tcp_splice(c->client_fd, c->target_fd, &sb);
-		if (unlikely(ret < 0)) {
-			put_client_slot(w, c);
-			return 0;
-		}
+		size_t max_up = get_max_up_bytes(c->tbucket);
 
-		c->cbuf_len = sb.cur_len;
-		if (c->cbuf_len > 0) {
-			/*
-			 * Target is not ready to receive more data, so we
-			 * need to wait for EPOLLOUT.
-			 */
-			data.ptr = c;
-			data.u64 |= EPL_DT_MASK_TARGET_TCP_DATA;
-			c->tpoll_mask |= EPOLLOUT;
-			err = epoll_mod(w, c->target_fd, c->tpoll_mask, data);
-			assert(!err);
-		}
+		if (max_up > 0) {
+			sb.buf = c->cbuf;
+			sb.cur_len = c->cbuf_len;
+			sb.max_len = SPLICE_BUF_SIZE;
+			sb.max_recv = max_up;
+			sb.max_send = max_up;
+			ret = do_tcp_splice(c->client_fd, c->target_fd, &sb);
+			if (unlikely(ret < 0)) {
+				put_client_slot(w, c);
+				return 0;
+			}
 
-		if (c->cbuf_len == SPLICE_BUF_SIZE) {
-			/*
-			 * Client buffer is full, stop reading from client
-			 * until we have more space.
-			 */
-			data.ptr = c;
-			data.u64 |= EPL_DT_MASK_CLIENT_TCP_DATA;
-			c->cpoll_mask &= ~EPOLLIN;
-			err = epoll_mod(w, c->client_fd, c->cpoll_mask, data);
-			assert(!err);
+			if (w->ctx->cfg.using_rate_limit)
+				atomic_fetch_sub(&c->tbucket->upload_tokens, (int64_t)ret);
+
+			c->cbuf_len = sb.cur_len;
+			if (c->cbuf_len > 0) {
+				/*
+				 * Target is not ready to receive more data, so we
+				 * need to wait for EPOLLOUT.
+				 */
+				data.ptr = c;
+				data.u64 |= EPL_DT_MASK_TARGET_TCP_DATA;
+				c->tpoll_mask |= EPOLLOUT;
+				err = epoll_mod(w, c->target_fd, c->tpoll_mask, data);
+				assert(!err);
+			}
+
+			if (c->cbuf_len == SPLICE_BUF_SIZE) {
+				/*
+				 * Client buffer is full, stop reading from client
+				 * until we have more space.
+				 */
+				data.ptr = c;
+				data.u64 |= EPL_DT_MASK_CLIENT_TCP_DATA;
+				c->cpoll_mask &= ~EPOLLIN;
+				err = epoll_mod(w, c->client_fd, c->cpoll_mask, data);
+				assert(!err);
+			}
+		} else {
+			ret = mark_client_up_rate_limited(c);
+			if (unlikely(ret)) {
+				put_client_slot(w, c);
+				return 0;
+			}
 		}
 	}
 
 	if (events & EPOLLOUT) {
-		sb.buf = c->tbuf;
-		sb.cur_len = c->tbuf_len;
-		sb.max_len = SPLICE_BUF_SIZE;
-		sb.max_recv = sb.max_len;
-		sb.max_send = sb.max_len;
-		ret = do_tcp_splice(c->target_fd, c->client_fd, &sb);
-		if (unlikely(ret < 0)) {
-			put_client_slot(w, c);
-			return 0;
-		}
+		size_t max_down = get_max_down_bytes(c->tbucket);
 
-		c->tbuf_len = sb.cur_len;
-		if (c->tbuf_len == 0) {
-			/*
-			 * Buffer is fully flushed to the client, stop
-			 * the EPOLLOUT event.
-			 */
-			data.ptr = c;
-			data.u64 |= EPL_DT_MASK_CLIENT_TCP_DATA;
-			c->cpoll_mask &= ~EPOLLOUT;
-			err = epoll_mod(w, c->client_fd, c->cpoll_mask, data);
-			assert(!err);
-		}
+		if (max_down > 0) {
+			sb.buf = c->tbuf;
+			sb.cur_len = c->tbuf_len;
+			sb.max_len = SPLICE_BUF_SIZE;
+			sb.max_recv = max_down;
+			sb.max_send = max_down;
+			ret = do_tcp_splice(c->target_fd, c->client_fd, &sb);
+			if (unlikely(ret < 0)) {
+				put_client_slot(w, c);
+				return 0;
+			}
 
-		if (c->tbuf_len < SPLICE_BUF_SIZE && !(c->tpoll_mask & EPOLLIN)) {
-			/*
-			 * Target is ready to receive more data, start
-			 * reading from target again.
-			 */
-			data.ptr = c;
-			data.u64 |= EPL_DT_MASK_TARGET_TCP_DATA;
-			c->tpoll_mask |= EPOLLIN;
-			err = epoll_mod(w, c->target_fd, c->tpoll_mask, data);
-			assert(!err);
+			if (w->ctx->cfg.using_rate_limit)
+				atomic_fetch_sub(&c->tbucket->download_tokens, (int64_t)ret);
+
+			c->tbuf_len = sb.cur_len;
+			if (c->tbuf_len == 0) {
+				/*
+				 * Buffer is fully flushed to the client, stop
+				 * the EPOLLOUT event.
+				 */
+				data.ptr = c;
+				data.u64 |= EPL_DT_MASK_CLIENT_TCP_DATA;
+				c->cpoll_mask &= ~EPOLLOUT;
+				err = epoll_mod(w, c->client_fd, c->cpoll_mask, data);
+				assert(!err);
+			}
+
+			if (c->tbuf_len < SPLICE_BUF_SIZE && !(c->tpoll_mask & EPOLLIN)) {
+				/*
+				 * Target is ready to receive more data, start
+				 * reading from target again.
+				 */
+				data.ptr = c;
+				data.u64 |= EPL_DT_MASK_TARGET_TCP_DATA;
+				c->tpoll_mask |= EPOLLIN;
+				err = epoll_mod(w, c->target_fd, c->tpoll_mask, data);
+				assert(!err);
+			}
+		} else {
+			ret = mark_client_down_rate_limited(c);
+			if (unlikely(ret)) {
+				put_client_slot(w, c);
+				return 0;
+			}
 		}
 	}
 
 	return 0;
+}
+
+
+static int fill_token_bucket(struct server_wrk *w, struct token_bucket *tb)
+{
+	uint32_t i, n;
+	int64_t tmp;
+
+	pthread_mutex_lock(&tb->lock);
+	pr_debug("NR clients of %s: %u", addr_to_str(&tb->addr), tb->nr_clients);
+	if (tb->nr_clients == 0) {
+		/*
+		 * Keep the lock ordering: w->ctx->rl.lock -> tb->lock
+		 */
+		pthread_mutex_unlock(&tb->lock);
+		pthread_mutex_lock(&w->ctx->rl.lock);
+		pthread_mutex_lock(&tb->lock);
+
+		/*
+		 * Re-check the number of clients, because it might have
+		 * changed while we were waiting for the lock.
+		 */
+		if (tb->nr_clients == 0) {
+			uint32_t ref = ____put_token_bucket(w->ctx, tb, NULL);
+			if (ref > 0) {
+				pthread_mutex_unlock(&tb->lock);
+				pthread_mutex_unlock(&w->ctx->rl.lock);
+				return 0;
+			}
+			assert(ref == 0);
+		}
+
+		pthread_mutex_unlock(&tb->lock);
+		pthread_mutex_unlock(&w->ctx->rl.lock);
+		return 0;
+	}
+
+	tmp = atomic_load(&tb->download_tokens);
+	tmp += tb->max_download_tokens;
+	if (tmp > tb->max_download_tokens)
+		tmp = tb->max_download_tokens;
+	atomic_store(&tb->download_tokens, tmp);
+
+	n = atomic_load(&tb->nr_down_rate_limted);
+	if (n) {
+		for (i = 0; i < tb->nr_clients; i++) {
+			struct client_state *c = tb->clients[i];
+			struct server_wrk *cw = c->wrk_ref;
+			union epoll_data data;
+			int ret;
+
+			if (!n)
+				break;
+
+			if (!c->is_down_rate_limited)
+				continue;
+
+			c->is_down_rate_limited = false;
+			atomic_fetch_sub(&tb->nr_down_rate_limted, 1u);
+			n--;
+
+			data.u64 = 0;
+			data.ptr = c;
+			data.u64 |= EPL_DT_MASK_TARGET_TCP_DATA;
+			c->tpoll_mask |= EPOLLIN;
+			ret = epoll_mod(cw, c->target_fd, c->tpoll_mask, data);
+			assert(!ret);
+			(void)ret;
+		}
+	}
+
+	tmp = atomic_load(&tb->upload_tokens);
+	tmp += tb->max_upload_tokens;
+	if (tmp > tb->max_upload_tokens)
+		tmp = tb->max_upload_tokens;
+	atomic_store(&tb->upload_tokens, tmp);
+
+	n = atomic_load(&tb->nr_up_rate_limted);
+	if (n) {
+		for (i = 0; i < tb->nr_clients; i++) {
+			struct client_state *c = tb->clients[i];
+			struct server_wrk *cw = c->wrk_ref;
+			union epoll_data data;
+			int ret;
+
+			if (!n)
+				break;
+
+			if (!c->is_up_rate_limited)
+				continue;
+
+			c->is_up_rate_limited = false;
+			atomic_fetch_sub(&tb->nr_up_rate_limted, 1u);
+			n--;
+
+			data.u64 = 0;
+			data.ptr = c;
+			data.u64 |= EPL_DT_MASK_CLIENT_TCP_DATA;
+			c->cpoll_mask |= EPOLLIN;
+			ret = epoll_mod(cw, c->client_fd, c->cpoll_mask, data);
+			assert(!ret);
+			(void)ret;
+		}
+	}
+
+	pthread_mutex_unlock(&tb->lock);
+	return 0;
+}
+
+static int handle_event_timer(struct server_wrk *w, struct epoll_event *ev)
+{
+	struct token_bucket *tb = ev->data.ptr;
+	uint64_t nr_exps;
+	ssize_t ret;
+
+	ret = read(tb->timer_fd, &nr_exps, sizeof(nr_exps));
+	if (unlikely(ret < 0)) {
+		ret = errno;
+		if (ret == EAGAIN)
+			return 0;
+
+		pr_warn("Failed to read from timer FD %s: %s", addr_to_str(&tb->addr), strerror(ret));
+	} else if (unlikely(ret != sizeof(nr_exps))) {
+		pr_warn("Unexpected read size from timer FD %s: %zd", addr_to_str(&tb->addr), ret);
+	}
+
+	return fill_token_bucket(w, tb);
 }
 
 static int poll_events(struct server_wrk *w)
@@ -2025,8 +2749,8 @@ static int handle_event(struct server_wrk *w, struct epoll_event *ev)
 		return handle_event_event_fd(w, ev);
 	}
 
-	mask = ev->data.u64 & EPL_DT_MASK_CLIENT_TCP_DATA;
-	ev->data.u64 &= ~EPL_DT_MASK_CLIENT_TCP_DATA;
+	mask = ev->data.u64 & EPL_DT_MASK_ALL;
+	ev->data.u64 &= ~EPL_DT_MASK_ALL;
 
 	switch (mask) {
 	case EPL_DT_MASK_CLIENT_TCP_DATA:
@@ -2039,6 +2763,8 @@ static int handle_event(struct server_wrk *w, struct epoll_event *ev)
 		return 0;
 	case EPL_DT_MASK_TARGET_UDP_DATA:
 		return 0;
+	case EPL_DT_MASK_TIMER:
+		return handle_event_timer(w, ev);
 	}
 
 	pr_warn("Unknown event data: 0x%lx (mask: 0x%lx)", ev->data.u64, mask);
