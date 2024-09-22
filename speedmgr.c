@@ -1180,6 +1180,201 @@ static int handle_event_target_conn(struct server_wrk *w, struct epoll_event *ev
 	return 0;
 }
 
+static ssize_t do_ep_recv(struct client_endp *ep)
+{
+	ssize_t ret;
+	size_t len;
+	char *buf;
+
+	if (ep->len == ep->cap) {
+		size_t new_cap;
+		char *tmp;
+
+		if (ep->cap == 0)
+			new_cap = INIT_RECV_BUF_SIZE;
+		else
+			new_cap = ep->cap + (ep->cap / 2) + 1;
+
+		tmp = realloc(ep->buf, new_cap);
+		if (!tmp) {
+			if (ep->cap > 0)
+				return -ENOBUFS;
+			pr_error("Failed to realloc receive buffer: %s", strerror(errno));
+			return -ENOMEM;
+		}
+
+		ep->buf = tmp;
+		ep->cap = new_cap;
+	}
+
+	assert(ep->len <= ep->cap);
+	assert(ep->buf);
+
+	len = ep->cap - ep->len;
+	if (len == 0)
+		return -ENOBUFS;
+
+	len = ep->cap - ep->len;
+	buf = ep->buf + ep->len;
+	ret = recv(ep->fd, buf, len, MSG_DONTWAIT);
+	if (ret < 0) {
+		ret = -errno;
+		if (ret == -EAGAIN || ret == -EINTR)
+			return -EAGAIN;
+
+		return ret;
+	}
+
+	if (ret == 0)
+		return -ECONNRESET;
+
+	ep->len += (size_t)ret;
+	return ret;
+}
+
+static ssize_t do_ep_send(struct client_endp *src, struct client_endp *dst)
+{
+	ssize_t ret;
+	size_t len;
+	char *buf;
+
+	if (src->len == 0)
+		return 0;
+
+	len = src->len;
+	buf = src->buf;
+	ret = send(dst->fd, buf, len, MSG_DONTWAIT);
+	if (ret < 0) {
+		ret = -errno;
+		if (ret == -EAGAIN || ret == -EINTR)
+			return -EAGAIN;
+
+		pr_error("Failed to send data: %s", strerror(-ret));
+		return ret;
+	}
+
+	if (ret == 0)
+		return -ECONNRESET;
+
+	if ((size_t)ret < len) {
+		memmove(buf, buf + ret, len - (size_t)ret);
+		src->len -= (size_t)ret;
+		return -EAGAIN;
+	}
+
+	src->len = 0;
+	return ret;
+}
+
+static int toggle_ep_event(struct server_wrk *w, struct client_state *cl,
+			   struct client_endp *ep, uint32_t tmask, bool enable)
+{
+	union epoll_data data;
+	uint32_t mask;
+	int ret;
+
+	mask = ep->ep_mask;
+	if (enable) {
+		if (mask & tmask)
+			return 0;
+		mask |= tmask;
+	} else {
+		if (!(mask & tmask))
+			return 0;
+		mask &= ~tmask;
+	}
+
+	data.u64 = 0;
+	data.ptr = cl;
+	if (ep == &cl->client)
+		data.u64 |= EPL_EV_TCP_CLIENT_DATA;
+	else
+		data.u64 |= EPL_EV_TCP_TARGET_DATA;
+
+	ret = epoll_mod(w->ep_fd, ep->fd, mask, data);
+	if (ret)
+		return ret;
+
+	ep->ep_mask = mask;
+	return 0;
+}
+
+static int toggle_epoll_in(struct server_wrk *w, struct client_state *cl,
+			   struct client_endp *ep, bool enable)
+{
+	return toggle_ep_event(w, cl, ep, EPOLLIN, enable);
+}
+
+static int toggle_epoll_out(struct server_wrk *w, struct client_state *cl,
+			    struct client_endp *ep, bool enable)
+{
+	return toggle_ep_event(w, cl, ep, EPOLLOUT, enable);
+}
+
+static int do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
+			    struct client_endp *src, struct client_endp *dst)
+{
+	ssize_t ret;
+
+	ret = do_ep_recv(src);
+	if (ret < 0) {
+		if (ret == -EAGAIN)
+			return 0;
+
+		if (ret == -ENOBUFS) {
+			pr_infov("Receive buffer is full, disabling EPOLLIN (thread %u)", w->idx);
+			return toggle_epoll_in(w, c, src, false);
+		}
+
+		return ret;
+	}
+
+	if (dst == &c->target && !c->target_connected)
+		return toggle_epoll_out(w, c, dst, true);
+
+	ret = do_ep_send(src, dst);
+	if (ret < 0) {
+		if (ret != -EAGAIN) {
+			pr_error("Failed to send data: %s", strerror(-ret));
+			return ret;
+		}
+
+		ret = toggle_epoll_out(w, c, dst, true);
+		if (ret)
+			return ret;
+	}
+
+	if (!(dst->ep_mask & EPOLLIN) && (src->cap - src->len) > 0) {
+		pr_infov("Enabling EPOLLIN (thread %u)", w->idx);
+		ret = toggle_epoll_in(w, c, src, true);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+static int do_pipe_epoll_out(struct server_wrk *w, struct client_state *c,
+			     struct client_endp *src, struct client_endp *dst)
+{
+	ssize_t ret;
+
+	ret = do_ep_send(src, dst);
+	if (ret < 0 && ret != -EAGAIN) {
+		pr_error("Failed to send data: %s", strerror(-ret));
+		return ret;
+	}
+
+	if (src->len == 0) {
+		pr_infov("Disabling EPOLLOUT (thread %u)", w->idx);
+		ret = toggle_epoll_out(w, c, dst, false);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
 static int handle_event_client_data(struct server_wrk *w, struct epoll_event *ev)
 {
 	struct client_state *c = GET_EPL_DT(ev->data.u64);
@@ -1189,6 +1384,18 @@ static int handle_event_client_data(struct server_wrk *w, struct epoll_event *ev
 	if (unlikely(events & (EPOLLERR | EPOLLHUP))) {
 		pr_errorv("Client socket hit (EPOLLERR|EPOLLHUP): %s (thread %u)", strerror(errno), w->idx);
 		return -ECONNRESET;
+	}
+
+	if (events & EPOLLIN) {
+		ret = do_pipe_epoll_in(w, c, &c->client, &c->target);
+		if (ret < 0)
+			return ret;
+	}
+
+	if (events & EPOLLOUT) {
+		ret = do_pipe_epoll_out(w, c, &c->target, &c->client);
+		if (ret < 0)
+			return ret;
 	}
 
 	return 0;
@@ -1203,6 +1410,18 @@ static int handle_event_target_data(struct server_wrk *w, struct epoll_event *ev
 	if (unlikely(events & (EPOLLERR | EPOLLHUP))) {
 		pr_errorv("Target socket hit (EPOLLERR|EPOLLHUP): %s (thread %u)", strerror(errno), w->idx);
 		return -ECONNRESET;
+	}
+
+	if (events & EPOLLIN) {
+		ret = do_pipe_epoll_in(w, c, &c->target, &c->client);
+		if (ret < 0)
+			return ret;
+	}
+
+	if (events & EPOLLOUT) {
+		ret = do_pipe_epoll_out(w, c, &c->client, &c->target);
+		if (ret < 0)
+			return ret;
 	}
 
 	return 0;
