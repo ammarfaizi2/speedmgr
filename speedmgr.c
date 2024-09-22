@@ -27,7 +27,7 @@
 #define NR_INIT_CLIENT_ARR_SIZE 32
 
 #define INIT_RECV_BUF_SIZE 8192
-#define MAX_RECV_BUF_RESIZE (1024*1024*1024)
+#define MAX_RECV_BUF_RESIZE (1024*1024*128)
 
 #include <stdatomic.h>
 #include <stdbool.h>

@@ -22,14 +22,14 @@ endif
 
 all: $(TARGET)
 
-$(TARGET): speedmgr.o ip_map.o
-	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
+$(TARGET): speedmgr.o
+	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 %.o: %.cpp
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+	$(CC) $(CXXFLAGS) -c $< -o $@
 
 clean:
 	rm -f *.o $(TARGET)
