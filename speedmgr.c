@@ -26,6 +26,9 @@
  */
 #define NR_INIT_CLIENT_ARR_SIZE 32
 
+#define INIT_RECV_BUF_SIZE 8192
+#define MAX_RECV_BUF_RESIZE (1024*1024*10)
+
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -81,17 +84,20 @@ struct sockaddr_in46 {
 	};
 };
 
+struct client_endp {
+	int		fd;
+	uint32_t	ep_mask;
+	size_t		len;
+	size_t		cap;
+	char		*buf;
+};
+
 struct client_state {
-	int			client_fd;
-	int			target_fd;
-	uint32_t		cpoll_mask;
-	uint32_t		tpoll_mask;
+	struct client_endp	client;
+	struct client_endp	target;
 	uint32_t		idx;
-	size_t			cbuf_len;
-	size_t			tbuf_len;
-	char			*cbuf;
-	char			*tbuf;
 	struct sockaddr_in46	client_addr;
+	bool target_connected;
 };
 
 struct client_stack {
@@ -113,7 +119,7 @@ struct server_wrk {
 
 	uint32_t		idx;
 	uint32_t		client_arr_size;
-	uint32_t		nr_online_clients;
+	_Atomic(uint32_t)	nr_online_clients;
 
 	pthread_t		thread;	
 	struct server_ctx	*ctx;
@@ -584,34 +590,34 @@ static int __push_client_stack(struct client_stack *cs, uint32_t data)
 	return 0;
 }
 
-// static int push_client_stack(struct client_stack *cs, uint32_t data)
-// {
-// 	int ret;
+static int push_client_stack(struct client_stack *cs, uint32_t data)
+{
+	int ret;
 
-// 	pthread_mutex_lock(&cs->lock);
-// 	ret = __push_client_stack(cs, data);
-// 	pthread_mutex_unlock(&cs->lock);
-// 	return ret;
-// }
+	pthread_mutex_lock(&cs->lock);
+	ret = __push_client_stack(cs, data);
+	pthread_mutex_unlock(&cs->lock);
+	return ret;
+}
 
-// static int __pop_client_stack(struct client_stack *cs, uint32_t *data)
-// {
-// 	if (cs->sp == 0)
-// 		return -EAGAIN;
+static int __pop_client_stack(struct client_stack *cs, uint32_t *data)
+{
+	if (cs->sp == 0)
+		return -EAGAIN;
 
-// 	*data = cs->data[--cs->sp];
-// 	return 0;
-// }
+	*data = cs->data[--cs->sp];
+	return 0;
+}
 
-// static int pop_client_stack(struct client_stack *cs, uint32_t *data)
-// {
-// 	int ret;
+static int pop_client_stack(struct client_stack *cs, uint32_t *data)
+{
+	int ret;
 
-// 	pthread_mutex_lock(&cs->lock);
-// 	ret = __pop_client_stack(cs, data);
-// 	pthread_mutex_unlock(&cs->lock);
-// 	return ret;
-// }
+	pthread_mutex_lock(&cs->lock);
+	ret = __pop_client_stack(cs, data);
+	pthread_mutex_unlock(&cs->lock);
+	return ret;
+}
 
 static int init_client_stack(struct server_wrk *w)
 {
@@ -641,22 +647,60 @@ static int init_client_stack(struct server_wrk *w)
 	return 0;
 }
 
+static void init_client_endp(struct client_endp *e)
+{
+	e->fd = -1;
+	e->ep_mask = 0;
+	e->len = 0;
+	e->cap = 0;
+	e->buf = NULL;
+}
+
+static void init_client_state(struct client_state *c)
+{
+	init_client_endp(&c->client);
+	init_client_endp(&c->target);
+	c->target_connected = false;
+	memset(&c->client_addr, 0, sizeof(c->client_addr));
+}
+
 static int init_clients(struct server_wrk *w)
 {
 	struct client_state *clients;
+	uint32_t i;
 	int ret;
 
 	ret = init_client_stack(w);
 	if (ret)
 		return ret;
 
-	clients = calloc(NR_INIT_CLIENT_ARR_SIZE, sizeof(*clients));
+	w->client_arr_size = NR_INIT_CLIENT_ARR_SIZE;
+	clients = calloc(w->client_arr_size, sizeof(*clients));
 	if (!clients)
 		return -ENOMEM;
 
-	w->client_arr_size = NR_INIT_CLIENT_ARR_SIZE;
+	for (i = 0; i < w->client_arr_size; i++) {
+		init_client_state(&clients[i]);
+		clients[i].idx = i;
+	}
+
 	w->clients = clients;
 	return 0;
+}
+
+static void free_client_endp(struct client_endp *e)
+{
+	if (e->fd >= 0) {
+		close(e->fd);
+		e->fd = -1;
+	}
+
+	if (e->buf) {
+		free(e->buf);
+		e->buf = NULL;
+		e->len = 0;
+		e->cap = 0;
+	}
 }
 
 static void close_all_client_fds(struct server_wrk *w)
@@ -666,27 +710,8 @@ static void close_all_client_fds(struct server_wrk *w)
 	for (i = 0; i < w->client_arr_size; i++) {
 		struct client_state *c = &w->clients[i];
 
-		if (c->client_fd >= 0) {
-			close(c->client_fd);
-			c->client_fd = -1;
-		}
-
-		if (c->target_fd >= 0) {
-			close(c->target_fd);
-			c->target_fd = -1;
-		}
-
-		if (c->cbuf) {
-			free(c->cbuf);
-			c->cbuf = NULL;
-			c->cbuf_len = 0;
-		}
-
-		if (c->tbuf) {
-			free(c->tbuf);
-			c->tbuf = NULL;
-			c->tbuf_len = 0;
-		}
+		free_client_endp(&c->client);
+		free_client_endp(&c->target);
 	}
 }
 
@@ -800,6 +825,16 @@ static int init_worker(struct server_wrk *w, bool create_thread)
 			free_epoll(w);
 			return ret;
 		}
+	} else {
+		union epoll_data data;
+
+		data.u64 = EPL_EV_TCP_ACCEPT;
+		ret = epoll_add(w->ep_fd, w->ctx->tcp_fd, EPOLLIN, data);
+		if (ret) {
+			free_clients(w);
+			free_epoll(w);
+			return ret;
+		}
 	}
 
 	return 0;
@@ -895,24 +930,321 @@ static void free_ctx(struct server_ctx *ctx)
 	free_socket(ctx);
 }
 
+static struct client_state *get_free_client_slot(struct server_wrk *w)
+{
+	struct client_state *c;
+	uint32_t idx;
+	int ret;
+
+	ret = pop_client_stack(w->cl_stack, &idx);
+	if (ret)
+		return NULL;
+
+	c = &w->clients[idx];
+	assert(c->client.fd < 0);
+	assert(c->target.fd < 0);
+	assert(!c->target_connected);
+	assert(c->idx == idx);
+	return c;
+}
+
+static struct server_wrk *pick_worker_for_new_conn(struct server_ctx *ctx)
+{
+	struct server_wrk *w = NULL;
+	uint32_t i, min;
+
+	w = &ctx->workers[0];
+	min = atomic_load(&ctx->workers[0].nr_online_clients);
+	for (i = 1; i < ctx->cfg.nr_workers; i++) {
+		uint32_t nr;
+
+		nr = atomic_load(&ctx->workers[i].nr_online_clients);
+		if (nr < min) {
+			min = nr;
+			w = &ctx->workers[i];
+		}
+	}
+
+	return w;
+}
+
+
+static void put_client_slot(struct server_wrk *w, struct client_state *c)
+{
+	bool hess = false;
+	int ret;
+
+	if (c->client.fd >= 0) {
+		pr_infov("Closing client FD %d (src: %s) (thread %u)", c->client.fd, sockaddr_to_str(&c->client_addr), w->idx);
+		ret = epoll_del(w->ep_fd, c->client.fd);
+		assert(!ret);
+		free_client_endp(&c->client);
+		hess = true;
+	}
+
+	if (c->target.fd >= 0) {
+		ret = epoll_del(w->ep_fd, c->target.fd);
+		assert(!ret);
+		free_client_endp(&c->target);
+		hess = true;
+	}
+
+	if (hess && w->ctx->accept_stopped) {
+		union epoll_data data;
+
+		pr_info("Re-enabling accept() (thread %u)", w->idx);
+		data.u64 = EPL_EV_TCP_ACCEPT;
+		ret = epoll_add(w->ep_fd, w->ctx->tcp_fd, EPOLLIN, data);
+		assert(!ret);
+
+		w->ctx->accept_stopped = false;
+		send_event_fd(&w->ctx->workers[0]);
+	}
+
+	w->handle_events_should_stop = hess;
+	c->target_connected = false;
+	memset(&c->client_addr, 0, sizeof(c->client_addr));
+	ret = push_client_stack(w->cl_stack, c->idx);
+	atomic_fetch_sub(&w->nr_online_clients, 1u);
+	assert(!ret);
+	(void)ret;
+}
+
+static int prepare_target_connect(struct server_wrk *w, struct client_state *c)
+{
+	struct sockaddr_in46 *taddr = &w->ctx->cfg.target_addr;
+	union epoll_data data;
+	socklen_t len;
+	int fd, ret;
+
+	if (taddr->sa.sa_family == AF_INET6)
+		len = sizeof(taddr->in6);
+	else
+		len = sizeof(taddr->in4);
+
+	fd = socket(taddr->sa.sa_family, SOCK_STREAM | SOCK_NONBLOCK, 0);
+	if (fd < 0) {
+		ret = errno;
+		pr_error("Failed to create target socket: %s", strerror(ret));
+		return -ret;
+	}
+
+#ifdef TCP_NODELAY
+	ret = 1;
+	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &ret, sizeof(ret));
+#endif
+
+	ret = connect(fd, &taddr->sa, len);
+	if (ret) {
+		ret = errno;
+		if (ret != EINPROGRESS) {
+			pr_error("Failed to connect to target: %s", strerror(ret));
+			close(fd);
+			return -ret;
+		}
+	}
+
+	c->target.fd = fd;
+
+	data.u64 = 0;
+	data.ptr = c;
+	data.u64 |= EPL_EV_TCP_CLIENT_DATA;
+	c->client.ep_mask = EPOLLIN;
+	ret = epoll_add(w->ep_fd, c->client.fd, c->client.ep_mask, data);
+	if (ret)
+		return ret;
+
+	data.u64 = 0;
+	data.ptr = c;
+	data.u64 |= EPL_EV_TCP_TARGET_CONN;
+	c->target.ep_mask = EPOLLOUT | EPOLLIN;
+	ret = epoll_add(w->ep_fd, c->target.fd, c->target.ep_mask, data);
+	if (ret)
+		return ret;
+
+	send_event_fd(w);
+	pr_debug("Preparing forward conn from %s to %s (thread %u)", sockaddr_to_str(&c->client_addr), sockaddr_to_str(taddr), w->idx);
+	return 0;
+}
+
+static int give_client_fd_to_a_worker(struct server_ctx *ctx, int fd,
+				      struct sockaddr_in46 *addr)
+{
+	struct client_state *c;
+	struct server_wrk *w;
+	int ret;
+
+	w = pick_worker_for_new_conn(ctx);
+	c = get_free_client_slot(w);
+	if (!c) {
+		pr_error("No free client slots available");
+		return -ENOMEM;
+	}
+
+	c->client.fd = fd;
+	c->client_addr = *addr;
+	ret = prepare_target_connect(w, c);
+	if (ret) {
+		put_client_slot(w, c);
+		return ret;
+	}
+
+	atomic_fetch_add(&w->nr_online_clients, 1u);
+	return 0;
+}
+
+static int handle_accept_error(int err, struct server_wrk *w)
+{
+	if (err == EAGAIN)
+		return 0;
+
+	if (err == EMFILE || err == ENFILE) {
+		pr_error("accept(): (%d) Too many open files, stop accepting...", err);
+		pr_info("accept() will be re-enabled when a client disconnects (thread %u)", w->idx);
+		w->ctx->accept_stopped = true;
+		return epoll_del(w->ep_fd, w->ctx->tcp_fd);
+	}
+
+	pr_error("accept() failed: %s", strerror(err));
+	return -err;
+}
+
+static int handle_event_accept(struct server_wrk *w)
+{
+	struct server_ctx *ctx = w->ctx;
+	struct sockaddr_in46 addr;
+	socklen_t len;
+	int ret, fd;
+
+	memset(&addr, 0, sizeof(addr));
+	if (ctx->cfg.bind_addr.sa.sa_family == AF_INET6)
+		len = sizeof(addr.in6);
+	else
+		len = sizeof(addr.in4);
+
+	ret = accept(ctx->tcp_fd, &addr.sa, &len);
+	if (unlikely(ret < 0))
+		return handle_accept_error(errno, w);
+
+	if (unlikely(len > sizeof(addr))) {
+		pr_error("accept() returned invalid address length: %u", len);
+		close(ret);
+		return -EINVAL;
+	}
+
+	pr_infov("New connection from %s", sockaddr_to_str(&addr));
+	fd = ret;
+	ret = give_client_fd_to_a_worker(w->ctx, fd, &addr);
+	if (ret)
+		close(fd);
+
+	return ret;
+}
+
+static int handle_event_target_conn(struct server_wrk *w, struct epoll_event *ev)
+{
+	struct client_state *c = GET_EPL_DT(ev->data.u64);
+	uint32_t events = ev->events;
+	union epoll_data data;
+	socklen_t len;
+	int ret, tmp;
+
+	if (events & (EPOLLERR | EPOLLHUP)) {
+		pr_error("Target connect failed: %s (thread %u)", strerror(errno), w->idx);
+		return -ECONNRESET;
+	}
+
+	tmp = 0;
+	len = sizeof(tmp);
+	ret = getsockopt(c->target.fd, SOL_SOCKET, SO_ERROR, &tmp, &len);
+	if (unlikely(tmp || !(events & EPOLLOUT))) {
+		if (tmp < 0)
+			tmp = -tmp;
+		pr_error("Failed to get target socket error: %s (thread %u)", strerror(tmp), w->idx);
+		return -ECONNRESET;
+	}
+
+	if (c->client.len > 0)
+		c->target.ep_mask = EPOLLIN | EPOLLOUT;
+	else
+		c->target.ep_mask = EPOLLIN;
+
+	data.u64 = 0;
+	data.ptr = c;
+	data.u64 |= EPL_EV_TCP_TARGET_DATA;
+	ret = epoll_mod(w->ep_fd, c->target.fd, c->target.ep_mask, data);
+	if (ret)
+		return ret;
+
+	pr_infov("Target connection established (thread %u)", w->idx);
+	return 0;
+}
+
+static int handle_event_client_data(struct server_wrk *w, struct epoll_event *ev)
+{
+	struct client_state *c = GET_EPL_DT(ev->data.u64);
+	uint32_t events = ev->events;
+	int ret;
+
+	if (unlikely(events & (EPOLLERR | EPOLLHUP))) {
+		pr_errorv("Client socket hit (EPOLLERR|EPOLLHUP): %s (thread %u)", strerror(errno), w->idx);
+		return -ECONNRESET;
+	}
+
+	return 0;
+}
+
+static int handle_event_target_data(struct server_wrk *w, struct epoll_event *ev)
+{
+	struct client_state *c = GET_EPL_DT(ev->data.u64);
+	uint32_t events = ev->events;
+	int ret;
+
+	if (unlikely(events & (EPOLLERR | EPOLLHUP))) {
+		pr_errorv("Target socket hit (EPOLLERR|EPOLLHUP): %s (thread %u)", strerror(errno), w->idx);
+		return -ECONNRESET;
+	}
+
+	return 0;
+}
+
 static int handle_event(struct server_wrk *w, struct epoll_event *ev)
 {
 	uint64_t evt = GET_EPL_EV(ev->data.u64);
+	int ret;
 
 	switch (evt) {
 	case EPL_EV_EVENTFD:
-		return consume_event_fd(w);
+		ret = consume_event_fd(w);
+		break;
 	case EPL_EV_TCP_ACCEPT:
-		return 0;
+		ret = handle_event_accept(w);
+		break;
 	case EPL_EV_TCP_CLIENT_DATA:
-		return 0;
+		ret = handle_event_client_data(w, ev);
+		break;
 	case EPL_EV_TCP_TARGET_DATA:
-		return 0;
+		ret = handle_event_target_data(w, ev);
+		break;
 	case EPL_EV_TCP_TARGET_CONN:
-		return 0;
+		ret = handle_event_target_conn(w, ev);
+		break;
 	default:
 		pr_error("Unknown event type: %lu (thread %u)", evt, w->idx);
 		return -EINVAL;
+	}
+
+	if (ret < 0) {
+		switch (evt) {
+		case EPL_EV_TCP_TARGET_CONN:
+		case EPL_EV_TCP_CLIENT_DATA:
+		case EPL_EV_TCP_TARGET_DATA:
+			put_client_slot(w, GET_EPL_DT(ev->data.u64));
+			ret = 0;
+			break;
+		default:
+			break;
+		}
 	}
 
 	return 0;
