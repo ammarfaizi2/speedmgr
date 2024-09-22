@@ -33,10 +33,10 @@
 /*
  * The number of initial client slots.
  */
-#define NR_INIT_CLIENT_ARR_SIZE 32
+#define NR_INIT_CLIENT_ARR_SIZE 2048
 
 #define INIT_RECV_BUF_SIZE 8192
-#define MAX_RECV_BUF_RESIZE (1024*1024*128)
+#define MAX_RECV_BUF_RESIZE 1024*1024*128
 
 #define INIT_SPD_MAP_SIZE 32
 
@@ -49,6 +49,8 @@
 #include <stdio.h>
 #include <errno.h>
 
+#include <sys/time.h>
+#include <sys/timerfd.h>
 #include <sys/resource.h>
 #include <netinet/tcp.h>
 #include <sys/eventfd.h>
@@ -109,7 +111,6 @@ struct ip_spd_bucket {
 	uint64_t		dn_fill_interval;
 
 	_Atomic(uint16_t)	nr_conns;
-	int			timer_fd;
 };
 
 struct ip_spd_map {
@@ -132,6 +133,11 @@ struct client_endp {
 	char		*buf;
 };
 
+enum {
+	UP_RATE_LIMITED		= (1u << 0u),
+	DOWN_RATE_LIMITED	= (1u << 1u)
+};
+
 struct client_state {
 	struct client_endp	client;
 	struct client_endp	target;
@@ -139,6 +145,7 @@ struct client_state {
 	struct sockaddr_in46	client_addr;
 	struct ip_spd_bucket	*spd;
 	bool target_connected;
+	uint8_t rate_limit_flags;
 };
 
 struct client_stack {
@@ -156,6 +163,7 @@ struct server_ctx;
 struct server_wrk {
 	int			ep_fd;
 	int			ev_fd;
+	int			timer_fd;
 	int			ep_timeout;
 
 	uint32_t		idx;
@@ -168,6 +176,7 @@ struct server_wrk {
 	struct client_stack	*cl_stack;
 
 	volatile bool		handle_events_should_stop;
+	bool			timer_is_armed;
 	struct epoll_event	events[NR_EPOLL_EVENTS];
 };
 
@@ -204,8 +213,7 @@ enum {
 	EPL_EV_TCP_CLIENT_DATA	= (0x0002ull << 48ull),
 	EPL_EV_TCP_TARGET_DATA	= (0x0003ull << 48ull),
 	EPL_EV_TCP_TARGET_CONN	= (0x0004ull << 48ull),
-	EPL_EV_TIMER_ARM_CLIENT	= (0x0005ull << 48ull),
-	EPL_EV_TIMER_ARM_TARGET	= (0x0006ull << 48ull),
+	EPL_EV_TIMERFD		= (0x0005ull << 48ull)
 };
 
 #define EPL_EV_MASK		(0xffffull << 48ull)
@@ -983,6 +991,7 @@ static void init_client_state(struct client_state *c)
 	init_client_endp(&c->client);
 	init_client_endp(&c->target);
 	c->target_connected = false;
+	c->rate_limit_flags = 0;
 	c->spd = NULL;
 	memset(&c->client_addr, 0, sizeof(c->client_addr));
 }
@@ -1126,6 +1135,104 @@ static void free_epoll(struct server_wrk *w)
 
 static void *worker_func(void *data);
 
+static int arm_timer(struct server_wrk *w)
+{
+	uint64_t up_intv, dn_intv;
+	struct itimerspec its;
+	struct timespec now;
+	int ret;
+
+	if (w->timer_fd < 0)
+		return 0;
+
+	if (w->timer_is_armed)
+		return 0;
+
+	ret = clock_gettime(CLOCK_MONOTONIC, &now);
+	if (ret) {
+		ret = -errno;
+		pr_error("Failed to get current time: %s", strerror(-ret));
+		return ret;
+	}
+
+	up_intv = w->ctx->spd_map.up_interval;
+	dn_intv = w->ctx->spd_map.down_interval;
+
+	if (!up_intv)
+		up_intv = ~0ull;
+	if (!dn_intv)
+		dn_intv = ~0ull;
+
+	ms_to_timespec(MIN(up_intv, dn_intv), &its.it_interval);
+	its.it_value.tv_sec = now.tv_sec;
+	its.it_value.tv_nsec = now.tv_nsec + 1;
+
+	ret = timerfd_settime(w->timer_fd, TFD_TIMER_ABSTIME, &its, NULL);
+	if (ret) {
+		ret = -errno;
+		pr_error("Failed to set timer FD: %s", strerror(-ret));
+		return ret;
+	}
+
+	pr_infov("Timer FD armed (thread %u)", w->idx);
+	w->timer_is_armed = true;
+	return 0;
+}
+
+static int disarm_timer(struct server_wrk *w)
+{
+	struct itimerspec its;
+	int ret;
+
+	if (w->timer_fd < 0)
+		return 0;
+
+	if (!w->timer_is_armed)
+		return 0;
+
+	its.it_interval.tv_sec = 0;
+	its.it_interval.tv_nsec = 0;
+	its.it_value.tv_sec = 0;
+	its.it_value.tv_nsec = 0;
+	ret = timerfd_settime(w->timer_fd, 0, &its, NULL);
+	if (ret) {
+		ret = -errno;
+		pr_error("Failed to disarm timer FD: %s", strerror(-ret));
+		return ret;
+	}
+
+	pr_infov("Timer FD disarmed (thread %u)", w->idx);
+	w->timer_is_armed = false;
+	return 0;
+}
+
+static int init_timer(struct server_wrk *w)
+{
+	union epoll_data data;
+	int ret;
+
+	ret = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+	if (ret < 0) {
+		ret = -errno;
+		pr_error("Failed to create timer FD: %s", strerror(-ret));
+		return ret;
+	}
+
+	w->timer_fd = ret;
+	data.u64 = EPL_EV_TIMERFD;
+	ret = epoll_add(w->ep_fd, ret, EPOLLIN, data);
+	if (ret)
+		return ret;
+
+	return 0;
+}
+
+static void free_timer(struct server_wrk *w)
+{
+	if (w->timer_fd >= 0)
+		close(w->timer_fd);
+}
+
 static int init_worker(struct server_wrk *w, bool create_thread)
 {
 	int ret;
@@ -1140,13 +1247,25 @@ static int init_worker(struct server_wrk *w, bool create_thread)
 		return ret;
 	}
 
+	if (w->ctx->spd_map.bucket_arr) {
+		ret = init_timer(w);
+		if (ret) {
+			free_clients(w);
+			free_epoll(w);
+			return ret;
+		}
+	} else {
+		w->timer_fd = -1;
+	}
+
 	if (create_thread) {
 		ret = pthread_create(&w->thread, NULL, &worker_func, w);
 		if (ret) {
 			pr_error("Failed to create worker thread %u: %s", w->idx, strerror(ret));
 			free_clients(w);
 			free_epoll(w);
-			return ret;
+			free_timer(w);
+			return -ret;
 		}
 	} else {
 		union epoll_data data;
@@ -1156,6 +1275,7 @@ static int init_worker(struct server_wrk *w, bool create_thread)
 		if (ret) {
 			free_clients(w);
 			free_epoll(w);
+			free_timer(w);
 			return ret;
 		}
 	}
@@ -1175,6 +1295,7 @@ static void free_worker(struct server_wrk *w)
 
 	free_clients(w);
 	free_epoll(w);
+	free_timer(w);
 }
 
 static int init_workers(struct server_ctx *ctx)
@@ -1276,6 +1397,7 @@ static struct client_state *get_free_client_slot(struct server_wrk *w)
 	assert(c->client.fd < 0);
 	assert(c->target.fd < 0);
 	assert(!c->target_connected);
+	assert(!c->rate_limit_flags);
 	assert(c->idx == idx);
 	assert(!c->spd);
 	return c;
@@ -1339,6 +1461,7 @@ static void put_client_slot(struct server_wrk *w, struct client_state *c)
 
 	w->handle_events_should_stop = hess;
 	c->target_connected = false;
+	c->rate_limit_flags = 0;
 	if (c->spd) {
 		put_ip_spd_bucket(&w->ctx->spd_map, &c->client_addr);
 		c->spd = NULL;
@@ -1751,6 +1874,7 @@ static void consume_token(struct client_state *c, enum tkn_type type, size_t n)
 static int do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 			    struct client_endp *src, struct client_endp *dst)
 {
+	enum tkn_type type = (src == &c->client) ? UP_TKN : DN_TKN;
 	size_t max_send;
 	ssize_t ret;
 
@@ -1773,9 +1897,12 @@ static int do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 	if (dst->ep_mask & EPOLLOUT)
 		return 0;
 
-	max_send = get_max_send_size(c, (src == &c->client) ? UP_TKN : DN_TKN);
-	if (max_send == 0)
-		return toggle_epoll_out(w, c, dst, true);
+	max_send = get_max_send_size(c, type);
+	if (!max_send) {
+		pr_infov("%s rate limited, disabling EPOLLIN (thread %u)", src == &c->client ? "Client" : "Target", w->idx);
+		c->rate_limit_flags |= (src == &c->client) ? UP_RATE_LIMITED : DOWN_RATE_LIMITED;
+		return arm_timer(w);
+	}
 
 	ret = do_ep_send(src, dst, max_send);
 	if (ret < 0) {
@@ -1797,8 +1924,18 @@ static int do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 static int do_pipe_epoll_out(struct server_wrk *w, struct client_state *c,
 			     struct client_endp *src, struct client_endp *dst)
 {
-	size_t max_send = get_max_send_size(c, (src == &c->client) ? UP_TKN : DN_TKN);
-	ssize_t ret;
+	enum tkn_type type = (src == &c->client) ? UP_TKN : DN_TKN;
+	size_t max_send = get_max_send_size(c, type);
+	int ret;
+
+	if (!max_send) {
+		c->rate_limit_flags |= (type == UP_TKN) ? UP_RATE_LIMITED : DOWN_RATE_LIMITED;
+		ret = toggle_epoll_out(w, c, src, false);
+		if (ret)
+			return ret;
+
+		return arm_timer(w);
+	}
 
 	ret = do_ep_send(src, dst, max_send);
 	if (ret < 0 && ret != -EAGAIN) {
@@ -1876,13 +2013,50 @@ static int handle_event_target_data(struct server_wrk *w, struct epoll_event *ev
 	return 0;
 }
 
-static int handle_event_timer_arm_client(struct server_wrk *w)
+static int handle_event_timer(struct server_wrk *w)
 {
-	return 0;
-}
+	size_t nr_limited = 0;
+	uint64_t sig;
+	ssize_t ret;
+	size_t i;
 
-static int handle_event_timer_arm_target(struct server_wrk *w)
-{
+	ret = read(w->timer_fd, &sig, sizeof(sig));
+	if (ret < 0) {
+		ret = -errno;
+		if (ret == -EAGAIN || ret == -EINTR)
+			return 0;
+
+		pr_error("Failed to read timer FD: %s", strerror(-ret));
+		return ret;
+	}
+
+	if (ret != sizeof(sig)) {
+		pr_error("Failed to read timer FD: Invalid read size: %zd", ret);
+		return -EIO;
+	}
+
+	for (i = 0; i < w->client_arr_size; i++) {
+		struct client_state *c = &w->clients[i];
+
+		if (c->client.fd < 0)
+			continue;
+
+		if (c->rate_limit_flags & UP_RATE_LIMITED) {
+			toggle_epoll_out(w, c, &c->target, true);
+			nr_limited++;
+		}
+
+		if (c->rate_limit_flags & DOWN_RATE_LIMITED) {
+			toggle_epoll_out(w, c, &c->client, true);
+			nr_limited++;
+		}
+
+		c->rate_limit_flags = 0;
+	}
+
+	if (nr_limited == 0)
+		return disarm_timer(w);
+
 	return 0;
 }
 
@@ -1907,11 +2081,8 @@ static int handle_event(struct server_wrk *w, struct epoll_event *ev)
 	case EPL_EV_TCP_TARGET_CONN:
 		ret = handle_event_target_conn(w, ev);
 		break;
-	case EPL_EV_TIMER_ARM_CLIENT:
-		ret = handle_event_timer_arm_client(w);
-		break;
-	case EPL_EV_TIMER_ARM_TARGET:
-		ret = handle_event_timer_arm_target(w);
+	case EPL_EV_TIMERFD:
+		ret = handle_event_timer(w);
 		break;
 	default:
 		pr_error("Unknown event type: %lu (thread %u)", evt, w->idx);
