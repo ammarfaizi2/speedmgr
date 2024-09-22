@@ -49,6 +49,7 @@
 #include <stdio.h>
 #include <errno.h>
 
+#include <netinet/in.h>
 #include <sys/time.h>
 #include <sys/timerfd.h>
 #include <sys/resource.h>
@@ -66,6 +67,14 @@
 #include <fcntl.h>
 
 #include "ht.h"
+
+#ifndef SO_ORIGINAL_DST
+#define SO_ORIGINAL_DST 80
+#endif
+
+#ifndef IP6T_SO_ORIGINAL_DST
+#define IP6T_SO_ORIGINAL_DST 80
+#endif
 
 static volatile bool *g_stop;
 static uint8_t g_verbose;
@@ -1473,19 +1482,68 @@ static void put_client_slot(struct server_wrk *w, struct client_state *c)
 	(void)ret;
 }
 
+static int get_target_addr(struct server_wrk *w, struct client_state *c,
+			   struct sockaddr_in46 *addr)
+{
+	struct sockaddr_in46 *cfg_addr = &w->ctx->cfg.target_addr;
+	socklen_t len;
+	int ret;
+
+	/*
+	 * If the destination is 0.0.0.0 or [::], get the original
+	 * destination address from the client using getsockopt().
+	 */
+	if (cfg_addr->sa.sa_family == AF_INET) {
+		if (cfg_addr->in4.sin_addr.s_addr != INADDR_ANY) {
+			*addr = *cfg_addr;
+			return 0;
+		}
+	} else if (cfg_addr->sa.sa_family == AF_INET6) {
+		if (!IN6_IS_ADDR_UNSPECIFIED(&cfg_addr->in6.sin6_addr)) {
+			*addr = *cfg_addr;
+			return 0;
+		}
+	}
+
+	if (w->ctx->cfg.bind_addr.sa.sa_family == AF_INET6) {
+		len = sizeof(addr->in6);
+		ret = getsockopt(c->client.fd, SOL_IPV6, IP6T_SO_ORIGINAL_DST, &addr->in6, &len);
+		if (ret) {
+			ret = -errno;
+			pr_error("Failed to get destination address: %s", strerror(-ret));
+			return ret;
+		}
+	} else {
+		len = sizeof(addr->in4);
+		ret = getsockopt(c->client.fd, SOL_IP, SO_ORIGINAL_DST, &addr->in4, &len);
+		if (ret) {
+			ret = -errno;
+			pr_error("Failed to get destination address: %s", strerror(-ret));
+			return ret;
+		}
+	}
+
+	return 0;
+}
+
 static int prepare_target_connect(struct server_wrk *w, struct client_state *c)
 {
-	struct sockaddr_in46 *taddr = &w->ctx->cfg.target_addr;
+	struct sockaddr_in46 taddr;
 	union epoll_data data;
 	socklen_t len;
 	int fd, ret;
 
-	if (taddr->sa.sa_family == AF_INET6)
-		len = sizeof(taddr->in6);
-	else
-		len = sizeof(taddr->in4);
+	memset(&taddr, 0, sizeof(taddr));
+	ret = get_target_addr(w, c, &taddr);
+	if (ret)
+		return ret;
 
-	fd = socket(taddr->sa.sa_family, SOCK_STREAM | SOCK_NONBLOCK, 0);
+	if (taddr.sa.sa_family == AF_INET6)
+		len = sizeof(taddr.in6);
+	else
+		len = sizeof(taddr.in4);
+
+	fd = socket(taddr.sa.sa_family, SOCK_STREAM | SOCK_NONBLOCK, 0);
 	if (fd < 0) {
 		ret = errno;
 		pr_error("Failed to create target socket: %s", strerror(ret));
@@ -1497,7 +1555,7 @@ static int prepare_target_connect(struct server_wrk *w, struct client_state *c)
 	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &ret, sizeof(ret));
 #endif
 
-	ret = connect(fd, &taddr->sa, len);
+	ret = connect(fd, &taddr.sa, len);
 	if (ret) {
 		ret = errno;
 		if (ret != EINPROGRESS) {
