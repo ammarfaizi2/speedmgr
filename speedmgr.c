@@ -1713,6 +1713,7 @@ static void consume_token(struct client_state *c, enum tkn_type type, size_t n)
 static int do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 			    struct client_endp *src, struct client_endp *dst)
 {
+	size_t max_send;
 	ssize_t ret;
 
 	ret = do_ep_recv(src);
@@ -1734,7 +1735,11 @@ static int do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 	if (dst->ep_mask & EPOLLOUT)
 		return 0;
 
-	ret = do_ep_send(src, dst, get_max_send_size(c, (src == &c->client) ? UP_TKN : DN_TKN));
+	max_send = get_max_send_size(c, (src == &c->client) ? UP_TKN : DN_TKN);
+	if (max_send == 0)
+		return toggle_epoll_out(w, c, dst, true);
+
+	ret = do_ep_send(src, dst, max_send);
 	if (ret < 0) {
 		if (ret != -EAGAIN) {
 			pr_error("Failed to send data: %s", strerror(-ret));
@@ -1754,9 +1759,10 @@ static int do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 static int do_pipe_epoll_out(struct server_wrk *w, struct client_state *c,
 			     struct client_endp *src, struct client_endp *dst)
 {
+	size_t max_send = get_max_send_size(c, (src == &c->client) ? UP_TKN : DN_TKN);
 	ssize_t ret;
 
-	ret = do_ep_send(src, dst, get_max_send_size(c, (src == &c->client) ? UP_TKN : DN_TKN));
+	ret = do_ep_send(src, dst, max_send);
 	if (ret < 0 && ret != -EAGAIN) {
 		pr_error("Failed to send data: %s", strerror(-ret));
 		return ret;
