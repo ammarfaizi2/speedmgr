@@ -109,6 +109,7 @@ struct ip_spd_bucket {
 	uint64_t		dn_fill_interval;
 
 	_Atomic(uint16_t)	nr_conns;
+	int			timer_fd;
 };
 
 struct ip_spd_map {
@@ -258,6 +259,26 @@ static void ms_to_timespec(uint64_t ms, struct timespec *ts)
 	ts->tv_nsec = (ms % 1000) * 1000000;
 }
 
+static void normalize_speed_limit(uint64_t *limit, uint64_t *interval)
+{
+	if (*limit % 2 != 0)
+		(*limit)++;
+
+	if (*interval % 2 != 0)
+		(*interval)++;
+
+	while ((*limit % 2) == 0 && (*interval % 2) == 0) {
+		*limit /= 2;
+		*interval /= 2;
+	}
+
+	if (*limit == 0)
+		*interval = 0;
+
+	if (*interval == 0)
+		*limit = 0;
+}
+
 static int init_spd_map(struct server_ctx *ctx)
 {
 	struct ip_spd_map *map = &ctx->spd_map;
@@ -276,38 +297,14 @@ static int init_spd_map(struct server_ctx *ctx)
 	}
 
 	if (map->up_interval > 0) {
-		/*
-		 * Normalize, make it small as possible.
-		 */
-		if (map->up_limit % 2 != 0)
-			map->up_limit++;
-
-		if (map->up_interval % 2 != 0)
-			map->up_interval++;
-
-		while ((map->up_limit % 2) == 0 && (map->up_interval % 2) == 0) {
-			map->up_limit /= 2;
-			map->up_interval /= 2;
-		}
+		normalize_speed_limit(&map->up_limit, &map->up_interval);
 	} else {
 		map->up_interval = 0;
 		map->up_limit = 0;
 	}
 
 	if (map->down_interval > 0) {
-		/*
-		 * Normalize, make it small as possible.
-		 */
-		if (map->down_limit % 2 != 0)
-			map->down_limit++;
-
-		if (map->down_interval % 2 != 0)
-			map->down_interval++;
-
-		while ((map->down_limit % 2) == 0 && (map->down_interval % 2) == 0) {
-			map->down_limit /= 2;
-			map->down_interval /= 2;
-		}
+		normalize_speed_limit(&map->down_limit, &map->down_interval);
 	} else {
 		map->down_interval = 0;
 		map->down_limit = 0;
