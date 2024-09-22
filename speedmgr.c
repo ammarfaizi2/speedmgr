@@ -275,6 +275,47 @@ static int init_spd_map(struct server_ctx *ctx)
 		return 0;
 	}
 
+	if (map->up_interval > 0) {
+		/*
+		 * Normalize, make it small as possible.
+		 */
+		if (map->up_limit % 2 != 0)
+			map->up_limit++;
+
+		if (map->up_interval % 2 != 0)
+			map->up_interval++;
+
+		while ((map->up_limit % 2) == 0 && (map->up_interval % 2) == 0) {
+			map->up_limit /= 2;
+			map->up_interval /= 2;
+		}
+	} else {
+		map->up_interval = 0;
+		map->up_limit = 0;
+	}
+
+	if (map->down_interval > 0) {
+		/*
+		 * Normalize, make it small as possible.
+		 */
+		if (map->down_limit % 2 != 0)
+			map->down_limit++;
+
+		if (map->down_interval % 2 != 0)
+			map->down_interval++;
+
+		while ((map->down_limit % 2) == 0 && (map->down_interval % 2) == 0) {
+			map->down_limit /= 2;
+			map->down_interval /= 2;
+		}
+	} else {
+		map->down_interval = 0;
+		map->down_limit = 0;
+	}
+
+	pr_infov("up_limit: %lu, up_interval: %lu, down_limit: %lu, down_interval: %lu\n",
+		 map->up_limit, map->up_interval, map->down_limit, map->down_interval);
+
 	ret = ht_create(&map->ht);
 	if (ret)
 		return ret;
