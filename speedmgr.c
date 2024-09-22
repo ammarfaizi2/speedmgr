@@ -196,6 +196,7 @@ struct server_cfg {
 	uint8_t			verbose;
 	int			backlog;
 	uint32_t		nr_workers;
+	uint32_t		out_mark;
 	uint64_t		up_limit;
 	uint64_t		up_interval;
 	uint64_t		down_limit;
@@ -241,9 +242,10 @@ static const struct option long_options[] = {
 	{ "up-interval",	required_argument,	NULL,	'I' },
 	{ "down-limit",		required_argument,	NULL,	'D' },
 	{ "down-interval",	required_argument,	NULL,	'd' },
+	{ "out-mark",		required_argument,	NULL,	'o' },
 	{ NULL,			0,			NULL,	0 },
 };
-static const char short_options[] = "hVw:b:t:vB:U:I:D:d:";
+static const char short_options[] = "hVw:b:t:vB:U:I:D:d:o:";
 
 static void show_help(const void *app)
 {
@@ -260,6 +262,7 @@ static void show_help(const void *app)
 	printf("  -I, --up-interval=NUM\t\tUpload fill interval (seconds)\n");
 	printf("  -D, --down-limit=NUM\t\tDownload speed limit (bytes)\n");
 	printf("  -d, --down-interval=NUM\tDownload fill interval (seconds)\n");
+	printf("  -o, --out-mark=NUM\t\tOutgoing connection packet mark\n");
 }
 
 static uint64_t get_time_ms(void)
@@ -682,18 +685,73 @@ static int parse_args(int argc, char *argv[], struct server_cfg *cfg)
 		case 'U':
 			cfg->up_limit = strtoull(optarg, &t, 10);
 			p.got_up_limit = true;
+			if (!t || *t == '\0') {
+				/* nothing */
+			} else if (*t == 'K' || *t == 'k') {
+				cfg->up_limit *= 1024;
+			} else if (*t == 'M' || *t == 'm') {
+				cfg->up_limit *= 1024 * 1024;
+			} else if (*t == 'G' || *t == 'g') {
+				cfg->up_limit *= 1024 * 1024 * 1024;
+			} else if (*t != '\0') {
+				pr_error("Invalid upload limit: %s", optarg);
+				return -EINVAL;
+			}
 			break;
 		case 'I':
 			cfg->up_interval = strtoull(optarg, &t, 10);
 			p.got_up_interval = true;
+			if (!t || *t == '\0') {
+				/* nothing */
+			} else if (*t == 'h') {
+				cfg->up_interval *= 3600;
+			} else if (*t == 'm') {
+				cfg->up_interval *= 60;
+			} else if (*t == 's') {
+				/* nothing */
+			} else {
+				pr_error("Invalid upload interval: %s", optarg);
+				return -EINVAL;
+			}
 			break;
 		case 'D':
 			cfg->down_limit = strtoull(optarg, &t, 10);
 			p.got_down_limit = true;
+			if (!t || *t == '\0') {
+				/* nothing */
+			} else if (*t == 'K' || *t == 'k') {
+				cfg->down_limit *= 1024;
+			} else if (*t == 'M' || *t == 'm') {
+				cfg->down_limit *= 1024 * 1024;
+			} else if (*t == 'G' || *t == 'g') {
+				cfg->down_limit *= 1024 * 1024 * 1024;
+			} else if (*t != '\0') {
+				pr_error("Invalid download limit: %s", optarg);
+				return -EINVAL;
+			}
 			break;
 		case 'd':
 			cfg->down_interval = strtoull(optarg, &t, 10);
 			p.got_down_interval = true;
+			if (!t || *t == '\0') {
+				/* nothing */
+			} else if (*t == 'h') {
+				cfg->down_interval *= 3600;
+			} else if (*t == 'm') {
+				cfg->down_interval *= 60;
+			} else if (*t == 's') {
+				/* nothing */
+			} else {
+				pr_error("Invalid download interval: %s", optarg);
+				return -EINVAL;
+			}
+			break;
+		case 'o':
+			cfg->out_mark = strtoul(optarg, &t, 10);
+			if (!t || *t != '\0') {
+				pr_error("Invalid outgoing packet mark: %s", optarg);
+				return -EINVAL;
+			}
 			break;
 		case '?':
 			return -EINVAL;
@@ -1554,6 +1612,18 @@ static int prepare_target_connect(struct server_wrk *w, struct client_state *c)
 	ret = 1;
 	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &ret, sizeof(ret));
 #endif
+
+	if (w->ctx->cfg.out_mark) {
+		uint32_t mark = w->ctx->cfg.out_mark;
+
+		ret = setsockopt(fd, SOL_SOCKET, SO_MARK, &mark, sizeof(mark));
+		if (ret) {
+			ret = errno;
+			pr_error("Failed to set SO_MARK on target socket: %s", strerror(ret));
+			close(fd);
+			return -ret;
+		}
+	}
 
 	ret = connect(fd, &taddr.sa, len);
 	if (ret) {
