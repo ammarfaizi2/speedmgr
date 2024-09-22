@@ -16,6 +16,15 @@
 #define ARRAY_SIZE(x)	(sizeof(x) / sizeof((x)[0]))
 #endif
 
+#ifndef MIN
+#define MIN(a, b)	((a) < (b) ? (a) : (b))
+#endif
+
+#ifndef MAX
+#define MAX(a, b)	((a) > (b) ? (a) : (b))
+#endif
+
+
 /*
  * The number of `struct epoll_event` array members.
  */
@@ -90,9 +99,15 @@ struct sockaddr_in46 {
 
 struct ip_spd_bucket {
 	_Atomic(uint64_t)	up_tkn;
-	_Atomic(uint64_t)	dn_tkn;
+	_Atomic(uint64_t)	last_up_fill;
 	uint64_t		up_tkn_max;
+	uint64_t		up_fill_interval;
+
+	_Atomic(uint64_t)	dn_tkn;
+	_Atomic(uint64_t)	last_dn_fill;
 	uint64_t		dn_tkn_max;
+	uint64_t		dn_fill_interval;
+
 	_Atomic(uint16_t)	nr_conns;
 };
 
@@ -188,6 +203,8 @@ enum {
 	EPL_EV_TCP_CLIENT_DATA	= (0x0002ull << 48ull),
 	EPL_EV_TCP_TARGET_DATA	= (0x0003ull << 48ull),
 	EPL_EV_TCP_TARGET_CONN	= (0x0004ull << 48ull),
+	EPL_EV_TIMER_ARM_CLIENT	= (0x0005ull << 48ull),
+	EPL_EV_TIMER_ARM_TARGET	= (0x0006ull << 48ull),
 };
 
 #define EPL_EV_MASK		(0xffffull << 48ull)
@@ -227,6 +244,20 @@ static void show_help(const void *app)
 	printf("  -d, --down-interval=NUM\tDownload fill interval (seconds)\n");
 }
 
+static uint64_t get_time_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
+static void ms_to_timespec(uint64_t ms, struct timespec *ts)
+{
+	ts->tv_sec = ms / 1000;
+	ts->tv_nsec = (ms % 1000) * 1000000;
+}
+
 static int init_spd_map(struct server_ctx *ctx)
 {
 	struct ip_spd_map *map = &ctx->spd_map;
@@ -238,7 +269,7 @@ static int init_spd_map(struct server_ctx *ctx)
 	map->down_limit = cfg->down_limit;
 	map->down_interval = cfg->down_interval;
 
-	if (!(map->up_limit && map->up_interval && map->down_limit && map->down_interval)) {
+	if (!(map->up_limit || map->up_interval || map->down_limit || map->down_interval)) {
 		memset(map, 0, sizeof(*map));
 		pr_infov("Speed limits are not set, speed limiter is disabled");
 		return 0;
@@ -397,11 +428,19 @@ static struct ip_spd_bucket *get_ip_spd_bucket(struct ip_spd_map *map,
 		free(b);
 		b = NULL;
 	} else {
+		uint64_t now = get_time_ms();
+
 		map->len++;
 		atomic_fetch_add(&b->nr_conns, 1u);
+
 		b->up_tkn_max = map->up_limit;
-		b->dn_tkn_max = map->down_limit;
+		b->up_fill_interval = map->up_interval;
+		atomic_store_explicit(&b->last_up_fill, now, memory_order_relaxed);
 		atomic_store_explicit(&b->up_tkn, b->up_tkn_max, memory_order_relaxed);
+
+		b->dn_tkn_max = map->down_limit;
+		b->dn_fill_interval = map->down_interval;
+		atomic_store_explicit(&b->last_dn_fill, now, memory_order_relaxed);
 		atomic_store_explicit(&b->dn_tkn, b->dn_tkn_max, memory_order_relaxed);
 	}
 
@@ -1547,17 +1586,18 @@ static ssize_t do_ep_recv(struct client_endp *ep)
 	return 0;
 }
 
-static ssize_t do_ep_send(struct client_endp *src, struct client_endp *dst)
+static ssize_t do_ep_send(struct client_endp *src, struct client_endp *dst,
+			  size_t max_send)
 {
 	ssize_t ret;
 	size_t len;
 	char *buf;
 
-	if (src->len == 0)
+	buf = src->buf;
+	len = MIN(src->len, max_send);
+	if (len == 0)
 		return 0;
 
-	len = src->len;
-	buf = src->buf;
 	ret = send(dst->fd, buf, len, MSG_DONTWAIT);
 	if (ret < 0) {
 		ret = -errno;
@@ -1579,6 +1619,95 @@ static ssize_t do_ep_send(struct client_endp *src, struct client_endp *dst)
 
 	src->len = 0;
 	return ret;
+}
+
+enum tkn_type {
+	UP_TKN,
+	DN_TKN,
+};
+
+static size_t __get_max_send_size(struct client_state *c, enum tkn_type type)
+{
+	struct ip_spd_bucket *b;
+	uint64_t last, now;
+	uint64_t cur_tkn;
+	size_t max;
+
+	if (!c->spd)
+		return MAX_RECV_BUF_RESIZE;
+
+	b = c->spd;
+	if (type == UP_TKN) {
+		if (!b->up_tkn_max)
+			return MAX_RECV_BUF_RESIZE;
+
+		now = get_time_ms();
+		last = atomic_load_explicit(&b->last_up_fill, memory_order_relaxed);
+		cur_tkn = atomic_load_explicit(&b->up_tkn, memory_order_relaxed);
+		if (now > last) {
+			cur_tkn += (now - last) * b->up_tkn_max / b->up_fill_interval;
+			if (cur_tkn > b->up_tkn_max)
+				cur_tkn = b->up_tkn_max;
+		}
+
+		atomic_store_explicit(&b->last_up_fill, now, memory_order_relaxed);
+		atomic_store_explicit(&b->up_tkn, cur_tkn, memory_order_relaxed);
+		max = cur_tkn;
+	} else if (type == DN_TKN) {
+		if (!b->dn_tkn_max)
+			return MAX_RECV_BUF_RESIZE;
+
+		now = get_time_ms();
+		last = atomic_load_explicit(&b->last_dn_fill, memory_order_relaxed);
+		cur_tkn = atomic_load_explicit(&b->dn_tkn, memory_order_relaxed);
+		if (now > last) {
+			cur_tkn += (now - last) * b->dn_tkn_max / b->dn_fill_interval;
+			if (cur_tkn > b->dn_tkn_max)
+				cur_tkn = b->dn_tkn_max;
+		}
+
+		atomic_store_explicit(&b->last_dn_fill, now, memory_order_relaxed);
+		atomic_store_explicit(&b->dn_tkn, cur_tkn, memory_order_relaxed);
+		max = cur_tkn;
+	} else {
+		pr_error("get_max_send_size: Invalid token type: %u", type);
+		assert(0);
+		max = 0;
+	}
+
+	return max;
+}
+
+static size_t get_max_send_size(struct client_state *c, enum tkn_type type)
+{
+	return __get_max_send_size(c, type);
+}
+
+static void consume_token(struct client_state *c, enum tkn_type type, size_t n)
+{
+	uint64_t tmp;
+
+	if (!c->spd)
+		return;
+
+	if (type == UP_TKN) {
+		if (!c->spd->up_tkn_max)
+			return;
+		tmp = atomic_load_explicit(&c->spd->up_tkn, memory_order_relaxed);
+		if (tmp >= n)
+			tmp -= n;
+		atomic_store_explicit(&c->spd->up_tkn, tmp, memory_order_relaxed);
+	} else if (type == DN_TKN) {
+		if (!c->spd->dn_tkn_max)
+			return;
+		tmp = atomic_load_explicit(&c->spd->dn_tkn, memory_order_relaxed);
+		if (tmp >= n)
+			tmp -= n;
+		atomic_store_explicit(&c->spd->dn_tkn, tmp, memory_order_relaxed);
+	} else {
+		pr_error("consume_token: Invalid token type: %u", type);
+		assert(0);
+	}
 }
 
 static int do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
@@ -1605,7 +1734,7 @@ static int do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 	if (dst->ep_mask & EPOLLOUT)
 		return 0;
 
-	ret = do_ep_send(src, dst);
+	ret = do_ep_send(src, dst, get_max_send_size(c, (src == &c->client) ? UP_TKN : DN_TKN));
 	if (ret < 0) {
 		if (ret != -EAGAIN) {
 			pr_error("Failed to send data: %s", strerror(-ret));
@@ -1618,6 +1747,7 @@ static int do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 			return ret;
 	}
 
+	consume_token(c, (src == &c->client) ? UP_TKN : DN_TKN, (size_t)ret);
 	return 0;
 }
 
@@ -1626,12 +1756,13 @@ static int do_pipe_epoll_out(struct server_wrk *w, struct client_state *c,
 {
 	ssize_t ret;
 
-	ret = do_ep_send(src, dst);
+	ret = do_ep_send(src, dst, get_max_send_size(c, (src == &c->client) ? UP_TKN : DN_TKN));
 	if (ret < 0 && ret != -EAGAIN) {
 		pr_error("Failed to send data: %s", strerror(-ret));
 		return ret;
 	}
 
+	consume_token(c, (src == &c->client) ? UP_TKN : DN_TKN, (size_t)ret);
 	if (src->len == 0) {
 		pr_infov("%s send buffer has been flushed, disabling EPOLLOUT (thread %u)", src == &c->client ? "Client" : "Target", w->idx);
 		ret = toggle_epoll_out(w, c, dst, false);
@@ -1701,6 +1832,16 @@ static int handle_event_target_data(struct server_wrk *w, struct epoll_event *ev
 	return 0;
 }
 
+static int handle_event_timer_arm_client(struct server_wrk *w)
+{
+	return 0;
+}
+
+static int handle_event_timer_arm_target(struct server_wrk *w)
+{
+	return 0;
+}
+
 static int handle_event(struct server_wrk *w, struct epoll_event *ev)
 {
 	uint64_t evt = GET_EPL_EV(ev->data.u64);
@@ -1721,6 +1862,12 @@ static int handle_event(struct server_wrk *w, struct epoll_event *ev)
 		break;
 	case EPL_EV_TCP_TARGET_CONN:
 		ret = handle_event_target_conn(w, ev);
+		break;
+	case EPL_EV_TIMER_ARM_CLIENT:
+		ret = handle_event_timer_arm_client(w);
+		break;
+	case EPL_EV_TIMER_ARM_TARGET:
+		ret = handle_event_timer_arm_target(w);
 		break;
 	default:
 		pr_error("Unknown event type: %lu (thread %u)", evt, w->idx);
