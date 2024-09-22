@@ -29,6 +29,8 @@
 #define INIT_RECV_BUF_SIZE 8192
 #define MAX_RECV_BUF_RESIZE (1024*1024*128)
 
+#define INIT_SPD_MAP_SIZE 32
+
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -51,6 +53,8 @@
 #include <getopt.h>
 #include <unistd.h>
 #include <fcntl.h>
+
+#include "ht.h"
 
 static volatile bool *g_stop;
 static uint8_t g_verbose;
@@ -84,6 +88,26 @@ struct sockaddr_in46 {
 	};
 };
 
+struct ip_spd_bucket {
+	_Atomic(uint64_t)	up_tkn;
+	_Atomic(uint64_t)	dn_tkn;
+	uint64_t		up_tkn_max;
+	uint64_t		dn_tkn_max;
+	_Atomic(uint16_t)	nr_conns;
+};
+
+struct ip_spd_map {
+	ht_t	ht;
+	size_t	cap;
+	size_t	len;
+	pthread_mutex_t	lock;
+	struct ip_spd_bucket **bucket_arr;
+	uint64_t up_limit;
+	uint64_t up_interval;
+	uint64_t down_limit;
+	uint64_t down_interval;
+};
+
 struct client_endp {
 	int		fd;
 	uint32_t	ep_mask;
@@ -97,6 +121,7 @@ struct client_state {
 	struct client_endp	target;
 	uint32_t		idx;
 	struct sockaddr_in46	client_addr;
+	struct ip_spd_bucket	*spd;
 	bool target_connected;
 };
 
@@ -137,9 +162,10 @@ struct server_cfg {
 	uint8_t			verbose;
 	int			backlog;
 	uint32_t		nr_workers;
-	uint64_t		burst_size;
-	uint64_t		fill_interval;
-	uint64_t		fill_size;
+	uint64_t		up_limit;
+	uint64_t		up_interval;
+	uint64_t		down_limit;
+	uint64_t		down_interval;
 	struct sockaddr_in46	bind_addr;
 	struct sockaddr_in46	target_addr;
 };
@@ -153,6 +179,7 @@ struct server_ctx {
 	int			tcp_fd;
 	struct server_wrk	*workers;
 	struct server_cfg	cfg;
+	struct ip_spd_map	spd_map;
 };
 
 enum {
@@ -175,12 +202,13 @@ static const struct option long_options[] = {
 	{ "target",		required_argument,	NULL,	't' },
 	{ "verbose",		no_argument,		NULL,	'v' },
 	{ "backlog",		required_argument,	NULL,	'B' },
-	{ "burst",		required_argument,	NULL,	'u' },
-	{ "fill-interval",	required_argument,	NULL,	'i' },
-	{ "fill-size",		required_argument,	NULL,	'f' },
+	{ "up-limit",		required_argument,	NULL,	'U' },
+	{ "up-interval",	required_argument,	NULL,	'I' },
+	{ "down-limit",		required_argument,	NULL,	'D' },
+	{ "down-interval",	required_argument,	NULL,	'd' },
 	{ NULL,			0,			NULL,	0 },
 };
-static const char short_options[] = "hVw:b:t:vB:u:i:f:";
+static const char short_options[] = "hVw:b:t:vB:U:I:D:d:";
 
 static void show_help(const void *app)
 {
@@ -193,9 +221,81 @@ static void show_help(const void *app)
 	printf("  -t, --target=ADDR\t\tTarget address, addr:port\n");
 	printf("  -v, --verbose\t\t\tVerbose mode\n");
 	printf("  -B, --backlog=NUM\t\tBacklog size\n");
-	printf("  -u, --burst=NUM\t\tBurst size (bytes)\n");
-	printf("  -i, --fill-interval=NUM\tFill interval (ms)\n");
-	printf("  -f, --fill-size=NUM\t\tFill size (bytes)\n");
+	printf("  -U, --up-limit=NUM\t\tUpload speed limit (bytes)\n");
+	printf("  -I, --up-interval=NUM\t\tUpload fill interval (seconds)\n");
+	printf("  -D, --down-limit=NUM\t\tDownload speed limit (bytes)\n");
+	printf("  -d, --down-interval=NUM\tDownload fill interval (seconds)\n");
+}
+
+static int init_spd_map(struct server_ctx *ctx)
+{
+	struct ip_spd_map *map = &ctx->spd_map;
+	struct server_cfg *cfg = &ctx->cfg;
+	int ret;
+
+	map->up_limit = cfg->up_limit;
+	map->up_interval = cfg->up_interval;
+	map->down_limit = cfg->down_limit;
+	map->down_interval = cfg->down_interval;
+
+	if (!(map->up_limit && map->up_interval && map->down_limit && map->down_interval)) {
+		memset(map, 0, sizeof(*map));
+		pr_infov("Speed limits are not set, speed limiter is disabled");
+		return 0;
+	}
+
+	ret = ht_create(&map->ht);
+	if (ret)
+		return ret;
+
+	map->cap = INIT_SPD_MAP_SIZE;
+	map->len = 0;
+	map->bucket_arr = calloc(map->cap, sizeof(*map->bucket_arr));
+	if (!map->bucket_arr) {
+		ht_destroy(&map->ht);
+		return -ENOMEM;
+	}
+
+	ret = pthread_mutex_init(&map->lock, NULL);
+	if (ret) {
+		free(map->bucket_arr);
+		ht_destroy(&map->ht);
+		return -ret;
+	}
+
+	return 0;
+}
+
+static void free_spd_map(struct server_ctx *ctx)
+{
+	struct ip_spd_map *map = &ctx->spd_map;
+	size_t i;
+
+	if (!map->bucket_arr)
+		return;
+
+	pthread_mutex_lock(&map->lock);
+	for (i = 0; i < map->len; i++)
+		free(map->bucket_arr[i]);
+	free(map->bucket_arr);
+	ht_destroy(&map->ht);
+	pthread_mutex_unlock(&map->lock);
+}
+
+static void init_ip_spd_bucket(struct ip_spd_bucket *b)
+{
+	memset(b, 0, sizeof(*b));
+}
+
+static inline void get_ip_ptr(struct sockaddr_in46 *addr, void **ptr, size_t *len)
+{
+	if (addr->sa.sa_family == AF_INET) {
+		*ptr = &addr->in4.sin_addr;
+		*len = sizeof(addr->in4.sin_addr);
+	} else {
+		*ptr = &addr->in6.sin6_addr;
+		*len = sizeof(addr->in6.sin6_addr);
+	}
 }
 
 static const char *sockaddr_to_str(struct sockaddr_in46 *addr)
@@ -216,6 +316,138 @@ static const char *sockaddr_to_str(struct sockaddr_in46 *addr)
 	}
 
 	return buf;
+}
+
+// MUST HOLD: map->lock when calling this function.
+static int get_bucket_index(struct ip_spd_map *map, struct sockaddr_in46 *key,
+			    uint32_t *idx)
+{
+	struct ht_data *data;
+	size_t tkey_len;
+	void *tkey;
+	int ret;
+
+	get_ip_ptr(key, &tkey, &tkey_len);
+	ret = ht_lookup(&map->ht, tkey, tkey_len, &data);
+	if (ret)
+		return ret;
+
+	*idx = data->u32;
+	return 0;
+}
+
+// MUST HOLD: map->lock when calling this function.
+static int set_bucket_index(struct ip_spd_map *map, struct sockaddr_in46 *key,
+			    uint32_t idx)
+{
+	struct ht_data data;
+	size_t tkey_len;
+	void *tkey;
+	int ret;
+
+	get_ip_ptr(key, &tkey, &tkey_len);
+	data.u32 = idx;
+	ret = ht_insert(&map->ht, tkey, tkey_len, &data);
+	if (ret)
+		return ret;
+
+	return 0;
+}
+
+static struct ip_spd_bucket *get_ip_spd_bucket(struct ip_spd_map *map,
+					       struct sockaddr_in46 *addr)
+{
+	struct ip_spd_bucket *b;
+	uint32_t idx;
+
+	if (!map->bucket_arr)
+		return NULL;
+
+	pthread_mutex_lock(&map->lock);
+	if (!get_bucket_index(map, addr, &idx)) {
+		b = map->bucket_arr[idx];
+		atomic_fetch_add(&b->nr_conns, 1u);
+		pthread_mutex_unlock(&map->lock);
+		return b;
+	}
+
+	if (map->len == map->cap) {
+		size_t new_cap = map->cap + (map->cap / 2) + 1;
+		struct ip_spd_bucket **new_arr;
+
+		new_arr = realloc(map->bucket_arr, new_cap * sizeof(*new_arr));
+		if (!new_arr) {
+			pthread_mutex_unlock(&map->lock);
+			return NULL;
+		}
+
+		map->bucket_arr = new_arr;
+		map->cap = new_cap;
+	}
+
+	b = calloc(1, sizeof(*b));
+	if (!b) {
+		pthread_mutex_unlock(&map->lock);
+		return NULL;
+	}
+
+	init_ip_spd_bucket(b);
+	map->bucket_arr[map->len] = b;
+	if (set_bucket_index(map, addr, map->len)) {
+		free(b);
+		b = NULL;
+	} else {
+		map->len++;
+		atomic_fetch_add(&b->nr_conns, 1u);
+		b->up_tkn_max = map->up_limit;
+		b->dn_tkn_max = map->down_limit;
+		atomic_store_explicit(&b->up_tkn, b->up_tkn_max, memory_order_relaxed);
+		atomic_store_explicit(&b->dn_tkn, b->dn_tkn_max, memory_order_relaxed);
+	}
+
+	pthread_mutex_unlock(&map->lock);
+	return b;
+}
+
+static void put_ip_spd_bucket(struct ip_spd_map *map, struct sockaddr_in46 *addr)
+{
+	struct ip_spd_bucket *b;
+	uint32_t idx;
+
+	assert(map->bucket_arr);
+	pthread_mutex_lock(&map->lock);
+	if (get_bucket_index(map, addr, &idx)) {
+		pthread_mutex_unlock(&map->lock);
+		pr_error("Failed to put bucket index for %s", sockaddr_to_str(addr));
+		return;
+	}
+
+	b = map->bucket_arr[idx];
+	if (atomic_fetch_sub(&b->nr_conns, 1u) == 1) {
+		size_t key_len;
+		void *key;
+
+		get_ip_ptr(addr, &key, &key_len);
+		ht_remove(&map->ht, key, key_len);
+		map->bucket_arr[idx] = NULL;
+		free(b);
+	}
+
+	/*
+	 * Shrink the bucket array if it's too large.
+	 */
+	if ((map->cap - map->len) > 32) {
+		struct ip_spd_bucket **new_arr;
+		size_t new_cap = map->len;
+
+		new_arr = realloc(map->bucket_arr, new_cap * sizeof(*new_arr));
+		if (new_arr) {
+			map->bucket_arr = new_arr;
+			map->cap = new_cap;
+		}
+	}
+
+	pthread_mutex_unlock(&map->lock);
 }
 
 static int parse_addr_and_port(const char *str, struct sockaddr_in46 *out)
@@ -291,6 +523,12 @@ static int parse_args(int argc, char *argv[], struct server_cfg *cfg)
 	struct parse_state {
 		bool got_bind_addr;
 		bool got_target_addr;
+
+		bool got_up_limit;
+		bool got_up_interval;
+
+		bool got_down_limit;
+		bool got_down_interval;
 	} p;
 
 	cfg->backlog = 64;
@@ -347,26 +585,21 @@ static int parse_args(int argc, char *argv[], struct server_cfg *cfg)
 				return -EINVAL;
 			}
 			break;
-		case 'u':
-			cfg->burst_size = strtoull(optarg, &t, 10);
-			if (cfg->burst_size == 0 || *t != '\0') {
-				pr_error("Invalid burst size: %s", optarg);
-				return -EINVAL;
-			}
+		case 'U':
+			cfg->up_limit = strtoull(optarg, &t, 10);
+			p.got_up_limit = true;
 			break;
-		case 'i':
-			cfg->fill_interval = strtoull(optarg, &t, 10);
-			if (cfg->fill_interval == 0 || *t != '\0') {
-				pr_error("Invalid fill interval: %s", optarg);
-				return -EINVAL;
-			}
+		case 'I':
+			cfg->up_interval = strtoull(optarg, &t, 10);
+			p.got_up_interval = true;
 			break;
-		case 'f':
-			cfg->fill_size = strtoull(optarg, &t, 10);
-			if (cfg->fill_size == 0 || *t != '\0') {
-				pr_error("Invalid fill size: %s", optarg);
-				return -EINVAL;
-			}
+		case 'D':
+			cfg->down_limit = strtoull(optarg, &t, 10);
+			p.got_down_limit = true;
+			break;
+		case 'd':
+			cfg->down_interval = strtoull(optarg, &t, 10);
+			p.got_down_interval = true;
 			break;
 		case '?':
 			return -EINVAL;
@@ -383,6 +616,18 @@ static int parse_args(int argc, char *argv[], struct server_cfg *cfg)
 
 	if (!p.got_target_addr) {
 		pr_error("Missing target address (the -t option)");
+		show_help(argv[0]);
+		return -EINVAL;
+	}
+
+	if (p.got_up_limit ^ p.got_up_interval) {
+		pr_error("Upload limit and upload interval must be specified together");
+		show_help(argv[0]);
+		return -EINVAL;
+	}
+
+	if (p.got_down_limit ^ p.got_down_interval) {
+		pr_error("Download limit and download interval must be specified together");
 		show_help(argv[0]);
 		return -EINVAL;
 	}
@@ -661,6 +906,7 @@ static void init_client_state(struct client_state *c)
 	init_client_endp(&c->client);
 	init_client_endp(&c->target);
 	c->target_connected = false;
+	c->spd = NULL;
 	memset(&c->client_addr, 0, sizeof(c->client_addr));
 }
 
@@ -912,12 +1158,19 @@ static int init_ctx(struct server_ctx *ctx)
 	if (ret)
 		return ret;
 
-	ret = init_socket(ctx);
+	ret = init_spd_map(ctx);
 	if (ret)
 		return ret;
 
+	ret = init_socket(ctx);
+	if (ret) {
+		free_spd_map(ctx);
+		return ret;
+	}
+
 	ret = init_workers(ctx);
 	if (ret) {
+		free_spd_map(ctx);
 		free_socket(ctx);
 		return ret;
 	}
@@ -929,6 +1182,7 @@ static void free_ctx(struct server_ctx *ctx)
 {
 	free_workers(ctx);
 	free_socket(ctx);
+	free_spd_map(ctx);
 }
 
 static struct client_state *get_free_client_slot(struct server_wrk *w)
@@ -946,6 +1200,7 @@ static struct client_state *get_free_client_slot(struct server_wrk *w)
 	assert(c->target.fd < 0);
 	assert(!c->target_connected);
 	assert(c->idx == idx);
+	assert(!c->spd);
 	return c;
 }
 
@@ -960,6 +1215,9 @@ static struct server_wrk *pick_worker_for_new_conn(struct server_ctx *ctx)
 		uint32_t nr;
 
 		nr = atomic_load(&ctx->workers[i].nr_online_clients);
+		if (nr < 5)
+			return &ctx->workers[i];
+
 		if (nr < min) {
 			min = nr;
 			w = &ctx->workers[i];
@@ -1004,6 +1262,10 @@ static void put_client_slot(struct server_wrk *w, struct client_state *c)
 
 	w->handle_events_should_stop = hess;
 	c->target_connected = false;
+	if (c->spd) {
+		put_ip_spd_bucket(&w->ctx->spd_map, &c->client_addr);
+		c->spd = NULL;
+	}
 	memset(&c->client_addr, 0, sizeof(c->client_addr));
 	ret = push_client_stack(w->cl_stack, c->idx);
 	atomic_fetch_sub(&w->nr_online_clients, 1u);
@@ -1071,6 +1333,7 @@ static int prepare_target_connect(struct server_wrk *w, struct client_state *c)
 static int give_client_fd_to_a_worker(struct server_ctx *ctx, int fd,
 				      struct sockaddr_in46 *addr)
 {
+	struct ip_spd_bucket *b;
 	struct client_state *c;
 	struct server_wrk *w;
 	int ret;
@@ -1084,6 +1347,10 @@ static int give_client_fd_to_a_worker(struct server_ctx *ctx, int fd,
 
 	c->client.fd = fd;
 	c->client_addr = *addr;
+	b = get_ip_spd_bucket(&ctx->spd_map, &c->client_addr);
+	if (b)
+		c->spd = b;
+
 	ret = prepare_target_connect(w, c);
 	if (ret) {
 		put_client_slot(w, c);
@@ -1246,7 +1513,7 @@ static ssize_t do_ep_recv(struct client_endp *ep)
 			if (!tmp) {
 				if (ep->cap > 0)
 					return -ENOBUFS;
-				pr_error("Failed to realloc receive buffer: %s", strerror(errno));
+				pr_error("Failed to realloc receive buffer: %s", strerror(ENOMEM));
 				return -ENOMEM;
 			}
 

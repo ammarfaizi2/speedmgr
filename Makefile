@@ -22,8 +22,8 @@ endif
 
 all: $(TARGET)
 
-$(TARGET): speedmgr.o
-	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
+$(TARGET): speedmgr.o ht.o
+	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
