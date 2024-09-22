@@ -27,7 +27,7 @@
 #define NR_INIT_CLIENT_ARR_SIZE 32
 
 #define INIT_RECV_BUF_SIZE 8192
-#define MAX_RECV_BUF_RESIZE (1024*1024*10)
+#define MAX_RECV_BUF_RESIZE (1024*1024*1024)
 
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -906,6 +906,7 @@ static int init_ctx(struct server_ctx *ctx)
 {
 	int ret;
 
+	g_verbose = ctx->cfg.verbose;
 	try_increase_rlimit_nofile();
 	ret = install_signal_handlers(ctx);
 	if (ret)
@@ -1049,7 +1050,7 @@ static int prepare_target_connect(struct server_wrk *w, struct client_state *c)
 	data.u64 = 0;
 	data.ptr = c;
 	data.u64 |= EPL_EV_TCP_CLIENT_DATA;
-	c->client.ep_mask = EPOLLIN;
+	c->client.ep_mask = 0;
 	ret = epoll_add(w->ep_fd, c->client.fd, c->client.ep_mask, data);
 	if (ret)
 		return ret;
@@ -1141,131 +1142,6 @@ static int handle_event_accept(struct server_wrk *w)
 	return ret;
 }
 
-static int handle_event_target_conn(struct server_wrk *w, struct epoll_event *ev)
-{
-	struct client_state *c = GET_EPL_DT(ev->data.u64);
-	uint32_t events = ev->events;
-	union epoll_data data;
-	socklen_t len;
-	int ret, tmp;
-
-	if (events & (EPOLLERR | EPOLLHUP)) {
-		pr_error("Target connect failed: %s (thread %u)", strerror(errno), w->idx);
-		return -ECONNRESET;
-	}
-
-	tmp = 0;
-	len = sizeof(tmp);
-	ret = getsockopt(c->target.fd, SOL_SOCKET, SO_ERROR, &tmp, &len);
-	if (unlikely(tmp || !(events & EPOLLOUT))) {
-		if (tmp < 0)
-			tmp = -tmp;
-		pr_error("Failed to get target socket error: %s (thread %u)", strerror(tmp), w->idx);
-		return -ECONNRESET;
-	}
-
-	if (c->client.len > 0)
-		c->target.ep_mask = EPOLLIN | EPOLLOUT;
-	else
-		c->target.ep_mask = EPOLLIN;
-
-	data.u64 = 0;
-	data.ptr = c;
-	data.u64 |= EPL_EV_TCP_TARGET_DATA;
-	ret = epoll_mod(w->ep_fd, c->target.fd, c->target.ep_mask, data);
-	if (ret)
-		return ret;
-
-	pr_infov("Target connection established (thread %u)", w->idx);
-	return 0;
-}
-
-static ssize_t do_ep_recv(struct client_endp *ep)
-{
-	ssize_t ret;
-	size_t len;
-	char *buf;
-
-	if (ep->len == ep->cap) {
-		size_t new_cap;
-		char *tmp;
-
-		if (ep->cap == 0)
-			new_cap = INIT_RECV_BUF_SIZE;
-		else
-			new_cap = ep->cap + (ep->cap / 2) + 1;
-
-		tmp = realloc(ep->buf, new_cap);
-		if (!tmp) {
-			if (ep->cap > 0)
-				return -ENOBUFS;
-			pr_error("Failed to realloc receive buffer: %s", strerror(errno));
-			return -ENOMEM;
-		}
-
-		ep->buf = tmp;
-		ep->cap = new_cap;
-	}
-
-	assert(ep->len <= ep->cap);
-	assert(ep->buf);
-
-	len = ep->cap - ep->len;
-	if (len == 0)
-		return -ENOBUFS;
-
-	len = ep->cap - ep->len;
-	buf = ep->buf + ep->len;
-	ret = recv(ep->fd, buf, len, MSG_DONTWAIT);
-	if (ret < 0) {
-		ret = -errno;
-		if (ret == -EAGAIN || ret == -EINTR)
-			return -EAGAIN;
-
-		return ret;
-	}
-
-	if (ret == 0)
-		return -ECONNRESET;
-
-	ep->len += (size_t)ret;
-	return ret;
-}
-
-static ssize_t do_ep_send(struct client_endp *src, struct client_endp *dst)
-{
-	ssize_t ret;
-	size_t len;
-	char *buf;
-
-	if (src->len == 0)
-		return 0;
-
-	len = src->len;
-	buf = src->buf;
-	ret = send(dst->fd, buf, len, MSG_DONTWAIT);
-	if (ret < 0) {
-		ret = -errno;
-		if (ret == -EAGAIN || ret == -EINTR)
-			return -EAGAIN;
-
-		pr_error("Failed to send data: %s", strerror(-ret));
-		return ret;
-	}
-
-	if (ret == 0)
-		return -ECONNRESET;
-
-	if ((size_t)ret < len) {
-		memmove(buf, buf + ret, len - (size_t)ret);
-		src->len -= (size_t)ret;
-		return -EAGAIN;
-	}
-
-	src->len = 0;
-	return ret;
-}
-
 static int toggle_ep_event(struct server_wrk *w, struct client_state *cl,
 			   struct client_endp *ep, uint32_t tmask, bool enable)
 {
@@ -1311,6 +1187,133 @@ static int toggle_epoll_out(struct server_wrk *w, struct client_state *cl,
 	return toggle_ep_event(w, cl, ep, EPOLLOUT, enable);
 }
 
+static int handle_event_target_conn(struct server_wrk *w, struct epoll_event *ev)
+{
+	struct client_state *c = GET_EPL_DT(ev->data.u64);
+	uint32_t events = ev->events;
+	union epoll_data data;
+	socklen_t len;
+	int ret, tmp;
+
+	tmp = 0;
+	len = sizeof(tmp);
+	ret = getsockopt(c->target.fd, SOL_SOCKET, SO_ERROR, &tmp, &len);
+	if (unlikely(tmp || !(events & EPOLLOUT))) {
+		if (tmp < 0)
+			tmp = -tmp;
+		pr_error("Failed to get target socket error: %s (thread %u)", strerror(tmp), w->idx);
+		return -ECONNRESET;
+	}
+
+	data.u64 = 0;
+	data.ptr = c;
+	data.u64 |= EPL_EV_TCP_TARGET_DATA;
+	c->target.ep_mask = EPOLLIN;
+	ret = epoll_mod(w->ep_fd, c->target.fd, c->target.ep_mask, data);
+	if (ret)
+		return ret;
+
+	data.u64 = 0;
+	data.ptr = c;
+	data.u64 |= EPL_EV_TCP_CLIENT_DATA;
+	c->client.ep_mask = EPOLLIN;
+	ret = epoll_mod(w->ep_fd, c->client.fd, c->client.ep_mask, data);
+	if (ret)
+		return ret;
+
+	c->target_connected = true;
+	pr_infov("Target connection established (thread %u)", w->idx);
+	return 0;
+}
+
+static ssize_t do_ep_recv(struct client_endp *ep)
+{
+	ssize_t ret;
+	size_t len;
+	char *buf;
+
+	if (ep->len == ep->cap) {
+		size_t new_cap;
+		char *tmp;
+
+		if (ep->cap == 0)
+			new_cap = INIT_RECV_BUF_SIZE;
+		else
+			new_cap = ep->cap + (ep->cap / 2) + 1;
+
+		if (new_cap <= MAX_RECV_BUF_RESIZE) {
+			tmp = realloc(ep->buf, new_cap);
+			if (!tmp) {
+				if (ep->cap > 0)
+					return -ENOBUFS;
+				pr_error("Failed to realloc receive buffer: %s", strerror(errno));
+				return -ENOMEM;
+			}
+
+			ep->buf = tmp;
+			ep->cap = new_cap;
+		}
+	}
+
+	assert(ep->len <= ep->cap);
+	assert(ep->buf);
+
+	len = ep->cap - ep->len;
+	if (len == 0)
+		return -ENOBUFS;
+
+	len = ep->cap - ep->len;
+	buf = ep->buf + ep->len;
+	ret = recv(ep->fd, buf, len, MSG_DONTWAIT);
+	if (ret < 0) {
+		ret = -errno;
+		if (ret == -EAGAIN || ret == -EINTR)
+			return -EAGAIN;
+
+		return ret;
+	}
+
+	if (ret == 0)
+		return -ECONNRESET;
+
+	ep->len += (size_t)ret;
+	return 0;
+}
+
+static ssize_t do_ep_send(struct client_endp *src, struct client_endp *dst)
+{
+	ssize_t ret;
+	size_t len;
+	char *buf;
+
+	if (src->len == 0)
+		return 0;
+
+	len = src->len;
+	buf = src->buf;
+	ret = send(dst->fd, buf, len, MSG_DONTWAIT);
+	if (ret < 0) {
+		ret = -errno;
+		if (ret == -EAGAIN || ret == -EINTR)
+			return -EAGAIN;
+
+		pr_error("Failed to send data: %s", strerror(-ret));
+		return ret;
+	}
+
+	if (ret == 0)
+		return -ECONNRESET;
+
+	if ((size_t)ret < len) {
+		memmove(buf, buf + ret, len - (size_t)ret);
+		src->len -= (size_t)ret;
+		return -EAGAIN;
+	}
+
+	src->len = 0;
+	return ret;
+}
+
 static int do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 			    struct client_endp *src, struct client_endp *dst)
 {
@@ -1322,7 +1325,7 @@ static int do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 			return 0;
 
 		if (ret == -ENOBUFS) {
-			pr_infov("Receive buffer is full, disabling EPOLLIN (thread %u)", w->idx);
+			pr_infov("%s recv buffer is full, disabling EPOLLIN (thread %u)", src == &c->client ? "Client" : "Target", w->idx);
 			return toggle_epoll_in(w, c, src, false);
 		}
 
@@ -1332,6 +1335,9 @@ static int do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 	if (dst == &c->target && !c->target_connected)
 		return toggle_epoll_out(w, c, dst, true);
 
+	if (dst->ep_mask & EPOLLOUT)
+		return 0;
+
 	ret = do_ep_send(src, dst);
 	if (ret < 0) {
 		if (ret != -EAGAIN) {
@@ -1339,14 +1345,8 @@ static int do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 			return ret;
 		}
 
+		pr_infov("%s send buffer is full, enabling EPOLLOUT (thread %u)", dst == &c->client ? "Client" : "Target", w->idx);
 		ret = toggle_epoll_out(w, c, dst, true);
-		if (ret)
-			return ret;
-	}
-
-	if (!(dst->ep_mask & EPOLLIN) && (src->cap - src->len) > 0) {
-		pr_infov("Enabling EPOLLIN (thread %u)", w->idx);
-		ret = toggle_epoll_in(w, c, src, true);
 		if (ret)
 			return ret;
 	}
@@ -1366,8 +1366,15 @@ static int do_pipe_epoll_out(struct server_wrk *w, struct client_state *c,
 	}
 
 	if (src->len == 0) {
-		pr_infov("Disabling EPOLLOUT (thread %u)", w->idx);
+		pr_infov("%s send buffer has been flushed, disabling EPOLLOUT (thread %u)", src == &c->client ? "Client" : "Target", w->idx);
 		ret = toggle_epoll_out(w, c, dst, false);
+		if (ret)
+			return ret;
+	}
+
+	if ((src->cap - src->len) > 0 && !(src->ep_mask & EPOLLIN)) {
+		pr_infov("%s recv buffer has space, enabling EPOLLIN (thread %u)", src == &c->client ? "Client" : "Target", w->idx);
+		ret = toggle_epoll_in(w, c, src, true);
 		if (ret)
 			return ret;
 	}
@@ -1382,7 +1389,7 @@ static int handle_event_client_data(struct server_wrk *w, struct epoll_event *ev
 	int ret;
 
 	if (unlikely(events & (EPOLLERR | EPOLLHUP))) {
-		pr_errorv("Client socket hit (EPOLLERR|EPOLLHUP): %s (thread %u)", strerror(errno), w->idx);
+		pr_errorv("Client socket hit (EPOLLERR|EPOLLHUP) (thread %u)", w->idx);
 		return -ECONNRESET;
 	}
 
@@ -1408,7 +1415,7 @@ static int handle_event_target_data(struct server_wrk *w, struct epoll_event *ev
 	int ret;
 
 	if (unlikely(events & (EPOLLERR | EPOLLHUP))) {
-		pr_errorv("Target socket hit (EPOLLERR|EPOLLHUP): %s (thread %u)", strerror(errno), w->idx);
+		pr_errorv("Client socket hit (EPOLLERR|EPOLLHUP) (thread %u)", w->idx);
 		return -ECONNRESET;
 	}
 
