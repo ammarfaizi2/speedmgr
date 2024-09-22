@@ -1,5 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
+/*
+ * For tproxy:
+ *    sudo ./speedmgr -w 1 -b [::]:4444 -t [::]:0 -U 1M -I 1000 -D 1M -d 1000 -o 1111;
+ *    sudo iptables -t nat -I OUTPUT -p tcp -j REDIRECT --to-ports 4444;
+ *    sudo iptables -t nat -I OUTPUT -m mark --mark 1111 -j ACCEPT;
+ */
+
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -36,7 +43,7 @@
 #define NR_INIT_CLIENT_ARR_SIZE 2048
 
 #define INIT_RECV_BUF_SIZE 8192
-#define MAX_RECV_BUF_RESIZE (1024*1024*128)
+#define MAX_RECV_BUF_RESIZE (20480)
 
 #define INIT_SPD_MAP_SIZE 32
 
@@ -152,6 +159,7 @@ struct client_state {
 	struct client_endp	target;
 	uint32_t		idx;
 	struct sockaddr_in46	client_addr;
+	struct sockaddr_in46	target_addr;
 	struct ip_spd_bucket	*spd;
 	bool target_connected;
 	uint8_t rate_limit_flags;
@@ -281,6 +289,8 @@ static void ms_to_timespec(uint64_t ms, struct timespec *ts)
 
 static void normalize_speed_limit(uint64_t *limit, uint64_t *interval)
 {
+	uint64_t next_int, next_lim;
+
 	if (*limit % 2 != 0)
 		(*limit)++;
 
@@ -288,8 +298,13 @@ static void normalize_speed_limit(uint64_t *limit, uint64_t *interval)
 		(*interval)++;
 
 	while ((*limit % 2) == 0 && (*interval % 2) == 0) {
-		*limit /= 2;
-		*interval /= 2;
+		next_int = *interval / 2;
+		next_lim = *limit / 2;
+		if (next_int < 100)
+			break;
+
+		*interval = next_int;
+		*limit = next_lim;
 	}
 
 	if (*limit == 0)
@@ -600,9 +615,9 @@ static int parse_addr_and_port(const char *str, struct sockaddr_in46 *out)
 	}
 
 	ret = atoi(port);
-	if (ret <= 0 || ret > 65535) {
+	if (ret < 0 || ret > 65535) {
 		pr_error("Invalid port in the address and port combination: \"%s\"", str);
-		pr_error("Port must be between 1 and 65535");
+		pr_error("Port must be between 0 and 65535");
 		ret = -EINVAL;
 		goto out;
 	}
@@ -704,11 +719,11 @@ static int parse_args(int argc, char *argv[], struct server_cfg *cfg)
 			if (!t || *t == '\0') {
 				/* nothing */
 			} else if (*t == 'h') {
-				cfg->up_interval *= 3600;
+				cfg->up_interval *= 1000 * 3600;
 			} else if (*t == 'm') {
-				cfg->up_interval *= 60;
+				cfg->up_interval *= 1000 * 60;
 			} else if (*t == 's') {
-				/* nothing */
+				cfg->up_interval *= 1000;
 			} else {
 				pr_error("Invalid upload interval: %s", optarg);
 				return -EINVAL;
@@ -736,11 +751,11 @@ static int parse_args(int argc, char *argv[], struct server_cfg *cfg)
 			if (!t || *t == '\0') {
 				/* nothing */
 			} else if (*t == 'h') {
-				cfg->down_interval *= 3600;
+				cfg->down_interval *= 1000 * 3600;
 			} else if (*t == 'm') {
-				cfg->down_interval *= 60;
+				cfg->down_interval *= 1000 * 60;
 			} else if (*t == 's') {
-				/* nothing */
+				cfg->down_interval *= 1000;
 			} else {
 				pr_error("Invalid download interval: %s", optarg);
 				return -EINVAL;
@@ -825,7 +840,7 @@ static int consume_event_fd(struct server_wrk *w)
 
 static int handle_epoll_ctl_err(const char *op, int ret, int epl_fd, int fd)
 {
-	pr_error("Failed to %s FD %d in epoll (%d): %s", op, fd, epl_fd, strerror(-ret));
+	pr_error("Failed to %s FD %d in epoll (%d): %s", op, fd, epl_fd, strerror(ret));
 	return -ret;
 }
 
@@ -1061,6 +1076,7 @@ static void init_client_state(struct client_state *c)
 	c->rate_limit_flags = 0;
 	c->spd = NULL;
 	memset(&c->client_addr, 0, sizeof(c->client_addr));
+	memset(&c->target_addr, 0, sizeof(c->target_addr));
 }
 
 static int init_clients(struct server_wrk *w)
@@ -1533,7 +1549,9 @@ static void put_client_slot(struct server_wrk *w, struct client_state *c)
 		put_ip_spd_bucket(&w->ctx->spd_map, &c->client_addr);
 		c->spd = NULL;
 	}
+
 	memset(&c->client_addr, 0, sizeof(c->client_addr));
+	memset(&c->target_addr, 0, sizeof(c->target_addr));
 	ret = push_client_stack(w->cl_stack, c->idx);
 	atomic_fetch_sub(&w->nr_online_clients, 1u);
 	assert(!ret);
@@ -1564,12 +1582,22 @@ static int get_target_addr(struct server_wrk *w, struct client_state *c,
 	}
 
 	if (w->ctx->cfg.bind_addr.sa.sa_family == AF_INET6) {
-		len = sizeof(addr->in6);
-		ret = getsockopt(c->client.fd, SOL_IPV6, IP6T_SO_ORIGINAL_DST, &addr->in6, &len);
-		if (ret) {
-			ret = -errno;
-			pr_error("Failed to get destination address: %s", strerror(-ret));
-			return ret;
+		if (IN6_IS_ADDR_V4MAPPED(&c->client_addr.in6.sin6_addr)) {
+			len = sizeof(addr->in4);
+			ret = getsockopt(c->client.fd, SOL_IP, SO_ORIGINAL_DST, &addr->in4, &len);
+			if (ret) {
+				ret = -errno;
+				pr_error("Failed to get destination address: %s", strerror(-ret));
+				return ret;
+			}
+		} else {
+			len = sizeof(addr->in6);
+			ret = getsockopt(c->client.fd, SOL_IPV6, IP6T_SO_ORIGINAL_DST, &addr->in6, &len);
+			if (ret) {
+				ret = -errno;
+				pr_error("Failed to get destination address: %s", strerror(-ret));
+				return ret;
+			}
 		}
 	} else {
 		len = sizeof(addr->in4);
@@ -1608,11 +1636,6 @@ static int prepare_target_connect(struct server_wrk *w, struct client_state *c)
 		return -ret;
 	}
 
-#ifdef TCP_NODELAY
-	ret = 1;
-	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &ret, sizeof(ret));
-#endif
-
 	if (w->ctx->cfg.out_mark) {
 		uint32_t mark = w->ctx->cfg.out_mark;
 
@@ -1625,6 +1648,7 @@ static int prepare_target_connect(struct server_wrk *w, struct client_state *c)
 		}
 	}
 
+	c->target_addr = taddr;
 	ret = connect(fd, &taddr.sa, len);
 	if (ret) {
 		ret = errno;
@@ -1635,23 +1659,32 @@ static int prepare_target_connect(struct server_wrk *w, struct client_state *c)
 		}
 	}
 
-	c->target.fd = fd;
+#ifdef TCP_NODELAY
+	ret = 1;
+	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &ret, sizeof(ret));
+#endif
 
 	data.u64 = 0;
 	data.ptr = c;
 	data.u64 |= EPL_EV_TCP_CLIENT_DATA;
 	c->client.ep_mask = 0;
 	ret = epoll_add(w->ep_fd, c->client.fd, c->client.ep_mask, data);
-	if (ret)
+	if (ret) {
+		close(fd);
 		return ret;
+	}
 
+	c->target.fd = fd;
 	data.u64 = 0;
 	data.ptr = c;
 	data.u64 |= EPL_EV_TCP_TARGET_CONN;
 	c->target.ep_mask = EPOLLOUT | EPOLLIN;
 	ret = epoll_add(w->ep_fd, c->target.fd, c->target.ep_mask, data);
-	if (ret)
+	if (ret) {
+		close(c->target.fd);
+		c->target.fd = -1;
 		return ret;
+	}
 
 	send_event_fd(w);
 	pr_debug("Preparing forward conn from %s to %s (thread %u)", sockaddr_to_str(&c->client_addr), sockaddr_to_str(taddr), w->idx);
@@ -1681,6 +1714,10 @@ static int give_client_fd_to_a_worker(struct server_ctx *ctx, int fd,
 
 	ret = prepare_target_connect(w, c);
 	if (ret) {
+		/*
+		 * Don't close(c->client.f).
+		 */
+		c->client.fd = -1;
 		put_client_slot(w, c);
 		return ret;
 	}
@@ -1796,7 +1833,7 @@ static int handle_event_target_conn(struct server_wrk *w, struct epoll_event *ev
 	if (unlikely(tmp || !(events & EPOLLOUT))) {
 		if (tmp < 0)
 			tmp = -tmp;
-		pr_error("Failed to get target socket error: %s (thread %u)", strerror(tmp), w->idx);
+		pr_error("Connect error: %s: %s", sockaddr_to_str(&c->target_addr), strerror(tmp));
 		return -ECONNRESET;
 	}
 
@@ -1817,7 +1854,7 @@ static int handle_event_target_conn(struct server_wrk *w, struct epoll_event *ev
 		return ret;
 
 	c->target_connected = true;
-	pr_infov("Target connection established (thread %u)", w->idx);
+	pr_infov("Connected to %s", sockaddr_to_str(&c->target_addr));
 	return 0;
 }
 
@@ -1893,7 +1930,6 @@ static ssize_t do_ep_send(struct client_endp *src, struct client_endp *dst,
 		if (ret == -EAGAIN || ret == -EINTR)
 			return -EAGAIN;
 
-		pr_error("Failed to send data: %s", strerror(-ret));
 		return ret;
 	}
 
@@ -2002,6 +2038,8 @@ static void consume_token(struct client_state *c, enum tkn_type type, size_t n)
 static int do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 			    struct client_endp *src, struct client_endp *dst)
 {
+	const char *src_name = (src == &c->client) ? "Client" : "Target";
+	const char *dst_name = (dst == &c->client) ? "Client" : "Target";
 	enum tkn_type type = (src == &c->client) ? UP_TKN : DN_TKN;
 	size_t max_send;
 	ssize_t ret;
@@ -2012,7 +2050,7 @@ static int do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 			return 0;
 
 		if (ret == -ENOBUFS) {
-			pr_infov("%s recv buffer is full, disabling EPOLLIN (thread %u)", src == &c->client ? "Client" : "Target", w->idx);
+			pr_infov("%s recv buffer is full, disabling EPOLLIN (thread %u)", src_name, w->idx);
 			return toggle_epoll_in(w, c, src, false);
 		}
 
@@ -2027,19 +2065,19 @@ static int do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 
 	max_send = get_max_send_size(c, type);
 	if (!max_send) {
-		pr_infov("%s rate limited, disabling EPOLLIN (thread %u)", src == &c->client ? "Client" : "Target", w->idx);
-		c->rate_limit_flags |= (src == &c->client) ? UP_RATE_LIMITED : DOWN_RATE_LIMITED;
+		pr_infov("%s rate limited, disabling EPOLLIN (thread %u)", src_name, w->idx);
+		c->rate_limit_flags |= (type == UP_TKN) ? UP_RATE_LIMITED : DOWN_RATE_LIMITED;
 		return arm_timer(w);
 	}
 
 	ret = do_ep_send(src, dst, max_send);
 	if (ret < 0) {
 		if (ret != -EAGAIN) {
-			pr_error("Failed to send data: %s", strerror(-ret));
+			pr_error("pi: send() to %s (src: %s; target: %s)", dst_name, sockaddr_to_str(&c->client_addr), sockaddr_to_str(&c->target_addr));
 			return ret;
 		}
 
-		pr_infov("%s send buffer is full, enabling EPOLLOUT (thread %u)", dst == &c->client ? "Client" : "Target", w->idx);
+		pr_infov("%s send buffer is full, enabling EPOLLOUT (thread %u)", dst_name, w->idx);
 		ret = toggle_epoll_out(w, c, dst, true);
 		if (ret)
 			return ret;
@@ -2052,6 +2090,8 @@ static int do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 static int do_pipe_epoll_out(struct server_wrk *w, struct client_state *c,
 			     struct client_endp *src, struct client_endp *dst)
 {
+	const char *src_name = (src == &c->client) ? "Client" : "Target";
+	const char *dst_name = (dst == &c->client) ? "Client" : "Target";
 	enum tkn_type type = (src == &c->client) ? UP_TKN : DN_TKN;
 	size_t max_send = get_max_send_size(c, type);
 	int ret;
@@ -2067,20 +2107,20 @@ static int do_pipe_epoll_out(struct server_wrk *w, struct client_state *c,
 
 	ret = do_ep_send(src, dst, max_send);
 	if (ret < 0 && ret != -EAGAIN) {
-		pr_error("Failed to send data: %s", strerror(-ret));
+		pr_error("po: send() to %s (src: %s; target: %s)", dst_name, sockaddr_to_str(&c->client_addr), sockaddr_to_str(&c->target_addr));
 		return ret;
 	}
 
-	consume_token(c, (src == &c->client) ? UP_TKN : DN_TKN, (size_t)ret);
+	consume_token(c, type, (size_t)ret);
 	if (src->len == 0) {
-		pr_infov("%s send buffer has been flushed, disabling EPOLLOUT (thread %u)", src == &c->client ? "Client" : "Target", w->idx);
+		pr_infov("%s send buffer has been flushed, disabling EPOLLOUT (thread %u)", src_name, w->idx);
 		ret = toggle_epoll_out(w, c, dst, false);
 		if (ret)
 			return ret;
 	}
 
 	if ((src->cap - src->len) > 0 && !(src->ep_mask & EPOLLIN)) {
-		pr_infov("%s recv buffer has space, enabling EPOLLIN (thread %u)", src == &c->client ? "Client" : "Target", w->idx);
+		pr_infov("%s recv buffer has space, enabling EPOLLIN (thread %u)", src_name, w->idx);
 		ret = toggle_epoll_in(w, c, src, true);
 		if (ret)
 			return ret;
