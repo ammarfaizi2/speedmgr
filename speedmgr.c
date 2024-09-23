@@ -92,6 +92,10 @@ static uint8_t g_verbose;
 #define pr_debug(fmt, ...) do { } while (0)
 #endif
 
+#ifndef __unused
+#define __unused __attribute__((__unused__))
+#endif
+
 #define pr_error(fmt, ...) printf("perr: " fmt "\n", ##__VA_ARGS__)
 #define pr_info(fmt, ...) printf("info: " fmt "\n", ##__VA_ARGS__)
 
@@ -162,6 +166,7 @@ struct client_state {
 	struct sockaddr_in46	target_addr;
 	struct ip_spd_bucket	*spd;
 	bool target_connected;
+	volatile bool is_used;
 	uint8_t rate_limit_flags;
 };
 
@@ -195,6 +200,7 @@ struct server_wrk {
 	volatile bool		handle_events_should_stop;
 	bool			timer_is_armed;
 	struct epoll_event	events[NR_EPOLL_EVENTS];
+	pthread_mutex_t		client_arr_mtx;
 };
 
 /*
@@ -847,6 +853,7 @@ static int consume_event_fd(struct server_wrk *w)
 static int handle_epoll_ctl_err(const char *op, int ret, int epl_fd, int fd)
 {
 	pr_error("Failed to %s FD %d in epoll (%d): %s", op, fd, epl_fd, strerror(ret));
+	assert(0);
 	return -ret;
 }
 
@@ -1079,6 +1086,7 @@ static void init_client_state(struct client_state *c)
 	init_client_endp(&c->client);
 	init_client_endp(&c->target);
 	c->target_connected = false;
+	c->is_used = false;
 	c->rate_limit_flags = 0;
 	c->spd = NULL;
 	memset(&c->client_addr, 0, sizeof(c->client_addr));
@@ -1224,6 +1232,7 @@ static void free_epoll(struct server_wrk *w)
 
 static void *worker_func(void *data);
 
+__unused
 static int arm_timer(struct server_wrk *w)
 {
 	uint64_t up_intv, dn_intv;
@@ -1326,12 +1335,21 @@ static int init_worker(struct server_wrk *w, bool create_thread)
 {
 	int ret;
 
+	ret = pthread_mutex_init(&w->client_arr_mtx, NULL);
+	if (ret) {
+		pr_error("Failed to initialize client array mutex: %s", strerror(ret));
+		return -ret;
+	}
+
 	ret = init_clients(w);
-	if (ret)
+	if (ret) {
+		pthread_mutex_destroy(&w->client_arr_mtx);
 		return ret;
+	}
 
 	ret = init_epoll(w);
 	if (ret) {
+		pthread_mutex_destroy(&w->client_arr_mtx);
 		free_clients(w);
 		return ret;
 	}
@@ -1385,6 +1403,7 @@ static void free_worker(struct server_wrk *w)
 	free_clients(w);
 	free_epoll(w);
 	free_timer(w);
+	pthread_mutex_destroy(&w->client_arr_mtx);
 }
 
 static int init_workers(struct server_ctx *ctx)
@@ -1472,23 +1491,42 @@ static void free_ctx(struct server_ctx *ctx)
 	free_spd_map(ctx);
 }
 
+#define ENDP_ASSERT(p)		\
+do {				\
+	assert((p)->fd < 0);	\
+	assert(!(p)->buf);	\
+	assert(!(p)->len);	\
+	assert(!(p)->cap);	\
+} while (0)
+
+
 static struct client_state *get_free_client_slot(struct server_wrk *w)
 {
-	struct client_state *c;
-	uint32_t idx;
-	int ret;
+	struct client_state *c = NULL;
+	uint32_t i;
 
-	ret = pop_client_stack(w->cl_stack, &idx);
-	if (ret)
-		return NULL;
+	pthread_mutex_lock(&w->client_arr_mtx);
+	for (i = 0; i < w->client_arr_size; i++) {
+		if (!w->clients[i].is_used) {
+			c = &w->clients[i];
+			break;
+		}
+	}
 
-	c = &w->clients[idx];
-	assert(c->client.fd < 0);
-	assert(c->target.fd < 0);
-	assert(!c->target_connected);
-	assert(!c->rate_limit_flags);
-	assert(c->idx == idx);
-	assert(!c->spd);
+	if (c) {
+		assert(!c->is_used);
+		ENDP_ASSERT(&c->client);
+		ENDP_ASSERT(&c->target);
+		assert(!c->target_connected);
+		assert(!c->spd);
+		assert(!c->rate_limit_flags);
+		assert(!c->client_addr.sa.sa_family);
+		assert(!c->target_addr.sa.sa_family);
+		c->is_used = true;
+		atomic_fetch_add(&w->nr_online_clients, 1u);
+	}
+
+	pthread_mutex_unlock(&w->client_arr_mtx);
 	return c;
 }
 
@@ -1514,7 +1552,6 @@ static struct server_wrk *pick_worker_for_new_conn(struct server_ctx *ctx)
 
 	return w;
 }
-
 
 static void put_client_slot(struct server_wrk *w, struct client_state *c)
 {
@@ -1555,7 +1592,17 @@ static void put_client_slot(struct server_wrk *w, struct client_state *c)
 	}
 
 	init_client_state(c);
-	ret = push_client_stack(w->cl_stack, c->idx);
+
+	if (0) {
+		ret = push_client_stack(w->cl_stack, c->idx);
+	} else {
+		uint32_t i;
+
+		pthread_mutex_lock(&w->client_arr_mtx);
+		c->is_used = false;
+		pthread_mutex_unlock(&w->client_arr_mtx);
+	}
+
 	atomic_fetch_sub(&w->nr_online_clients, 1u);
 	assert(!ret);
 	(void)ret;
@@ -1717,11 +1764,13 @@ static int give_client_fd_to_a_worker(struct server_ctx *ctx, int fd,
 
 	ret = prepare_target_connect(w, c);
 	if (ret) {
+
 		/*
 		 * Don't close(c->client.f).
 		 */
 		c->client.fd = -1;
 		c->target.fd = -1;
+
 		put_client_slot(w, c);
 		return ret;
 	}
@@ -1803,6 +1852,7 @@ static int toggle_ep_event(struct server_wrk *w, struct client_state *cl,
 	else
 		data.u64 |= EPL_EV_TCP_TARGET_DATA;
 
+	assert(ep->fd >= 0);
 	ret = epoll_mod(w->ep_fd, ep->fd, mask, data);
 	if (ret)
 		return ret;
@@ -1958,100 +2008,15 @@ enum tkn_type {
 	DN_TKN,
 };
 
-static size_t get_and_fill_rt(_Atomic(uint64_t) *last_p, _Atomic(uint64_t) *tkn_p,
-			      uint64_t tkn_max, uint64_t fill_interval)
-{
-	uint64_t last, tnow, delta, cur_tkn, nfill;
-
-	tnow = get_time_ms();
-	last = atomic_load_explicit(last_p, memory_order_relaxed);
-	cur_tkn = atomic_load_explicit(tkn_p, memory_order_relaxed);
-
-	delta = tnow - last;
-	nfill = (delta * tkn_max) / fill_interval;
-	if (nfill) {
-		cur_tkn += nfill;
-		if (cur_tkn > tkn_max)
-			cur_tkn = tkn_max;
-
-		atomic_store_explicit(tkn_p, cur_tkn, memory_order_relaxed);
-		atomic_store_explicit(last_p, tnow, memory_order_relaxed);
-	}
-
-	return cur_tkn;
-}
-
-static size_t __get_max_send_size(struct client_state *c, enum tkn_type type)
-{
-	struct ip_spd_bucket *b;
-	size_t max;
-
-	if (!c->spd)
-		return MAX_RECV_BUF_RESIZE;
-
-	b = c->spd;
-	if (type == UP_TKN) {
-		if (!b->up_tkn_max)
-			return MAX_RECV_BUF_RESIZE;
-
-		max = get_and_fill_rt(&b->last_up_fill, &b->up_tkn,
-				      b->up_tkn_max, b->up_fill_interval);
-	} else if (type == DN_TKN) {
-		if (!b->dn_tkn_max)
-			return MAX_RECV_BUF_RESIZE;
-
-		max = get_and_fill_rt(&b->last_dn_fill, &b->dn_tkn,
-				      b->dn_tkn_max, b->dn_fill_interval);
-	} else {
-		pr_error("get_max_send_size: Invalid token type: %u", type);
-		assert(0);
-		max = 0;
-	}
-
-	return max;
-}
-
-static size_t get_max_send_size(struct client_state *c, enum tkn_type type)
-{
-	return __get_max_send_size(c, type);
-}
-
-static void consume_token(struct client_state *c, enum tkn_type type, size_t n)
-{
-	uint64_t tmp;
-
-	if (!c->spd)
-		return;
-
-	if (type == UP_TKN) {
-		if (!c->spd->up_tkn_max)
-			return;
-		tmp = atomic_load_explicit(&c->spd->up_tkn, memory_order_relaxed);
-		if (tmp >= n)
-			tmp -= n;
-		atomic_store_explicit(&c->spd->up_tkn, tmp, memory_order_relaxed);
-	} else if (type == DN_TKN) {
-		if (!c->spd->dn_tkn_max)
-			return;
-		tmp = atomic_load_explicit(&c->spd->dn_tkn, memory_order_relaxed);
-		if (tmp >= n)
-			tmp -= n;
-		atomic_store_explicit(&c->spd->dn_tkn, tmp, memory_order_relaxed);
-	} else {
-		pr_error("consume_token: Invalid token type: %u", type);
-		assert(0);
-	}
-}
-
 static int do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 			    struct client_endp *src, struct client_endp *dst)
 {
 	struct sockaddr_in46 *psrc = (src == &c->client) ? &c->client_addr : &c->target_addr;
 	struct sockaddr_in46 *pdst = (dst == &c->client) ? &c->client_addr : &c->target_addr;
-	const char *src_name = (src == &c->client) ? "Client" : "Target";
-	const char *dst_name = (dst == &c->client) ? "Client" : "Target";
-	enum tkn_type type = (src == &c->client) ? UP_TKN : DN_TKN;
-	size_t max_send;
+	__unused const char *src_name = (src == &c->client) ? "Client" : "Target";
+	__unused const char *dst_name = (dst == &c->client) ? "Client" : "Target";
+	__unused enum tkn_type type = (src == &c->client) ? UP_TKN : DN_TKN;
+	size_t max_send = MAX_RECV_BUF_RESIZE;
 	ssize_t ret;
 
 	ret = do_ep_recv(src);
@@ -2073,13 +2038,6 @@ static int do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 	if (dst == &c->target && !c->target_connected)
 		return toggle_epoll_out(w, c, dst, true);
 
-	max_send = get_max_send_size(c, type);
-	if (!max_send) {
-		pr_debug("%s rate limited, disabling EPOLLIN (thread %u)", src_name, w->idx);
-		c->rate_limit_flags |= (type == UP_TKN) ? UP_RATE_LIMITED : DOWN_RATE_LIMITED;
-		return arm_timer(w);
-	}
-
 	ret = do_ep_send(src, dst, max_send);
 	if (ret < 0) {
 		if (ret != -EAGAIN) {
@@ -2093,7 +2051,6 @@ static int do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 			return ret;
 	}
 
-	consume_token(c, type, (size_t)ret);
 	return 0;
 }
 
@@ -2102,20 +2059,11 @@ static int do_pipe_epoll_out(struct server_wrk *w, struct client_state *c,
 {
 	struct sockaddr_in46 *psrc = (src == &c->client) ? &c->client_addr : &c->target_addr;
 	struct sockaddr_in46 *pdst = (dst == &c->client) ? &c->client_addr : &c->target_addr;
-	const char *src_name = (src == &c->client) ? "Client" : "Target";
-	const char *dst_name = (dst == &c->client) ? "Client" : "Target";
-	enum tkn_type type = (src == &c->client) ? UP_TKN : DN_TKN;
-	size_t max_send = get_max_send_size(c, type);
+	__unused const char *src_name = (src == &c->client) ? "Client" : "Target";
+	__unused const char *dst_name = (dst == &c->client) ? "Client" : "Target";
+	__unused enum tkn_type type = (src == &c->client) ? UP_TKN : DN_TKN;
+	size_t max_send = MAX_RECV_BUF_RESIZE;
 	int ret;
-
-	if (!max_send) {
-		c->rate_limit_flags |= (type == UP_TKN) ? UP_RATE_LIMITED : DOWN_RATE_LIMITED;
-		ret = toggle_epoll_out(w, c, src, false);
-		if (ret)
-			return ret;
-
-		return arm_timer(w);
-	}
 
 	ret = do_ep_send(src, dst, max_send);
 	if (ret < 0 && ret != -EAGAIN) {
@@ -2123,7 +2071,6 @@ static int do_pipe_epoll_out(struct server_wrk *w, struct client_state *c,
 		return ret;
 	}
 
-	consume_token(c, type, (size_t)ret);
 	if (src->len == 0) {
 		pr_debug("%s send buffer has been flushed, disabling EPOLLOUT (thread %u)", src_name, w->idx);
 		ret = toggle_epoll_out(w, c, dst, false);
@@ -2174,7 +2121,7 @@ static int handle_event_target_data(struct server_wrk *w, struct epoll_event *ev
 	int ret;
 
 	if (unlikely(events & (EPOLLERR | EPOLLHUP))) {
-		pr_errorv("Client socket hit (EPOLLERR|EPOLLHUP) (thread %u)", w->idx);
+		pr_errorv("rhup: Target socket hit (EPOLLERR|EPOLLHUP): %s -> %s (thread %u)", sockaddr_to_str(&c->client_addr), sockaddr_to_str(&c->target_addr), w->idx);
 		return -ECONNRESET;
 	}
 
