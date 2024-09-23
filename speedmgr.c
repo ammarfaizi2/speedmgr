@@ -45,7 +45,7 @@
 #define NR_INIT_SPD_BUCKET_ARR	32
 
 #define NR_INIT_RECV_BUF_BYTES	8192
-#define NR_MAX_RECV_BUF_BYTES	(1024 * 1024 * 128)
+#define NR_MAX_RECV_BUF_BYTES	(1024 * 1024 * 256)
 
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -570,8 +570,8 @@ static int init_stack_u32(struct stack_u32 *stack, uint32_t size)
 static void free_stack_u32(struct stack_u32 *stack)
 {
 	uint32_t *data;
-	pr_vl_dbg(3, "free_stack_u32: stack=%p; stack_size=%u", stack, stack->bp);
 
+	pr_vl_dbg(3, "free_stack_u32: stack=%p; stack_size=%u", stack, stack->bp);
 	pthread_mutex_lock(&stack->lock);
 	data = stack->data;
 	stack->data = NULL;
