@@ -40,7 +40,7 @@
 /*
  * The number of initial client slots.
  */
-#define NR_INIT_CLIENT_ARR	2048
+#define NR_INIT_CLIENT_ARR	2
 
 #define NR_INIT_SPD_BUCKET_ARR	32
 
@@ -83,7 +83,7 @@
 #define IP6T_SO_ORIGINAL_DST 80
 #endif
 
-#define g_dbg_level (2)
+#define g_dbg_level (3)
 static volatile bool *g_stop;
 static uint8_t g_verbose;
 
@@ -359,7 +359,7 @@ static int parse_args(int argc, char *argv[], struct server_cfg *cfg)
 		bool got_down_interval;
 	} p;
 
-	cfg->backlog = 64;
+	cfg->backlog = 4;
 	cfg->nr_workers = 4;
 	cfg->verbose = 0;
 
@@ -569,11 +569,15 @@ static int init_stack_u32(struct stack_u32 *stack, uint32_t size)
 
 static void free_stack_u32(struct stack_u32 *stack)
 {
+	uint32_t *data;
+	pr_vl_dbg(3, "free_stack_u32: stack=%p; stack_size=%u", stack, stack->bp);
+
 	pthread_mutex_lock(&stack->lock);
+	data = stack->data;
+	stack->data = NULL;
 	pthread_mutex_unlock(&stack->lock);
 	pthread_mutex_destroy(&stack->lock);
-	free(stack->data);
-	stack->data = NULL;
+	free(data);
 }
 
 static int __upsize_stack_u32(struct stack_u32 *stack, uint32_t new_size)
@@ -594,6 +598,9 @@ static int __push_stack_u32(struct stack_u32 *stack, uint32_t data)
 	if (stack->sp >= stack->bp)
 		return -EAGAIN;
 
+	if (!stack->data)
+		return -EOWNERDEAD;
+
 	stack->data[stack->sp++] = data;
 	return 0;
 }
@@ -602,6 +609,9 @@ static int __pop_stack_u32(struct stack_u32 *stack, uint32_t *data)
 {
 	if (stack->sp == 0)
 		return -EAGAIN;
+
+	if (!stack->data)
+		return -EOWNERDEAD;
 
 	*data = stack->data[--stack->sp];
 	return 0;
@@ -1524,6 +1534,11 @@ static int get_client_slot(struct server_wrk *w, struct client_state **c)
 	}
 
 	*c = w->clients[idx];
+	if (!*c) {
+		push_stack_u32(&w->cl_stack, idx);
+		return -ENOMEM;
+	}
+
 	(*c)->is_used = true;
 	atomic_fetch_add(&w->nr_online_clients, 1u);
 	return 0;
@@ -1585,11 +1600,11 @@ static void __put_client_slot(struct server_wrk *w, struct client_state *c, bool
 
 	if (c->client_ep.fd >= 0) {
 		pr_infov("pcls: %s -> %s (fd=%d; tfd=%d; thread=%u)",
-			sockaddr_to_str(&c->client_ep.addr),
-			sockaddr_to_str(&c->target_ep.addr),
-			c->client_ep.fd,
-			c->target_ep.fd,
-			w->idx);
+			 sockaddr_to_str(&c->client_ep.addr),
+			 sockaddr_to_str(&c->target_ep.addr),
+			 c->client_ep.fd,
+			 c->target_ep.fd,
+			 w->idx);
 	}
 
 	reset_client_state(c);
@@ -1724,7 +1739,13 @@ static int prepare_target_connect(struct server_wrk *w, struct client_state *c)
 	c->target_ep.fd = fd;
 	c->target_ep.addr = taddr;
 
-	pr_infov("ncon: %s -> %s", sockaddr_to_str(&c->client_ep.addr), sockaddr_to_str(&c->target_ep.addr));
+	pr_infov("ncon: %s -> %s (fd=%d; tfd=%d; thread=%u)",
+		 sockaddr_to_str(&c->client_ep.addr),
+		 sockaddr_to_str(&c->target_ep.addr),
+		 c->client_ep.fd,
+		 c->target_ep.fd,
+		 w->idx);
+
 	ret = connect(fd, &taddr.sa, len);
 	if (ret) {
 		ret = errno;
@@ -2130,20 +2151,32 @@ static int handle_event_target_conn(struct server_wrk *w, struct epoll_event *ev
 		return -ECONNRESET;
 	}
 
+	pthread_mutex_lock(&w->epass_mutex);
 	c->target_connected = true;
 	c->target_ep.ep_mask |= EPOLLIN;
 	ret = apply_ep_mask(w, c, &c->target_ep);
-	if (ret)
+	if (ret) {
+		pthread_mutex_unlock(&w->epass_mutex);
 		return ret;
+	}
 
 	if (!(c->client_ep.ep_mask & EPOLLIN)) {
 		c->client_ep.ep_mask |= EPOLLIN;
 		ret = apply_ep_mask(w, c, &c->client_ep);
-		if (ret)
+		if (ret) {
+			pthread_mutex_unlock(&w->epass_mutex);
 			return ret;
+		}
 	}
 
-	pr_infov("conn: %s -> %s", sockaddr_to_str(&c->client_ep.addr), sockaddr_to_str(&c->target_ep.addr));
+	pthread_mutex_unlock(&w->epass_mutex);
+	pr_infov("conn: %s -> %s (fd=%d; tfd=%d; thread=%u)",
+		 sockaddr_to_str(&c->client_ep.addr),
+		 sockaddr_to_str(&c->target_ep.addr),
+		 c->client_ep.fd,
+		 c->target_ep.fd,
+		 w->idx);
+
 	return 0;
 }
 
