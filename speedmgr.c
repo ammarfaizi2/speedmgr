@@ -42,8 +42,8 @@
  */
 #define NR_INIT_CLIENT_ARR_SIZE 2048
 
-#define INIT_RECV_BUF_SIZE 512
-#define MAX_RECV_BUF_RESIZE (512)
+#define INIT_RECV_BUF_SIZE (1024*512)
+#define MAX_RECV_BUF_RESIZE (1024*1024*128)
 
 #define INIT_SPD_MAP_SIZE 32
 
@@ -409,10 +409,16 @@ static const char *sockaddr_to_str(struct sockaddr_in46 *addr)
 	char *buf = _buf[_counter++ % ARRAY_SIZE(_buf)];
 
 	if (addr->sa.sa_family == AF_INET6) {
-		*buf = '[';
-		inet_ntop(AF_INET6, &addr->in6.sin6_addr, buf + 1, INET6_ADDRSTRLEN);
-		snprintf(buf + strlen(buf), sizeof(_buf[0]) - strlen(buf), "]:%hu",
-			 ntohs(addr->in6.sin6_port));
+		if (IN6_IS_ADDR_V4MAPPED(&addr->in6.sin6_addr)) {
+			inet_ntop(AF_INET, &addr->in6.sin6_addr.s6_addr32[3], buf, INET_ADDRSTRLEN);
+			snprintf(buf + strlen(buf), sizeof(_buf[0]) - strlen(buf), ":%hu",
+				 ntohs(addr->in6.sin6_port));
+		} else {
+			*buf = '[';
+			inet_ntop(AF_INET6, &addr->in6.sin6_addr, buf + 1, INET6_ADDRSTRLEN);
+			snprintf(buf + strlen(buf), sizeof(_buf[0]) - strlen(buf), "]:%hu",
+				ntohs(addr->in6.sin6_port));
+		}
 	} else {
 		inet_ntop(AF_INET, &addr->in4.sin_addr, buf, INET_ADDRSTRLEN);
 		snprintf(buf + strlen(buf), sizeof(_buf[0]) - strlen(buf), ":%hu",
@@ -1715,6 +1721,7 @@ static int give_client_fd_to_a_worker(struct server_ctx *ctx, int fd,
 		 * Don't close(c->client.f).
 		 */
 		c->client.fd = -1;
+		c->target.fd = -1;
 		put_client_slot(w, c);
 		return ret;
 	}
@@ -1951,11 +1958,32 @@ enum tkn_type {
 	DN_TKN,
 };
 
+static size_t get_and_fill_rt(_Atomic(uint64_t) *last_p, _Atomic(uint64_t) *tkn_p,
+			      uint64_t tkn_max, uint64_t fill_interval)
+{
+	uint64_t last, tnow, delta, cur_tkn, nfill;
+
+	tnow = get_time_ms();
+	last = atomic_load_explicit(last_p, memory_order_relaxed);
+	cur_tkn = atomic_load_explicit(tkn_p, memory_order_relaxed);
+
+	delta = tnow - last;
+	nfill = (delta * tkn_max) / fill_interval;
+	if (nfill) {
+		cur_tkn += nfill;
+		if (cur_tkn > tkn_max)
+			cur_tkn = tkn_max;
+
+		atomic_store_explicit(tkn_p, cur_tkn, memory_order_relaxed);
+		atomic_store_explicit(last_p, tnow, memory_order_relaxed);
+	}
+
+	return cur_tkn;
+}
+
 static size_t __get_max_send_size(struct client_state *c, enum tkn_type type)
 {
 	struct ip_spd_bucket *b;
-	uint64_t last, now;
-	uint64_t cur_tkn;
 	size_t max;
 
 	if (!c->spd)
@@ -1966,34 +1994,14 @@ static size_t __get_max_send_size(struct client_state *c, enum tkn_type type)
 		if (!b->up_tkn_max)
 			return MAX_RECV_BUF_RESIZE;
 
-		now = get_time_ms();
-		last = atomic_load_explicit(&b->last_up_fill, memory_order_relaxed);
-		cur_tkn = atomic_load_explicit(&b->up_tkn, memory_order_relaxed);
-		if (now > last) {
-			cur_tkn += (now - last) * b->up_tkn_max / b->up_fill_interval;
-			if (cur_tkn > b->up_tkn_max)
-				cur_tkn = b->up_tkn_max;
-		}
-
-		atomic_store_explicit(&b->last_up_fill, now, memory_order_relaxed);
-		atomic_store_explicit(&b->up_tkn, cur_tkn, memory_order_relaxed);
-		max = cur_tkn;
+		max = get_and_fill_rt(&b->last_up_fill, &b->up_tkn,
+				      b->up_tkn_max, b->up_fill_interval);
 	} else if (type == DN_TKN) {
 		if (!b->dn_tkn_max)
 			return MAX_RECV_BUF_RESIZE;
 
-		now = get_time_ms();
-		last = atomic_load_explicit(&b->last_dn_fill, memory_order_relaxed);
-		cur_tkn = atomic_load_explicit(&b->dn_tkn, memory_order_relaxed);
-		if (now > last) {
-			cur_tkn += (now - last) * b->dn_tkn_max / b->dn_fill_interval;
-			if (cur_tkn > b->dn_tkn_max)
-				cur_tkn = b->dn_tkn_max;
-		}
-
-		atomic_store_explicit(&b->last_dn_fill, now, memory_order_relaxed);
-		atomic_store_explicit(&b->dn_tkn, cur_tkn, memory_order_relaxed);
-		max = cur_tkn;
+		max = get_and_fill_rt(&b->last_dn_fill, &b->dn_tkn,
+				      b->dn_tkn_max, b->dn_fill_interval);
 	} else {
 		pr_error("get_max_send_size: Invalid token type: %u", type);
 		assert(0);
@@ -2140,7 +2148,7 @@ static int handle_event_client_data(struct server_wrk *w, struct epoll_event *ev
 	int ret;
 
 	if (unlikely(events & (EPOLLERR | EPOLLHUP))) {
-		pr_errorv("Client socket hit (EPOLLERR|EPOLLHUP) (thread %u)", w->idx);
+		pr_errorv("rhup: Client socket hit (EPOLLERR|EPOLLHUP): %s -> %s (thread %u)", sockaddr_to_str(&c->client_addr), sockaddr_to_str(&c->target_addr), w->idx);
 		return -ECONNRESET;
 	}
 
