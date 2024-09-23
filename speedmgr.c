@@ -231,12 +231,12 @@ struct server_ctx {
 };
 
 enum {
-	EPL_EV_EVENTFD		= (0x0000ull << 48ull),
-	EPL_EV_TCP_ACCEPT	= (0x0001ull << 48ull),
-	EPL_EV_TCP_CLIENT_DATA	= (0x0002ull << 48ull),
-	EPL_EV_TCP_TARGET_DATA	= (0x0003ull << 48ull),
-	EPL_EV_TCP_TARGET_CONN	= (0x0004ull << 48ull),
-	EPL_EV_TIMERFD		= (0x0005ull << 48ull)
+	EPL_EV_EVENTFD		= (0x0001ull << 48ull),
+	EPL_EV_TCP_ACCEPT	= (0x0002ull << 48ull),
+	EPL_EV_TCP_CLIENT_DATA	= (0x0003ull << 48ull),
+	EPL_EV_TCP_TARGET_DATA	= (0x0004ull << 48ull),
+	EPL_EV_TCP_TARGET_CONN	= (0x0005ull << 48ull),
+	EPL_EV_TIMERFD		= (0x0006ull << 48ull)
 };
 
 #define EPL_EV_MASK		(0xffffull << 48ull)
@@ -1576,6 +1576,14 @@ static int get_target_addr(struct server_wrk *w, struct client_state *c,
 	return ret;
 }
 
+static inline void set_epoll_data(union epoll_data *data, struct client_state *c,
+				  uint64_t ev_mask)
+{
+	data->u64 = 0;
+	data->ptr = c;
+	data->u64 |= ev_mask;
+}
+
 static int prepare_target_connect(struct server_wrk *w, struct client_state *c)
 {
 	struct sockaddr_in46 taddr;
@@ -1632,10 +1640,8 @@ static int prepare_target_connect(struct server_wrk *w, struct client_state *c)
 #endif
 
 	pthread_mutex_lock(&w->epass_mutex);
-	data.u64 = 0;
-	data.ptr = c;
-	data.u64 |= EPL_EV_TCP_TARGET_CONN;
 	c->target_ep.ep_mask = EPOLLOUT;
+	set_epoll_data(&data, c, EPL_EV_TCP_TARGET_CONN);
 	ret = epoll_add(w->ep_fd, c->target_ep.fd, c->target_ep.ep_mask, data);
 	if (ret) {
 		pthread_mutex_unlock(&w->epass_mutex);
@@ -1644,10 +1650,8 @@ static int prepare_target_connect(struct server_wrk *w, struct client_state *c)
 		return ret;
 	}
 
-	data.u64 = 0;
-	data.ptr = c;
-	data.u64 |= EPL_EV_TCP_CLIENT_DATA;
-	c->client_ep.ep_mask = 0;
+	c->client_ep.ep_mask = EPOLLIN;
+	set_epoll_data(&data, c, EPL_EV_TCP_CLIENT_DATA);
 	ret = epoll_add(w->ep_fd, c->client_ep.fd, c->client_ep.ep_mask, data);
 	if (ret) {
 		pthread_mutex_unlock(&w->epass_mutex);
@@ -1750,7 +1754,7 @@ static ssize_t do_ep_recv(struct client_endp *ep)
 		if (ep->cap == 0)
 			new_cap = NR_INIT_RECV_BUF_BYTES;
 		else
-			new_cap = ep->cap + (ep->cap / 2) + 1;
+			new_cap = (ep->cap * 2u) + 1u;
 
 		new_cap = MIN(new_cap, NR_MAX_RECV_BUF_BYTES);
 		if (new_cap <= NR_MAX_RECV_BUF_BYTES) {
@@ -1830,13 +1834,10 @@ static int apply_ep_mask(struct server_wrk *w, struct client_state *c,
 {
 	union epoll_data data;
 
-	data.u64 = 0;
-	data.ptr = c;
-
 	if (&c->target_ep == ep)
-		data.u64 |= (c->target_connected) ? EPL_EV_TCP_TARGET_DATA : EPL_EV_TCP_TARGET_CONN;
+		set_epoll_data(&data, c, (c->target_connected) ? EPL_EV_TCP_TARGET_DATA : EPL_EV_TCP_TARGET_CONN);
 	else
-		data.u64 |= EPL_EV_TCP_CLIENT_DATA;
+		set_epoll_data(&data, c, EPL_EV_TCP_CLIENT_DATA);
 
 	return epoll_mod(w->ep_fd, ep->fd, ep->ep_mask, data);
 }
@@ -1844,8 +1845,8 @@ static int apply_ep_mask(struct server_wrk *w, struct client_state *c,
 static int do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 			    struct client_endp *src, struct client_endp *dst)
 {
-	struct sockaddr_in46 *psrc = (src == &c->client_ep) ? &c->client_ep.addr : &c->target_ep.addr;
-	struct sockaddr_in46 *pdst = (dst == &c->client_ep) ? &c->client_ep.addr : &c->target_ep.addr;
+	__unused struct sockaddr_in46 *psrc = (src == &c->client_ep) ? &c->client_ep.addr : &c->target_ep.addr;
+	__unused struct sockaddr_in46 *pdst = (dst == &c->client_ep) ? &c->client_ep.addr : &c->target_ep.addr;
 	__unused const char *src_name = (src == &c->client_ep) ? "Client" : "Target";
 	__unused const char *dst_name = (dst == &c->client_ep) ? "Client" : "Target";
 	ssize_t ret;
@@ -1857,7 +1858,13 @@ static int do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 		if (ret != -ENOBUFS)
 			return ret;
 
-		pr_vl_dbg(3, "%s recv buffer is full, disabling EPOLLIN (thread %u)", src_name, w->idx);
+		pr_vl_dbg(3, "Disabling EPOLLIN on src=%s (fd=%d; psrc=%s; pdst=%s; thread=%u)",
+			  src_name,
+			  src->fd,
+			  sockaddr_to_str(psrc),
+			  sockaddr_to_str(pdst),
+			  w->idx);
+
 		src->ep_mask &= ~EPOLLIN;
 		ret = apply_ep_mask(w, c, src);
 		if (ret)
@@ -1875,23 +1882,37 @@ static int do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 	ret = do_ep_send(src, dst, NR_MAX_RECV_BUF_BYTES);
 	if (ret < 0) {
 		if (ret != -EAGAIN) {
-			pr_vl_dbg(3, "pi: send() to %s (psrc: %s; pdst: %s): %s", dst_name, sockaddr_to_str(psrc), sockaddr_to_str(pdst), strerror(-ret));
+
+			pr_vl_dbg(3, "po: send() to %s (fd=%d; psrc=%s; pdst=%s; thread=%u): %s",
+				  dst_name,
+				  dst->fd,
+				  sockaddr_to_str(psrc),
+				  sockaddr_to_str(pdst),
+				  w->idx,
+				  strerror(-ret));
+
 			return ret;
 		}
 
-		pr_vl_dbg(3, "%s send buffer is full, enabling EPOLLOUT (thread %u)", dst_name, w->idx);
+		pr_vl_dbg(3, "Enabling  EPOLLOUT on dst=%s (fd=%d; psrc=%s; pdst=%s; thread=%u)",
+			  dst_name,
+			  dst->fd,
+			  sockaddr_to_str(psrc),
+			  sockaddr_to_str(pdst),
+			  w->idx);
+
 		dst->ep_mask |= EPOLLOUT;
 		ret = apply_ep_mask(w, c, dst);
 	}
 
-	return ret;
+	return 0;
 }
 
 static int do_pipe_epoll_out(struct server_wrk *w, struct client_state *c,
 			     struct client_endp *src, struct client_endp *dst)
 {
-	struct sockaddr_in46 *psrc = (src == &c->client_ep) ? &c->client_ep.addr : &c->target_ep.addr;
-	struct sockaddr_in46 *pdst = (dst == &c->client_ep) ? &c->client_ep.addr : &c->target_ep.addr;
+	__unused struct sockaddr_in46 *psrc = (src == &c->client_ep) ? &c->client_ep.addr : &c->target_ep.addr;
+	__unused struct sockaddr_in46 *pdst = (dst == &c->client_ep) ? &c->client_ep.addr : &c->target_ep.addr;
 	__unused const char *src_name = (src == &c->client_ep) ? "Client" : "Target";
 	__unused const char *dst_name = (dst == &c->client_ep) ? "Client" : "Target";
 
@@ -1900,12 +1921,24 @@ static int do_pipe_epoll_out(struct server_wrk *w, struct client_state *c,
 
 	ret = do_ep_send(src, dst, NR_MAX_RECV_BUF_BYTES);
 	if (ret < 0 && ret != -EAGAIN) {
-		pr_vl_dbg(3, "po: send() to %s (psrc: %s; pdst: %s): %s", dst_name, sockaddr_to_str(psrc), sockaddr_to_str(pdst), strerror(-ret));
+		pr_vl_dbg(3, "po: send() to %s (fd=%d; psrc=%s; pdst=%s; thread=%u): %s",
+			  dst_name,
+			  dst->fd,
+			  sockaddr_to_str(psrc),
+			  sockaddr_to_str(pdst),
+			  w->idx,
+			  strerror(-ret));
 		return ret;
 	}
 
 	if (src->len == 0) {
-		pr_vl_dbg(3, "%s send buffer has been emptied, disabling EPOLLOUT (thread %u)", src_name, w->idx);
+		pr_vl_dbg(3, "Disabling EPOLLOUT on dst=%s (fd=%d; psrc=%s; pdst=%s; thread=%u)",
+			  dst_name,
+			  dst->fd,
+			  sockaddr_to_str(psrc),
+			  sockaddr_to_str(pdst),
+			  w->idx);
+
 		dst->ep_mask &= ~EPOLLOUT;
 		ret = apply_ep_mask(w, c, dst);
 		if (ret)
@@ -1914,12 +1947,17 @@ static int do_pipe_epoll_out(struct server_wrk *w, struct client_state *c,
 
 	remain_bsize = src->cap - src->len;
 	if (remain_bsize > 0 && !(src->ep_mask & EPOLLIN)) {
-		pr_vl_dbg(3, "%s send buffer has room, enabling EPOLLIN (thread %u)", src_name, w->idx);
+		pr_vl_dbg(3, "Enabling  EPOLLIN on src=%s (fd=%d; psrc=%s; pdst=%s; thread=%u)",
+			  src_name,
+			  src->fd,
+			  sockaddr_to_str(psrc),
+			  sockaddr_to_str(pdst),
+			  w->idx);
 		src->ep_mask |= EPOLLIN;
 		ret = apply_ep_mask(w, c, src);
 	}
 
-	return ret;
+	return 0;
 }
 
 static int handle_event_client_data(struct server_wrk *w, struct epoll_event *ev)
