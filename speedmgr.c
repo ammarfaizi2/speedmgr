@@ -702,6 +702,9 @@ static int init_spd_map(struct server_ctx *ctx)
 	struct ip_spd_map *map = &ctx->spd_map;
 	int ret;
 
+	if (!ctx->need_timer)
+		return 0;
+
 	ret = ht_create(&map->ht);
 	if (ret)
 		return ret;
@@ -728,6 +731,9 @@ static void free_spd_map(struct server_ctx *ctx)
 {
 	struct ip_spd_map *map = &ctx->spd_map;
 	size_t i;
+
+	if (!ctx->need_timer)
+		return;
 
 	if (!map->bucket_arr)
 		return;
@@ -1422,37 +1428,38 @@ static int get_client_slot(struct server_wrk *w, struct client_state **c)
 	return 0;
 }
 
-static void put_client_slot(struct server_wrk *w, struct client_state *c)
+static void __put_client_slot(struct server_wrk *w, struct client_state *c, bool epl_del)
 {
 	bool hess = false;
 	int ret;
 
-	pthread_mutex_lock(&w->epass_mutex);
-	if (c->client_ep.fd >= 0) {
-		pr_infov("pcls: %s -> %s (fd=%d; thread=%u)", sockaddr_to_str(&c->client_ep.addr), sockaddr_to_str(&c->target_ep.addr), c->client_ep.fd, w->idx);
-		ret = epoll_del(w->ep_fd, c->client_ep.fd);
-		if (ret) {
-			pr_error("client_ep epoll_del error: %s -> %s (ep_fd=%d; fd=%d)",
-				 sockaddr_to_str(&c->client_ep.addr),
-				 sockaddr_to_str(&c->target_ep.addr),
-				 w->ep_fd,
-				 c->client_ep.fd);
+	if (epl_del) {
+		pthread_mutex_lock(&w->epass_mutex);
+		if (c->client_ep.fd >= 0) {
+			ret = epoll_del(w->ep_fd, c->client_ep.fd);
+			if (ret) {
+				pr_error("client_ep epoll_del error: %s -> %s (ep_fd=%d; fd=%d)",
+					sockaddr_to_str(&c->client_ep.addr),
+					sockaddr_to_str(&c->target_ep.addr),
+					w->ep_fd,
+					c->client_ep.fd);
+			}
+			hess = true;
 		}
-		hess = true;
-	}
 
-	if (c->target_ep.fd >= 0) {
-		ret = epoll_del(w->ep_fd, c->target_ep.fd);
-		if (ret) {
-			pr_error("target_ep epoll_del error: %s -> %s (ep_fd=%d; fd=%d)",
-				sockaddr_to_str(&c->client_ep.addr),
-				sockaddr_to_str(&c->target_ep.addr),
-				w->ep_fd,
-				c->target_ep.fd);
+		if (c->target_ep.fd >= 0) {
+			ret = epoll_del(w->ep_fd, c->target_ep.fd);
+			if (ret) {
+				pr_error("target_ep epoll_del error: %s -> %s (ep_fd=%d; fd=%d)",
+					sockaddr_to_str(&c->client_ep.addr),
+					sockaddr_to_str(&c->target_ep.addr),
+					w->ep_fd,
+					c->target_ep.fd);
+			}
+			hess = true;
 		}
-		hess = true;
+		pthread_mutex_unlock(&w->epass_mutex);
 	}
-	pthread_mutex_unlock(&w->epass_mutex);
 
 	if (hess) {
 		pthread_mutex_lock(&w->ctx->accept_mutex);
@@ -1475,11 +1482,30 @@ static void put_client_slot(struct server_wrk *w, struct client_state *c)
 		c->spd = NULL;
 	}
 
+	if (c->client_ep.fd >= 0) {
+		pr_infov("pcls: %s -> %s (fd=%d; tfd=%d; thread=%u)",
+			sockaddr_to_str(&c->client_ep.addr),
+			sockaddr_to_str(&c->target_ep.addr),
+			c->client_ep.fd,
+			c->target_ep.fd,
+			w->idx);
+	}
+
 	reset_client_state(c);
 	push_stacku32(w->cl_stack, c->idx);
 	atomic_fetch_sub(&w->nr_online_clients, 1u);
 	w->handle_events_should_stop = hess;
 	(void)ret;
+}
+
+static void put_client_slot(struct server_wrk *w, struct client_state *c)
+{
+	__put_client_slot(w, c, true);
+}
+
+static void put_client_slot_no_epoll(struct server_wrk *w, struct client_state *c)
+{
+	__put_client_slot(w, c, false);
 }
 
 static struct server_wrk *pick_worker_for_new_conn(struct server_ctx *ctx)
@@ -1662,7 +1688,7 @@ static int give_client_fd_to_a_worker(struct server_ctx *ctx, int fd,
 	c->client_ep.addr = *addr;
 	r = prepare_target_connect(w, c);
 	if (r) {
-		put_client_slot(w, c);
+		put_client_slot_no_epoll(w, c);
 		return r;
 	}
 
@@ -1978,16 +2004,6 @@ static int handle_event_target_conn(struct server_wrk *w, struct epoll_event *ev
 			return ret;
 	}
 
-	ret = do_pipe_epoll_in(w, c, &c->client_ep, &c->target_ep);
-	if (ret < 0)
-		return ret;
-
-	if (c->client_ep.len > 0) {
-		ret = do_pipe_epoll_out(w, c, &c->client_ep, &c->target_ep);
-		if (ret < 0)
-			return ret;
-	}
-
 	pr_infov("conn: %s -> %s", sockaddr_to_str(&c->client_ep.addr), sockaddr_to_str(&c->target_ep.addr));
 	return 0;
 }
@@ -2080,7 +2096,7 @@ static void close_all_clients(struct server_wrk *w)
 
 	for (i = 0; i < w->client_arr_size; i++) {
 		if (w->clients[i].is_used)
-			put_client_slot(w, &w->clients[i]);
+			put_client_slot_no_epoll(w, &w->clients[i]);
 	}
 }
 
