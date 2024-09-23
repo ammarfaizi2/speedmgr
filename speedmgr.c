@@ -44,6 +44,9 @@
 
 #define NR_INIT_SPD_BUCKET_ARR	32
 
+#define NR_INIT_RECV_BUF_BYTES	8192
+#define NR_MAX_RECV_BUF_BYTES	(1024 * 1024 * 128)
+
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -89,13 +92,13 @@ static uint8_t g_verbose;
 #endif
 
 #if 1
-#define pr_debug(fmt, ...)	printf("[%06d] dbug: " fmt "\n", gettid(), ##__VA_ARGS__)
+#define pr_debug(fmt, ...)	printf("[%08d] dbug: " fmt "\n", gettid(), ##__VA_ARGS__)
 #else
 #define pr_debug(fmt, ...) do { } while (0)
 #endif
 
-#define pr_error(fmt, ...)	printf("[%06d] perr: " fmt "\n", gettid(), ##__VA_ARGS__)
-#define pr_info(fmt, ...)	printf("[%06d] info: " fmt "\n", gettid(), ##__VA_ARGS__)
+#define pr_error(fmt, ...)	printf("[%08d] perr: " fmt "\n", gettid(), ##__VA_ARGS__)
+#define pr_info(fmt, ...)	printf("[%08d] info: " fmt "\n", gettid(), ##__VA_ARGS__)
 
 #define pr_vl_dbg(level, fmt, ...)		\
 do {						\
@@ -879,8 +882,10 @@ static void free_clients(struct server_wrk *w)
 	if (!w->clients)
 		return;
 
-	for (i = 0; i < w->client_arr_size; i++)
-		reset_client_state(&w->clients[i]);
+	for (i = 0; i < w->client_arr_size; i++) {
+		if (w->clients[i].is_used)
+			reset_client_state(&w->clients[i]);
+	}
 
 	free(w->clients);
 	w->clients = NULL;
@@ -1253,7 +1258,8 @@ static void free_ctx(struct server_ctx *ctx)
 	free_socket(ctx);
 }
 
-static inline void get_ip_ptr(struct sockaddr_in46 *addr, void **ptr, size_t *len)
+static inline void get_ip_ptr(const struct sockaddr_in46 *addr, const void **ptr,
+			      size_t *len)
 {
 	if (addr->sa.sa_family == AF_INET) {
 		*ptr = &addr->in4.sin_addr;
@@ -1267,12 +1273,12 @@ static inline void get_ip_ptr(struct sockaddr_in46 *addr, void **ptr, size_t *le
 /*
  * MUST HOLD: map->lock when calling this function.
  */
-static int get_bucket_index(struct ip_spd_map *map, struct sockaddr_in46 *key,
-			    uint32_t *idx)
+static int get_bucket_index(struct ip_spd_map *map,
+			    const struct sockaddr_in46 *key, uint32_t *idx)
 {
 	struct ht_data *data;
+	const void *tkey;
 	size_t tkey_len;
-	void *tkey;
 	int ret;
 
 	get_ip_ptr(key, &tkey, &tkey_len);
@@ -1287,12 +1293,13 @@ static int get_bucket_index(struct ip_spd_map *map, struct sockaddr_in46 *key,
 /*
  * MUST HOLD: map->lock when calling this function.
  */
-static int set_bucket_index(struct ip_spd_map *map, struct sockaddr_in46 *key,
+static int set_bucket_index(struct ip_spd_map *map,
+			    const struct sockaddr_in46 *key,
 			    uint32_t idx)
 {
 	struct ht_data data;
+	const void *tkey;
 	size_t tkey_len;
-	void *tkey;
 	int ret;
 
 	get_ip_ptr(key, &tkey, &tkey_len);
@@ -1310,7 +1317,7 @@ static void init_ip_spd_bucket(struct ip_spd_bucket *b)
 }
 
 static struct ip_spd_bucket *get_ip_spd_bucket(struct ip_spd_map *map,
-					       struct sockaddr_in46 *addr)
+					       const struct sockaddr_in46 *addr)
 {
 	struct ip_spd_bucket *b;
 	uint32_t idx;
@@ -1374,8 +1381,8 @@ static void put_ip_spd_bucket(struct ip_spd_map *map, struct sockaddr_in46 *addr
 
 	b = map->bucket_arr[idx];
 	if (atomic_fetch_sub(&b->nr_conns, 1u) == 1) {
+		const void *key;
 		size_t key_len;
-		void *key;
 
 		get_ip_ptr(addr, &key, &key_len);
 		ht_remove(&map->ht, key, key_len);
@@ -1475,27 +1482,537 @@ static void put_client_slot(struct server_wrk *w, struct client_state *c)
 	(void)ret;
 }
 
+static struct server_wrk *pick_worker_for_new_conn(struct server_ctx *ctx)
+{
+	struct server_wrk *w = NULL;
+	uint32_t i, min;
+
+	w = &ctx->workers[0];
+	min = atomic_load(&ctx->workers[0].nr_online_clients);
+	for (i = 1; i < ctx->cfg.nr_workers; i++) {
+		uint32_t nr;
+
+		nr = atomic_load(&ctx->workers[i].nr_online_clients);
+		if (nr < 5)
+			return &ctx->workers[i];
+
+		if (nr < min) {
+			min = nr;
+			w = &ctx->workers[i];
+		}
+	}
+
+	return w;
+}
+
+static int get_target_addr(struct server_wrk *w, struct client_state *c,
+			   struct sockaddr_in46 *addr)
+{
+	struct sockaddr_in46 *cfg_addr = &w->ctx->cfg.target_addr;
+	socklen_t len;
+	sa_family_t f;
+	int ret;
+
+	/*
+	 * If the destination is 0.0.0.0 or [::], get the original
+	 * destination address from the client using getsockopt().
+	 */
+	if (cfg_addr->sa.sa_family == AF_INET) {
+		if (cfg_addr->in4.sin_addr.s_addr != INADDR_ANY) {
+			*addr = *cfg_addr;
+			return 0;
+		}
+	} else if (cfg_addr->sa.sa_family == AF_INET6) {
+		if (!IN6_IS_ADDR_UNSPECIFIED(&cfg_addr->in6.sin6_addr)) {
+			*addr = *cfg_addr;
+			return 0;
+		}
+	}
+
+	f = w->ctx->cfg.bind_addr.sa.sa_family;
+	if (f == AF_INET6 && !IN6_IS_ADDR_V4MAPPED(&c->client_ep.addr.in6.sin6_addr)) {
+		len = sizeof(addr->in6);
+		ret = getsockopt(c->client_ep.fd, SOL_IPV6, IP6T_SO_ORIGINAL_DST, &addr->in6, &len);
+		if (ret) {
+			ret = -errno;
+			pr_error("getsockopt(SOL_IPV6, IP6T_SO_ORIGINAL_DST): %s", strerror(-ret));
+		}
+
+		return ret;
+	}
+
+	len = sizeof(addr->in4);
+	ret = getsockopt(c->client_ep.fd, SOL_IP, SO_ORIGINAL_DST, &addr->in4, &len);
+	if (ret) {
+		ret = -errno;
+		pr_error("getsockopt(SOL_IP, SO_ORIGINAL_DST): %s", strerror(-ret));
+	}
+	return ret;
+}
+
+static int prepare_target_connect(struct server_wrk *w, struct client_state *c)
+{
+	struct sockaddr_in46 taddr;
+	union epoll_data data;
+	socklen_t len;
+	int fd, ret;
+
+	memset(&taddr, 0, sizeof(taddr));
+	ret = get_target_addr(w, c, &taddr);
+	if (ret)
+		return ret;
+
+	if (taddr.sa.sa_family == AF_INET6)
+		len = sizeof(taddr.in6);
+	else
+		len = sizeof(taddr.in4);
+
+	fd = socket(taddr.sa.sa_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+	if (fd < 0) {
+		ret = errno;
+		pr_error("Failed to create target socket: %s", strerror(ret));
+		return -ret;
+	}
+
+	if (w->ctx->cfg.out_mark) {
+		uint32_t mark = w->ctx->cfg.out_mark;
+
+		ret = setsockopt(fd, SOL_SOCKET, SO_MARK, &mark, sizeof(mark));
+		if (ret) {
+			ret = errno;
+			pr_error("Failed to set SO_MARK on target socket: %s", strerror(ret));
+			close(fd);
+			return -ret;
+		}
+	}
+
+	c->target_ep.fd = fd;
+	c->target_ep.addr = taddr;
+
+	pr_infov("ncon: %s -> %s", sockaddr_to_str(&c->client_ep.addr), sockaddr_to_str(&c->target_ep.addr));
+	ret = connect(fd, &taddr.sa, len);
+	if (ret) {
+		ret = errno;
+		if (ret != EINPROGRESS) {
+			pr_error("Failed to connect to target: %s", strerror(ret));
+			close(fd);
+			return -ret;
+		}
+	}
+
+#ifdef TCP_NODELAY
+	ret = 1;
+	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &ret, sizeof(ret));
+#endif
+
+	pthread_mutex_lock(&w->epass_mutex);
+	data.u64 = 0;
+	data.ptr = c;
+	data.u64 |= EPL_EV_TCP_TARGET_CONN;
+	c->target_ep.ep_mask = EPOLLOUT;
+	ret = epoll_add(w->ep_fd, c->target_ep.fd, c->target_ep.ep_mask, data);
+	if (ret) {
+		pthread_mutex_unlock(&w->epass_mutex);
+		close(c->target_ep.fd);
+		c->target_ep.fd = -1;
+		return ret;
+	}
+
+	data.u64 = 0;
+	data.ptr = c;
+	data.u64 |= EPL_EV_TCP_CLIENT_DATA;
+	c->client_ep.ep_mask = 0;
+	ret = epoll_add(w->ep_fd, c->client_ep.fd, c->client_ep.ep_mask, data);
+	if (ret) {
+		pthread_mutex_unlock(&w->epass_mutex);
+		close(c->target_ep.fd);
+		c->target_ep.fd = -1;
+		return ret;
+	}
+	send_event_fd(w);
+	pthread_mutex_unlock(&w->epass_mutex);
+	atomic_fetch_add(&w->nr_online_clients, 1u);
+	return 0;
+}
+
+/*
+ * @fd: The ownership is taken by give_client_fd_to_a_worker().
+ */
+static int give_client_fd_to_a_worker(struct server_ctx *ctx, int fd,
+				      const struct sockaddr_in46 *addr)
+{
+	struct ip_spd_bucket *b;
+	struct client_state *c;
+	struct server_wrk *w;
+	int r;
+
+	w = pick_worker_for_new_conn(ctx);
+	r = get_client_slot(w, &c);
+	if (r) {
+		close(fd);
+		pr_error("get_client_slot(): %s", strerror(-r));
+		return -ENOMEM;
+	}
+
+	b = get_ip_spd_bucket(&ctx->spd_map, addr);
+	if (b)
+		c->spd = b;
+
+	c->client_ep.fd = fd;
+	c->client_ep.addr = *addr;
+	r = prepare_target_connect(w, c);
+	if (r) {
+		put_client_slot(w, c);
+		return r;
+	}
+
+	return 0;
+}
+
+static int handle_accept_error(int err, struct server_wrk *w)
+{
+	if (err == EAGAIN || err == EINTR)
+		return 0;
+
+	if (err == EMFILE || err == ENFILE) {
+		pr_error("accept(): (%d) Too many open files, stop accepting...", err);
+		pr_info("accept() will be re-enabled when a client disconnects (thread %u)", w->idx);
+		w->ctx->accept_stopped = true;
+		return epoll_del(w->ep_fd, w->ctx->tcp_fd);
+	}
+
+	pr_error("accept() failed: %s", strerror(err));
+	return -err;
+}
+
+static int handle_event_accept(struct server_wrk *w)
+{
+	struct server_ctx *ctx = w->ctx;
+	struct sockaddr_in46 addr;
+	socklen_t len;
+	int ret;
+
+	memset(&addr, 0, sizeof(addr));
+	if (ctx->cfg.bind_addr.sa.sa_family == AF_INET6)
+		len = sizeof(addr.in6);
+	else
+		len = sizeof(addr.in4);
+
+	ret = accept4(ctx->tcp_fd, &addr.sa, &len, SOCK_NONBLOCK | SOCK_CLOEXEC);
+	if (unlikely(ret < 0))
+		return handle_accept_error(errno, w);
+
+	if (unlikely(len > sizeof(addr))) {
+		pr_error("accept() returned invalid address length: %u", len);
+		close(ret);
+		return -EINVAL;
+	}
+
+	return give_client_fd_to_a_worker(w->ctx, ret, &addr);
+}
+
+static ssize_t do_ep_recv(struct client_endp *ep)
+{
+	ssize_t ret;
+	size_t len;
+	char *buf;
+
+	if (ep->len == ep->cap) {
+		size_t new_cap;
+		char *tmp;
+
+		if (ep->cap == 0)
+			new_cap = NR_INIT_RECV_BUF_BYTES;
+		else
+			new_cap = ep->cap + (ep->cap / 2) + 1;
+
+		new_cap = MIN(new_cap, NR_MAX_RECV_BUF_BYTES);
+		if (new_cap <= NR_MAX_RECV_BUF_BYTES) {
+			tmp = realloc(ep->buf, new_cap);
+			if (!tmp) {
+				if (ep->cap > 0)
+					return -ENOBUFS;
+				pr_error("Failed to realloc receive buffer: %s", strerror(ENOMEM));
+				return -ENOMEM;
+			}
+
+			ep->buf = tmp;
+			ep->cap = new_cap;
+		}
+	}
+
+	assert(ep->len <= ep->cap);
+	assert(ep->buf);
+
+	len = ep->cap - ep->len;
+	buf = ep->buf + ep->len;
+	if (len == 0)
+		return -ENOBUFS;
+
+	ret = recv(ep->fd, buf, len, MSG_DONTWAIT);
+	if (ret < 0) {
+		ret = -errno;
+		if (ret == -EAGAIN || ret == -EINTR)
+			return -EAGAIN;
+
+		return ret;
+	}
+
+	if (ret == 0)
+		return -ECONNRESET;
+
+	ep->len += (size_t)ret;
+	return 0;
+}
+
+static ssize_t do_ep_send(struct client_endp *src, struct client_endp *dst,
+			  size_t max_send)
+{
+	size_t len = MIN(src->len, max_send);
+	char *buf = src->buf;
+	ssize_t ret;
+	size_t uret;
+
+	if (!len)
+		return 0;
+
+	ret = send(dst->fd, buf, len, MSG_DONTWAIT);
+	if (ret < 0) {
+		ret = -errno;
+		if (ret == -EAGAIN || ret == -EINTR)
+			return -EAGAIN;
+
+		return ret;
+	}
+
+	if (ret == 0)
+		return -ECONNRESET;
+
+	uret = (size_t)ret;
+	if (uret < len) {
+		src->len -= uret;
+		memmove(buf, buf + uret, src->len);
+		return -EAGAIN;
+	}
+
+	src->len = 0;
+	return ret;
+}
+
+static int apply_ep_mask(struct server_wrk *w, struct client_state *c,
+			 struct client_endp *ep)
+{
+	union epoll_data data;
+
+	data.u64 = 0;
+	data.ptr = c;
+
+	if (&c->target_ep == ep)
+		data.u64 |= (c->target_connected) ? EPL_EV_TCP_TARGET_DATA : EPL_EV_TCP_TARGET_CONN;
+	else
+		data.u64 |= EPL_EV_TCP_CLIENT_DATA;
+
+	return epoll_mod(w->ep_fd, ep->fd, ep->ep_mask, data);
+}
+
+static int do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
+			    struct client_endp *src, struct client_endp *dst)
+{
+	struct sockaddr_in46 *psrc = (src == &c->client_ep) ? &c->client_ep.addr : &c->target_ep.addr;
+	struct sockaddr_in46 *pdst = (dst == &c->client_ep) ? &c->client_ep.addr : &c->target_ep.addr;
+	__unused const char *src_name = (src == &c->client_ep) ? "Client" : "Target";
+	__unused const char *dst_name = (dst == &c->client_ep) ? "Client" : "Target";
+	ssize_t ret;
+
+	ret = do_ep_recv(src);
+	if (ret < 0) {
+		if (ret == -EAGAIN)
+			return 0;
+		if (ret != -ENOBUFS)
+			return ret;
+
+		pr_vl_dbg(3, "%s recv buffer is full, disabling EPOLLIN (thread %u)", src_name, w->idx);
+		src->ep_mask &= ~EPOLLIN;
+		ret = apply_ep_mask(w, c, src);
+		if (ret)
+			return ret;
+	}
+
+	if (dst->ep_mask & EPOLLOUT)
+		return 0;
+
+	if (dst == &c->target_ep && !c->target_connected) {
+		dst->ep_mask |= EPOLLOUT;
+		return apply_ep_mask(w, c, dst);
+	}
+
+	ret = do_ep_send(src, dst, NR_MAX_RECV_BUF_BYTES);
+	if (ret < 0) {
+		if (ret != -EAGAIN) {
+			pr_vl_dbg(3, "pi: send() to %s (psrc: %s; pdst: %s): %s", dst_name, sockaddr_to_str(psrc), sockaddr_to_str(pdst), strerror(-ret));
+			return ret;
+		}
+
+		pr_vl_dbg(3, "%s send buffer is full, enabling EPOLLOUT (thread %u)", dst_name, w->idx);
+		dst->ep_mask |= EPOLLOUT;
+		ret = apply_ep_mask(w, c, dst);
+	}
+
+	return ret;
+}
+
+static int do_pipe_epoll_out(struct server_wrk *w, struct client_state *c,
+			     struct client_endp *src, struct client_endp *dst)
+{
+	struct sockaddr_in46 *psrc = (src == &c->client_ep) ? &c->client_ep.addr : &c->target_ep.addr;
+	struct sockaddr_in46 *pdst = (dst == &c->client_ep) ? &c->client_ep.addr : &c->target_ep.addr;
+	__unused const char *src_name = (src == &c->client_ep) ? "Client" : "Target";
+	__unused const char *dst_name = (dst == &c->client_ep) ? "Client" : "Target";
+
+	size_t remain_bsize;
+	ssize_t ret;
+
+	ret = do_ep_send(src, dst, NR_MAX_RECV_BUF_BYTES);
+	if (ret < 0 && ret != -EAGAIN) {
+		pr_vl_dbg(3, "po: send() to %s (psrc: %s; pdst: %s): %s", dst_name, sockaddr_to_str(psrc), sockaddr_to_str(pdst), strerror(-ret));
+		return ret;
+	}
+
+	if (src->len == 0) {
+		pr_vl_dbg(3, "%s send buffer has been emptied, disabling EPOLLOUT (thread %u)", src_name, w->idx);
+		dst->ep_mask &= ~EPOLLOUT;
+		ret = apply_ep_mask(w, c, dst);
+		if (ret)
+			return ret;
+	}
+
+	remain_bsize = src->cap - src->len;
+	if (remain_bsize > 0 && !(src->ep_mask & EPOLLIN)) {
+		pr_vl_dbg(3, "%s send buffer has room, enabling EPOLLIN (thread %u)", src_name, w->idx);
+		src->ep_mask |= EPOLLIN;
+		ret = apply_ep_mask(w, c, src);
+	}
+
+	return ret;
+}
+
+static int handle_event_client_data(struct server_wrk *w, struct epoll_event *ev)
+{
+	struct client_state *c = GET_EPL_DT(ev->data.u64);
+	uint32_t events = ev->events;
+	int ret;
+
+	if (unlikely(events & (EPOLLERR | EPOLLHUP))) {
+		pr_errorv("rhup: Client socket hit EPOLLERR|EPOLLHUP: %s -> %s (thread %u)", sockaddr_to_str(&c->client_ep.addr), sockaddr_to_str(&c->target_ep.addr), w->idx);
+		return -ECONNRESET;
+	}
+
+	if (events & EPOLLIN) {
+		ret = do_pipe_epoll_in(w, c, &c->client_ep, &c->target_ep);
+		if (ret < 0)
+			return ret;
+	}
+
+	if (events & EPOLLOUT) {
+		ret = do_pipe_epoll_out(w, c, &c->target_ep, &c->client_ep);
+		if (ret < 0)
+			return ret;
+	}
+
+	return 0;
+}
+
+static int handle_event_target_data(struct server_wrk *w, struct epoll_event *ev)
+{
+	struct client_state *c = GET_EPL_DT(ev->data.u64);
+	uint32_t events = ev->events;
+	int ret;
+
+	if (unlikely(events & (EPOLLERR | EPOLLHUP))) {
+		pr_errorv("thup: Target socket hit EPOLLERR|EPOLLHUP: %s -> %s (thread %u)", sockaddr_to_str(&c->client_ep.addr), sockaddr_to_str(&c->target_ep.addr), w->idx);
+		return -ECONNRESET;
+	}
+
+	if (events & EPOLLIN) {
+		ret = do_pipe_epoll_in(w, c, &c->target_ep, &c->client_ep);
+		if (ret < 0)
+			return ret;
+	}
+
+	if (events & EPOLLOUT) {
+		ret = do_pipe_epoll_out(w, c, &c->client_ep, &c->target_ep);
+		if (ret < 0)
+			return ret;
+	}
+
+	return 0;
+}
+
+static int handle_event_target_conn(struct server_wrk *w, struct epoll_event *ev)
+{
+	struct client_state *c = GET_EPL_DT(ev->data.u64);
+	uint32_t events = ev->events;
+	socklen_t len;
+	int ret, tmp;
+
+	tmp = 0;
+	len = sizeof(tmp);
+	ret = getsockopt(c->target_ep.fd, SOL_SOCKET, SO_ERROR, &tmp, &len);
+	if (unlikely(tmp || !(events & EPOLLOUT))) {
+		if (tmp < 0)
+			tmp = -tmp;
+		pr_error("Connect error: %s: %s", sockaddr_to_str(&c->target_ep.addr), strerror(tmp));
+		return -ECONNRESET;
+	}
+
+	c->target_connected = true;
+	c->target_ep.ep_mask |= EPOLLIN;
+	ret = apply_ep_mask(w, c, &c->target_ep);
+	if (ret)
+		return ret;
+
+	if (!(c->client_ep.ep_mask & EPOLLIN)) {
+		c->client_ep.ep_mask |= EPOLLIN;
+		ret = apply_ep_mask(w, c, &c->client_ep);
+		if (ret)
+			return ret;
+	}
+
+	ret = do_pipe_epoll_in(w, c, &c->client_ep, &c->target_ep);
+	if (ret < 0)
+		return ret;
+
+	if (c->client_ep.len > 0) {
+		ret = do_pipe_epoll_out(w, c, &c->client_ep, &c->target_ep);
+		if (ret < 0)
+			return ret;
+	}
+
+	pr_infov("conn: %s -> %s", sockaddr_to_str(&c->client_ep.addr), sockaddr_to_str(&c->target_ep.addr));
+	return 0;
+}
+
 static int handle_event(struct server_wrk *w, struct epoll_event *ev)
 {
 	uint64_t evt = GET_EPL_EV(ev->data.u64);
-	int ret;
+	int ret = 0;
 
 	switch (evt) {
 	case EPL_EV_EVENTFD:
 		ret = consume_event_fd(w);
 		break;
-	// case EPL_EV_TCP_ACCEPT:
-	// 	ret = handle_event_accept(w);
-	// 	break;
-	// case EPL_EV_TCP_CLIENT_DATA:
-	// 	ret = handle_event_client_data(w, ev);
-	// 	break;
-	// case EPL_EV_TCP_TARGET_DATA:
-	// 	ret = handle_event_target_data(w, ev);
-	// 	break;
-	// case EPL_EV_TCP_TARGET_CONN:
-	// 	ret = handle_event_target_conn(w, ev);
-	// 	break;
+	case EPL_EV_TCP_ACCEPT:
+		ret = handle_event_accept(w);
+		break;
+	case EPL_EV_TCP_CLIENT_DATA:
+		ret = handle_event_client_data(w, ev);
+		break;
+	case EPL_EV_TCP_TARGET_DATA:
+		ret = handle_event_target_data(w, ev);
+		break;
+	case EPL_EV_TCP_TARGET_CONN:
+		ret = handle_event_target_conn(w, ev);
+		break;
 	// case EPL_EV_TIMERFD:
 	// 	ret = handle_event_timer(w);
 	// 	break;
@@ -1557,6 +2074,16 @@ static int poll_events(struct server_wrk *w)
 	return ret;
 }
 
+static void close_all_clients(struct server_wrk *w)
+{
+	uint32_t i;
+
+	for (i = 0; i < w->client_arr_size; i++) {
+		if (w->clients[i].is_used)
+			put_client_slot(w, &w->clients[i]);
+	}
+}
+
 static void *worker_entry(void *arg)
 {
 	struct server_wrk *w = arg;
@@ -1574,6 +2101,7 @@ static void *worker_entry(void *arg)
 			break;
 	}
 
+	close_all_clients(w);
 	ptr = (void *)(intptr_t)ret;
 	return ptr;
 }
