@@ -568,15 +568,11 @@ static int init_stack_u32(struct stack_u32 *stack, uint32_t size)
 
 static void free_stack_u32(struct stack_u32 *stack)
 {
-	uint32_t *data;
-
 	pr_vl_dbg(3, "free_stack_u32: stack=%p; stack_size=%u", stack, stack->bp);
 	pthread_mutex_lock(&stack->lock);
-	data = stack->data;
-	stack->data = NULL;
 	pthread_mutex_unlock(&stack->lock);
 	pthread_mutex_destroy(&stack->lock);
-	free(data);
+	free(stack->data);
 }
 
 static int __upsize_stack_u32(struct stack_u32 *stack, uint32_t new_size)
@@ -597,9 +593,6 @@ static int __push_stack_u32(struct stack_u32 *stack, uint32_t data)
 	if (stack->sp >= stack->bp)
 		return -EAGAIN;
 
-	if (!stack->data)
-		return -EOWNERDEAD;
-
 	stack->data[stack->sp++] = data;
 	return 0;
 }
@@ -608,9 +601,6 @@ static int __pop_stack_u32(struct stack_u32 *stack, uint32_t *data)
 {
 	if (stack->sp == 0)
 		return -EAGAIN;
-
-	if (!stack->data)
-		return -EOWNERDEAD;
 
 	*data = stack->data[--stack->sp];
 	return 0;
@@ -851,7 +841,8 @@ static struct client_state *alloc_client_state(void)
 	return c;
 }
 
-static void reset_client_ep(struct client_endp *ep)
+static void reset_client_ep(struct client_endp *ep, bool preserve_buf,
+			    size_t max_preserve)
 {
 	if (ep->fd >= 0) {
 		close(ep->fd);
@@ -859,16 +850,24 @@ static void reset_client_ep(struct client_endp *ep)
 	}
 
 	if (ep->buf) {
-		free(ep->buf);
-		ep->buf = NULL;
+		if (preserve_buf && ep->cap <= max_preserve) {
+			ep->len = 0;
+		} else {
+			free(ep->buf);
+			ep->buf = NULL;
+			ep->len = 0;
+			ep->cap = 0;
+		}
+	} else {
+		ep->len = 0;
+		ep->cap = 0;
 	}
 
-	ep->len = 0;
-	ep->cap = 0;
 	memset(&ep->addr, 0, sizeof(ep->addr));
 }
 
-static void reset_client_state(struct client_state *c)
+static void reset_client_state(struct client_state *c, bool preserve_buf,
+			       size_t max_preserve)
 {
 	/*
 	 * The caller must already put c->spd.
@@ -880,8 +879,8 @@ static void reset_client_state(struct client_state *c)
 	 */
 	assert(c->is_used);
 
-	reset_client_ep(&c->client_ep);
-	reset_client_ep(&c->target_ep);
+	reset_client_ep(&c->client_ep, preserve_buf, max_preserve);
+	reset_client_ep(&c->target_ep, preserve_buf, max_preserve);
 
 	c->spd = NULL;
 	c->rate_limit_flags = 0;
@@ -891,55 +890,44 @@ static void reset_client_state(struct client_state *c)
 
 static int upsize_clients(struct server_wrk *w)
 {
-	struct client_state **new_clients;
-	size_t new_arr_size, old_arr_size;
-	uint32_t st_new_idx;
+	struct client_state **new_arr;
+	size_t old_len;
+	size_t new_len;
 	uint32_t i;
-	int ret;
+	int ret = 0;
 
 	pthread_mutex_lock(&w->cl_stack.lock);
-	new_arr_size = (w->client_arr_size * 2) + 1;
-	new_clients = realloc(w->clients, new_arr_size * sizeof(*new_clients));
-	if (!new_clients) {
-		pthread_mutex_unlock(&w->cl_stack.lock);
-		return -ENOMEM;
+	old_len = w->client_arr_size;
+	new_len = (old_len + 1) * 2;
+	new_arr = realloc(w->clients, new_len * sizeof(*new_arr));
+	if (!new_arr) {
+		ret = -ENOMEM;
+		goto out;
 	}
 
-	old_arr_size = w->client_arr_size;
-	st_new_idx = w->client_arr_size;
-	w->client_arr_size = new_arr_size;
-	w->clients = new_clients;
-
+	w->clients = new_arr;
+	w->client_arr_size = new_len;
 	ret = __upsize_stack_u32(&w->cl_stack, w->client_arr_size);
-	if (ret) {
-		pthread_mutex_unlock(&w->cl_stack.lock);
-		return ret;
-	}
+	if (ret)
+		goto out;
 
-	for (i = st_new_idx; i < w->client_arr_size; i++) {
+	for (i = old_len; i < new_len; i++) {
 		struct client_state *c = alloc_client_state();
 		if (!c) {
-			for (; i >= st_new_idx; i--)
-				free(w->clients[i]);
-
-			w->client_arr_size = old_arr_size;
-			pthread_mutex_unlock(&w->cl_stack.lock);
-			return -ENOMEM;
+			ret = -ENOMEM;
+			goto out;
 		}
 
 		c->idx = i;
 		w->clients[i] = c;
-	}
 
-	for (i = st_new_idx; i < w->client_arr_size; i++) {
 		ret = __push_stack_u32(&w->cl_stack, i);
-		if (ret) {
-			/* TODO: Handle resize failure. */
-			abort();
-		}
+		assert(!ret);
+		(void)ret;
 	}
 
-	pr_vl_dbg(2, "upsize_clients: Increased client array size to %u", w->client_arr_size);
+	pr_infov("upsize_clients: old_size=%zu; new_size=%zu (thread=%u)", old_len, new_len, w->idx);
+out:
 	pthread_mutex_unlock(&w->cl_stack.lock);
 	return ret;
 }
@@ -999,14 +987,16 @@ static void free_clients(struct server_wrk *w)
 
 	close_all_clients(w);
 	for (i = 0; i < w->client_arr_size; i++) {
-		if (w->clients[i]) {
+		struct client_state *c = w->clients[i];
 
-			if (w->clients[i]->is_used)
-				reset_client_state(w->clients[i]);
+		if (!c)
+			continue;
 
-			free(w->clients[i]);
-			w->clients[i] = NULL;
-		}
+		assert(!c->is_used);
+		assert(!c->client_ep.buf);
+		assert(!c->target_ep.buf);
+		free(c);
+		w->clients[i] = NULL;
 	}
 
 	free(w->clients);
@@ -1531,6 +1521,7 @@ static void put_ip_spd_bucket(struct ip_spd_map *map, struct sockaddr_in46 *addr
 
 static int get_client_slot(struct server_wrk *w, struct client_state **c)
 {
+	struct client_state *t;
 	uint32_t idx;
 	int ret;
 
@@ -1545,18 +1536,27 @@ static int get_client_slot(struct server_wrk *w, struct client_state **c)
 			return ret;
 	}
 
-	*c = w->clients[idx];
-	if (!*c) {
+	t = w->clients[idx];
+	if (!t) {
 		push_stack_u32(&w->cl_stack, idx);
 		return -ENOMEM;
 	}
 
-	(*c)->is_used = true;
+	assert(!t->is_used);
+	assert(!t->spd);
+	assert(t->client_ep.fd < 0);
+	assert(t->client_ep.len == 0);
+	assert(t->target_ep.fd < 0);
+	assert(t->target_ep.len == 0);
+
+	t->is_used = true;
+	*c = t;
 	atomic_fetch_add(&w->nr_online_clients, 1u);
 	return 0;
 }
 
-static void __put_client_slot(struct server_wrk *w, struct client_state *c, bool epl_del)
+static void __put_client_slot(struct server_wrk *w, struct client_state *c,
+			      bool epl_del, bool preserve_buf)
 {
 	bool hess = false;
 	int ret;
@@ -1619,7 +1619,7 @@ static void __put_client_slot(struct server_wrk *w, struct client_state *c, bool
 			 w->idx);
 	}
 
-	reset_client_state(c);
+	reset_client_state(c, preserve_buf, NR_INIT_RECV_BUF_BYTES);
 	push_stack_u32(&w->cl_stack, c->idx);
 	atomic_fetch_sub(&w->nr_online_clients, 1u);
 	w->handle_events_should_stop = hess;
@@ -1628,12 +1628,12 @@ static void __put_client_slot(struct server_wrk *w, struct client_state *c, bool
 
 static void put_client_slot(struct server_wrk *w, struct client_state *c)
 {
-	__put_client_slot(w, c, true);
+	__put_client_slot(w, c, true, true);
 }
 
 static void put_client_slot_no_epoll(struct server_wrk *w, struct client_state *c)
 {
-	__put_client_slot(w, c, false);
+	__put_client_slot(w, c, false, false);
 }
 
 static struct server_wrk *pick_worker_for_new_conn(struct server_ctx *ctx)
@@ -1758,6 +1758,12 @@ static int prepare_target_connect(struct server_wrk *w, struct client_state *c)
 		 c->target_ep.fd,
 		 w->idx);
 
+
+#ifdef TCP_NODELAY
+	ret = 1;
+	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &ret, sizeof(ret));
+#endif
+
 	ret = connect(fd, &taddr.sa, len);
 	if (ret) {
 		ret = errno;
@@ -1767,11 +1773,6 @@ static int prepare_target_connect(struct server_wrk *w, struct client_state *c)
 			return -ret;
 		}
 	}
-
-#ifdef TCP_NODELAY
-	ret = 1;
-	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &ret, sizeof(ret));
-#endif
 
 	pthread_mutex_lock(&w->epass_mutex);
 	c->target_ep.ep_mask = EPOLLOUT;
@@ -1841,7 +1842,9 @@ static int handle_accept_error(int err, struct server_wrk *w)
 	if (err == EMFILE || err == ENFILE) {
 		pr_error("accept(): (%d) Too many open files, stop accepting...", err);
 		pr_info("accept() will be re-enabled when a client disconnects (thread %u)", w->idx);
+		pthread_mutex_lock(&w->ctx->accept_mutex);
 		w->ctx->accept_stopped = true;
+		pthread_mutex_unlock(&w->ctx->accept_mutex);
 		return epoll_del(w->ep_fd, w->ctx->tcp_fd);
 	}
 
