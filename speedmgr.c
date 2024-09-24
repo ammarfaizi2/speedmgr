@@ -973,8 +973,29 @@ static void close_all_clients(struct server_wrk *w)
 	uint32_t i;
 
 	for (i = 0; i < w->client_arr_size; i++) {
-		if (w->clients[i]->is_used)
-			put_client_slot_no_epoll(w, w->clients[i]);
+		struct client_state *c = w->clients[i];
+
+		if (c->is_used) {
+			put_client_slot_no_epoll(w, c);
+			assert(!c->is_used);
+			assert(c->client_ep.fd < 0);
+			assert(c->target_ep.fd < 0);
+			assert(!c->client_ep.buf);
+			assert(!c->target_ep.buf);
+		} else {
+			assert(c->client_ep.fd < 0);
+			assert(c->target_ep.fd < 0);
+
+			if (c->target_ep.buf) {
+				free(c->target_ep.buf);
+				c->target_ep.buf = NULL;
+			}
+
+			if (c->client_ep.buf) {
+				free(c->client_ep.buf);
+				c->client_ep.buf = NULL;
+			}
+		}
 	}
 }
 
@@ -989,14 +1010,10 @@ static void free_clients(struct server_wrk *w)
 	for (i = 0; i < w->client_arr_size; i++) {
 		struct client_state *c = w->clients[i];
 
-		if (!c)
-			continue;
-
-		assert(!c->is_used);
-		assert(!c->client_ep.buf);
-		assert(!c->target_ep.buf);
-		free(c);
-		w->clients[i] = NULL;
+		if (c) {
+			free(c);
+			w->clients[i] = NULL;
+		}
 	}
 
 	free(w->clients);
