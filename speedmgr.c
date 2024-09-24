@@ -359,7 +359,7 @@ static int parse_args(int argc, char *argv[], struct server_cfg *cfg)
 		bool got_down_interval;
 	} p;
 
-	cfg->backlog = 4;
+	cfg->backlog = 300;
 	cfg->nr_workers = 4;
 	cfg->verbose = 0;
 
