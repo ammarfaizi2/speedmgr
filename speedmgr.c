@@ -1449,7 +1449,8 @@ static void init_ip_spd_bucket(struct ip_spd_bucket *b)
 	memset(b, 0, sizeof(*b));
 }
 
-static struct ip_spd_bucket *get_ip_spd_bucket(struct ip_spd_map *map,
+static struct ip_spd_bucket *get_ip_spd_bucket(struct server_wrk *w,
+					       struct ip_spd_map *map,
 					       const struct sockaddr_in46 *addr)
 {
 	struct ip_spd_bucket *b;
@@ -1492,7 +1493,15 @@ static struct ip_spd_bucket *get_ip_spd_bucket(struct ip_spd_map *map,
 		free(b);
 		b = NULL;
 	} else {
+		struct server_cfg *cfg = &w->ctx->cfg;
+
 		map->len++;
+		b->dn_tkn.fill_intv = cfg->down_interval;
+		b->dn_tkn.max = cfg->down_limit;
+		b->up_tkn.fill_intv = cfg->up_interval;
+		b->up_tkn.max = cfg->up_limit;
+		atomic_store_explicit(&b->up_tkn.tkn, b->up_tkn.max, memory_order_relaxed);
+		atomic_store_explicit(&b->dn_tkn.tkn, b->dn_tkn.max, memory_order_relaxed);
 	}
 
 	pthread_mutex_unlock(&map->lock);
@@ -1840,7 +1849,7 @@ static int give_client_fd_to_a_worker(struct server_ctx *ctx, int fd,
 		return -ENOMEM;
 	}
 
-	b = get_ip_spd_bucket(&ctx->spd_map, addr);
+	b = get_ip_spd_bucket(w, &ctx->spd_map, addr);
 	if (b)
 		c->spd = b;
 
@@ -2078,7 +2087,7 @@ static size_t get_max_send_size(struct client_state *c, enum size_direction dir)
 	}
 
 	if (!b)
-		return src->len;
+		return (size_t)~0ull;
 
 	now  = get_time_ns();
 	cur  = atomic_load_explicit(&tkn->tkn, memory_order_relaxed);
@@ -2148,6 +2157,11 @@ static int do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 		return 0;
 
 	if (dst == &c->target_ep && !c->target_connected) {
+		dst->ep_mask |= EPOLLOUT;
+		return apply_ep_mask(w, c, dst);
+	}
+
+	if (max_send_size == 0) {
 		dst->ep_mask |= EPOLLOUT;
 		return apply_ep_mask(w, c, dst);
 	}
