@@ -44,8 +44,8 @@
 
 #define NR_INIT_SPD_BUCKET_ARR	32
 
-#define NR_INIT_RECV_BUF_BYTES	8192
-#define NR_MAX_RECV_BUF_BYTES	(1024 * 1024 * 256)
+#define NR_INIT_RECV_BUF_BYTES	(1024 * 1024 * 32)
+#define NR_MAX_RECV_BUF_BYTES	(1024 * 1024 * 512)
 
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -363,8 +363,7 @@ static int parse_args(int argc, char *argv[], struct server_cfg *cfg)
 	cfg->nr_workers = 4;
 	cfg->verbose = 0;
 
-	p.got_bind_addr = false;
-	p.got_target_addr = false;
+	memset(&p, 0, sizeof(p));
 	while (1) {
 		int q, i;
 		char *t;
@@ -979,6 +978,18 @@ static int init_clients(struct server_wrk *w)
 	return 0;
 }
 
+static void put_client_slot_no_epoll(struct server_wrk *w, struct client_state *c);
+
+static void close_all_clients(struct server_wrk *w)
+{
+	uint32_t i;
+
+	for (i = 0; i < w->client_arr_size; i++) {
+		if (w->clients[i]->is_used)
+			put_client_slot_no_epoll(w, w->clients[i]);
+	}
+}
+
 static void free_clients(struct server_wrk *w)
 {
 	uint32_t i;
@@ -986,6 +997,7 @@ static void free_clients(struct server_wrk *w)
 	if (!w->clients)
 		return;
 
+	close_all_clients(w);
 	for (i = 0; i < w->client_arr_size; i++) {
 		if (w->clients[i]) {
 
@@ -1837,13 +1849,29 @@ static int handle_accept_error(int err, struct server_wrk *w)
 	return -err;
 }
 
+static int set_optional_sockopt(int fd)
+{
+	int p;
+
+	/*
+	 * Set TCP_NODELAY.
+	 */
+	p = 1;
+	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &p, sizeof(p));
+
+	return 0;
+}
+
 static int handle_event_accept(struct server_wrk *w)
 {
+	static const uint32_t NR_MAX_ACCEPT_CYCLE = 32;
 	struct server_ctx *ctx = w->ctx;
 	struct sockaddr_in46 addr;
+	uint32_t counter = 0;
 	socklen_t len;
 	int ret;
 
+do_accept:
 	memset(&addr, 0, sizeof(addr));
 	if (ctx->cfg.bind_addr.sa.sa_family == AF_INET6)
 		len = sizeof(addr.in6);
@@ -1854,13 +1882,21 @@ static int handle_event_accept(struct server_wrk *w)
 	if (unlikely(ret < 0))
 		return handle_accept_error(errno, w);
 
+	set_optional_sockopt(ret);
 	if (unlikely(len > sizeof(addr))) {
 		pr_error("accept() returned invalid address length: %u", len);
 		close(ret);
 		return -EINVAL;
 	}
 
-	return give_client_fd_to_a_worker(w->ctx, ret, &addr);
+	ret = give_client_fd_to_a_worker(w->ctx, ret, &addr);
+	if (ret)
+		return ret;
+
+	if (++counter < NR_MAX_ACCEPT_CYCLE)
+		goto do_accept;
+
+	return 0;
 }
 
 static ssize_t do_ep_recv(struct client_endp *ep)
@@ -2180,6 +2216,11 @@ static int handle_event_target_conn(struct server_wrk *w, struct epoll_event *ev
 	return 0;
 }
 
+static int handle_event_timer(struct server_wrk *w)
+{
+	return 0;
+}
+
 static int handle_event(struct server_wrk *w, struct epoll_event *ev)
 {
 	uint64_t evt = GET_EPL_EV(ev->data.u64);
@@ -2201,9 +2242,9 @@ static int handle_event(struct server_wrk *w, struct epoll_event *ev)
 	case EPL_EV_TCP_TARGET_CONN:
 		ret = handle_event_target_conn(w, ev);
 		break;
-	// case EPL_EV_TIMERFD:
-	// 	ret = handle_event_timer(w);
-	// 	break;
+	case EPL_EV_TIMERFD:
+		ret = handle_event_timer(w);
+		break;
 	default:
 		pr_error("Unknown event type: %lu (thread %u)", evt, w->idx);
 		return -EINVAL;
@@ -2262,16 +2303,6 @@ static int poll_events(struct server_wrk *w)
 	return ret;
 }
 
-static void close_all_clients(struct server_wrk *w)
-{
-	uint32_t i;
-
-	for (i = 0; i < w->client_arr_size; i++) {
-		if (w->clients[i]->is_used)
-			put_client_slot_no_epoll(w, w->clients[i]);
-	}
-}
-
 static void *worker_entry(void *arg)
 {
 	struct server_wrk *w = arg;
@@ -2289,7 +2320,6 @@ static void *worker_entry(void *arg)
 			break;
 	}
 
-	close_all_clients(w);
 	ptr = (void *)(intptr_t)ret;
 	return ptr;
 }
