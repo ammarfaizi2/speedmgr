@@ -2083,7 +2083,7 @@ static int do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 		ret = apply_ep_mask(w, c, dst);
 	}
 
-	return 0;
+	return ret;
 }
 
 static int do_pipe_epoll_out(struct server_wrk *w, struct client_state *c,
@@ -2135,7 +2135,7 @@ static int do_pipe_epoll_out(struct server_wrk *w, struct client_state *c,
 		ret = apply_ep_mask(w, c, src);
 	}
 
-	return 0;
+	return ret;
 }
 
 static int handle_event_client_data(struct server_wrk *w, struct epoll_event *ev)
