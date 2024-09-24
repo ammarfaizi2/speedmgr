@@ -44,8 +44,8 @@
 
 #define NR_INIT_SPD_BUCKET_ARR	32
 
-#define NR_INIT_RECV_BUF_BYTES	(1024 * 1024 * 32)
-#define NR_MAX_RECV_BUF_BYTES	(1024 * 1024 * 512)
+#define NR_INIT_RECV_BUF_BYTES	4096
+#define NR_MAX_RECV_BUF_BYTES	(1024 * 1024 * 2)
 
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -1502,6 +1502,7 @@ static struct ip_spd_bucket *get_ip_spd_bucket(struct server_wrk *w,
 		b->up_tkn.max = cfg->up_limit;
 		atomic_store_explicit(&b->up_tkn.tkn, b->up_tkn.max, memory_order_relaxed);
 		atomic_store_explicit(&b->dn_tkn.tkn, b->dn_tkn.max, memory_order_relaxed);
+		atomic_store_explicit(&b->nr_conns, 1u, memory_order_relaxed);
 	}
 
 	pthread_mutex_unlock(&map->lock);
@@ -1512,6 +1513,7 @@ static void put_ip_spd_bucket(struct ip_spd_map *map, struct sockaddr_in46 *addr
 {
 	struct ip_spd_bucket *b;
 	uint32_t idx;
+	uint16_t n;
 
 	assert(map->bucket_arr);
 	pthread_mutex_lock(&map->lock);
@@ -1522,7 +1524,8 @@ static void put_ip_spd_bucket(struct ip_spd_map *map, struct sockaddr_in46 *addr
 	}
 
 	b = map->bucket_arr[idx];
-	if (atomic_fetch_sub(&b->nr_conns, 1u) == 1) {
+	n = atomic_fetch_sub(&b->nr_conns, 1u);
+	if (n == 1) {
 		const void *key;
 		size_t key_len;
 
@@ -1531,6 +1534,8 @@ static void put_ip_spd_bucket(struct ip_spd_map *map, struct sockaddr_in46 *addr
 		map->bucket_arr[idx] = NULL;
 		free(b);
 	}
+
+	printf("put_ip_spd_bucket: %s -> %u\n", sockaddr_to_str(addr), n);
 
 	/*
 	 * Shrink the bucket array if it's too large.
