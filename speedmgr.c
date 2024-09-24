@@ -44,8 +44,8 @@
 
 #define NR_INIT_SPD_BUCKET_ARR	32
 
-#define NR_INIT_RECV_BUF_BYTES	1600
-#define NR_MAX_RECV_BUF_BYTES	1600
+#define NR_INIT_RECV_BUF_BYTES	2048
+#define NR_MAX_RECV_BUF_BYTES	4096
 
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -1508,16 +1508,18 @@ static struct ip_spd_bucket *get_ip_spd_bucket(struct server_wrk *w,
 	} else {
 		struct server_cfg *cfg = &w->ctx->cfg;
 		uint64_t now = get_time_us();
+		uint64_t rvp = 1;
 
 		map->len++;
-		b->dn_tkn.fill_intv = cfg->down_interval * 1000;
-		b->dn_tkn.max = cfg->down_limit;
-		b->up_tkn.fill_intv = cfg->up_interval * 1000;
-		b->up_tkn.max = cfg->up_limit;
+		b->up_tkn.fill_intv = cfg->up_interval * 1000 * rvp;
+		b->dn_tkn.fill_intv = cfg->down_interval * 1000 * rvp;
+		b->up_tkn.max = cfg->up_limit * rvp;
+		b->dn_tkn.max = cfg->down_limit * rvp;
 		atomic_store_explicit(&b->up_tkn.tkn, b->up_tkn.max, memory_order_relaxed);
 		atomic_store_explicit(&b->dn_tkn.tkn, b->dn_tkn.max, memory_order_relaxed);
 		atomic_store_explicit(&b->up_tkn.last_fill, now, memory_order_relaxed);
 		atomic_store_explicit(&b->dn_tkn.last_fill, now, memory_order_relaxed);
+		atomic_store_explicit(&b->nr_conns, 1u, memory_order_relaxed);
 	}
 
 	pthread_mutex_unlock(&map->lock);
@@ -1758,6 +1760,19 @@ static inline void set_epoll_data(union epoll_data *data, struct client_state *c
 	data->u64 |= ev_mask;
 }
 
+static int set_optional_sockopt(int fd)
+{
+	int p;
+
+	/*
+	 * Set TCP_NODELAY and TCP_QUICKACK.
+	 */
+	p = 1;
+	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &p, sizeof(p));
+	setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &p, sizeof(p));
+	return 0;
+}
+
 static int prepare_target_connect(struct server_wrk *w, struct client_state *c)
 {
 	struct sockaddr_in46 taddr;
@@ -1782,6 +1797,8 @@ static int prepare_target_connect(struct server_wrk *w, struct client_state *c)
 		return -ret;
 	}
 
+	set_optional_sockopt(fd);
+
 	if (w->ctx->cfg.out_mark) {
 		uint32_t mark = w->ctx->cfg.out_mark;
 
@@ -1804,12 +1821,6 @@ static int prepare_target_connect(struct server_wrk *w, struct client_state *c)
 		 c->target_ep.fd,
 		 w->idx);
 
-
-#ifdef TCP_NODELAY
-	ret = 1;
-	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &ret, sizeof(ret));
-#endif
-
 	ret = connect(fd, &taddr.sa, len);
 	if (ret) {
 		ret = errno;
@@ -1831,7 +1842,7 @@ static int prepare_target_connect(struct server_wrk *w, struct client_state *c)
 		return ret;
 	}
 
-	c->client_ep.ep_mask = EPOLLIN;
+	c->client_ep.ep_mask = 0;
 	set_epoll_data(&data, c, EPL_EV_TCP_CLIENT_DATA);
 	ret = epoll_add(w->ep_fd, c->client_ep.fd, c->client_ep.ep_mask, data);
 	if (ret) {
@@ -1898,19 +1909,6 @@ static int handle_accept_error(int err, struct server_wrk *w)
 	return -err;
 }
 
-static int set_optional_sockopt(int fd)
-{
-	int p;
-
-	/*
-	 * Set TCP_NODELAY.
-	 */
-	p = 1;
-	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &p, sizeof(p));
-
-	return 0;
-}
-
 static int handle_event_accept(struct server_wrk *w)
 {
 	static const uint32_t NR_MAX_ACCEPT_CYCLE = 32;
@@ -1948,7 +1946,7 @@ do_accept:
 	return 0;
 }
 
-static ssize_t do_ep_recv(struct client_endp *ep)
+static ssize_t do_ep_recv(struct client_endp *ep, size_t max_send_size)
 {
 	ssize_t ret;
 	size_t len;
@@ -1983,6 +1981,7 @@ static ssize_t do_ep_recv(struct client_endp *ep)
 
 	len = ep->cap - ep->len;
 	buf = ep->buf + ep->len;
+	len = MIN(len, max_send_size);
 	if (len == 0)
 		return -ENOBUFS;
 
@@ -1992,6 +1991,8 @@ static ssize_t do_ep_recv(struct client_endp *ep)
 		if (ret == -EAGAIN || ret == -EINTR)
 			return -EAGAIN;
 
+		pr_errorv("recv() from %s: %s", sockaddr_to_str(&ep->addr),
+			  strerror(-ret));
 		return ret;
 	}
 
@@ -2019,6 +2020,8 @@ static ssize_t do_ep_send(struct client_endp *src, struct client_endp *dst,
 		if (ret == -EAGAIN || ret == -EINTR)
 			return -EAGAIN;
 
+		pr_errorv("send() to %s: %s", sockaddr_to_str(&dst->addr),
+			  strerror(-ret));
 		return ret;
 	}
 
@@ -2097,17 +2100,21 @@ static size_t get_max_send_size(struct client_state *c, enum size_direction dir)
 	last = atomic_load_explicit(&tkn->last_fill, memory_order_relaxed);
 
 	delta = now - last;
-	fill = (tkn->max * delta) / (tkn->fill_intv);
+	fill = ((tkn->max * delta * tkn->fill_intv) / tkn->fill_intv) / tkn->fill_intv;
+
+	if (fill < (100*1024))
+		fill = 0;
+
 	new_tkn = MIN(cur + fill, tkn->max);
-	if (new_tkn != cur) {
+	if (new_tkn > cur) {
 		atomic_store_explicit(&tkn->tkn, new_tkn, memory_order_relaxed);
 		atomic_store_explicit(&tkn->last_fill, now, memory_order_relaxed);
 		cur = new_tkn;
 	}
 
-	if (p++ % 32 == 0)
-		printf("%s cur=%lu; fill=%lu; delta=%lu;\n",
-		       dir == MAX_UP_SIZE ? "UP" : "DN", cur, fill, delta);
+	if (p++ % 4 == 0)
+		printf("%s cur=%lu; new_tkn=%lu; fill=%lu; delta=%lu;\n",
+		       dir == MAX_UP_SIZE ? "UP" : "DN", cur, new_tkn, fill, delta);
 
 	return cur;
 }
@@ -2141,7 +2148,7 @@ static ssize_t do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 	ssize_t sock_ret;
 	int err;
 
-	sock_ret = do_ep_recv(src);
+	sock_ret = do_ep_recv(src, max_send_size);
 	if (sock_ret < 0) {
 		if (sock_ret == -EAGAIN)
 			return 0;
