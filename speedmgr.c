@@ -128,13 +128,15 @@ struct sockaddr_in46 {
 
 struct spd_tkn {
 	_Atomic(uint64_t)	tkn;
-	_Atomic(uint64_t)	max;
 	_Atomic(uint64_t)	last_fill;
+	uint64_t		nr_fill;
+	uint64_t		fill_intv;
+	uint64_t		max;
 };
 
 struct ip_spd_bucket {
 	struct spd_tkn		up_tkn;
-	struct spd_tkn		db_tkn;
+	struct spd_tkn		dn_tkn;
 	_Atomic(uint16_t)	nr_conns;
 };
 
@@ -188,6 +190,7 @@ struct server_wrk {
 	uint32_t		idx;
 	uint32_t		client_arr_size;
 	_Atomic(uint32_t)	nr_online_clients;
+	uint64_t		next_timer_ns;
 
 	pthread_t		thread;
 	pthread_mutex_t		epass_mutex;	/* When passing a client to another worker */
@@ -1158,6 +1161,7 @@ static int init_timer(struct server_wrk *w)
 	if (ret)
 		return ret;
 
+	w->next_timer_ns = 0;
 	return 0;
 }
 
@@ -2020,6 +2024,95 @@ static int apply_ep_mask(struct server_wrk *w, struct client_state *c,
 	return epoll_mod(w->ep_fd, ep->fd, ep->ep_mask, data);
 }
 
+enum size_direction {
+	MAX_UP_SIZE,
+	MAX_DN_SIZE
+};
+
+static uint64_t get_time_ns(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
+
+static void ns_to_timespec(uint64_t ns, struct timespec *ts)
+{
+	ts->tv_sec = ns / 1000000000;
+	ts->tv_nsec = ns % 1000000000;
+}
+
+static int arm_timer(struct server_wrk *w)
+{
+	struct itimerspec its;
+	uint64_t now, interval;
+	int ret;
+
+	if (!w->ctx->need_timer)
+		return 0;
+
+	now = get_time_ns();
+	ret = timerfd_settime(w->timer_fd, TFD_TIMER_ABSTIME, &its, NULL);
+	if (ret) {
+		ret = -errno;
+		pr_error("Failed to arm timer: %s", strerror(-ret));
+	}
+
+	return ret;
+}
+
+static size_t get_max_send_size(struct client_state *c, enum size_direction dir)
+{
+	uint64_t cur, last, now, delta, fill, new_tkn;
+	struct ip_spd_bucket *b = c->spd;
+	struct client_endp *src;
+	struct spd_tkn *tkn;
+
+	if (dir == MAX_UP_SIZE) {
+		src = &c->client_ep;
+		tkn = &b->up_tkn;
+	} else {
+		src = &c->target_ep;
+		tkn = &b->dn_tkn;
+	}
+
+	if (!b)
+		return src->len;
+
+	now  = get_time_ns();
+	cur  = atomic_load_explicit(&tkn->tkn, memory_order_relaxed);
+	last = atomic_load_explicit(&tkn->last_fill, memory_order_relaxed);
+
+	delta   = now - last;
+	fill    = (tkn->nr_fill * delta) / tkn->fill_intv;
+	new_tkn = MIN(cur + fill, tkn->max);
+	if (new_tkn != cur) {
+		atomic_store_explicit(&tkn->tkn, new_tkn, memory_order_relaxed);
+		atomic_store_explicit(&tkn->last_fill, now, memory_order_relaxed);
+		cur = new_tkn;
+	}
+
+	return cur;
+}
+
+static void consume_token(struct client_state *c, enum size_direction dir,
+			  size_t size)
+{
+	struct ip_spd_bucket *b = c->spd;
+	struct spd_tkn *tkn;
+
+	if (!b)
+		return;
+
+	if (dir == MAX_UP_SIZE)
+		tkn = &b->up_tkn;
+	else
+		tkn = &b->dn_tkn;
+
+	atomic_fetch_sub(&tkn->tkn, size);
+}
+
 static int do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 			    struct client_endp *src, struct client_endp *dst)
 {
@@ -2027,6 +2120,8 @@ static int do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 	__unused struct sockaddr_in46 *pdst = (dst == &c->client_ep) ? &c->client_ep.addr : &c->target_ep.addr;
 	__unused const char *src_name = (src == &c->client_ep) ? "Client" : "Target";
 	__unused const char *dst_name = (dst == &c->client_ep) ? "Client" : "Target";
+	enum size_direction dir = (src == &c->client_ep) ? MAX_UP_SIZE : MAX_DN_SIZE;
+	size_t max_send_size = get_max_send_size(c, dir);
 	ssize_t ret;
 
 	ret = do_ep_recv(src);
@@ -2057,7 +2152,7 @@ static int do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 		return apply_ep_mask(w, c, dst);
 	}
 
-	ret = do_ep_send(src, dst, NR_MAX_RECV_BUF_BYTES);
+	ret = do_ep_send(src, dst, max_send_size);
 	if (ret < 0) {
 		if (ret != -EAGAIN) {
 
@@ -2083,6 +2178,9 @@ static int do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 		ret = apply_ep_mask(w, c, dst);
 	}
 
+	if (ret > 0)
+		consume_token(c, dir, (size_t)ret);
+
 	return ret;
 }
 
@@ -2093,11 +2191,12 @@ static int do_pipe_epoll_out(struct server_wrk *w, struct client_state *c,
 	__unused struct sockaddr_in46 *pdst = (dst == &c->client_ep) ? &c->client_ep.addr : &c->target_ep.addr;
 	__unused const char *src_name = (src == &c->client_ep) ? "Client" : "Target";
 	__unused const char *dst_name = (dst == &c->client_ep) ? "Client" : "Target";
-
+	enum size_direction dir = (src == &c->client_ep) ? MAX_UP_SIZE : MAX_DN_SIZE;
+	size_t max_send_size = get_max_send_size(c, dir);
 	size_t remain_bsize;
 	ssize_t ret;
 
-	ret = do_ep_send(src, dst, NR_MAX_RECV_BUF_BYTES);
+	ret = do_ep_send(src, dst, max_send_size);
 	if (ret < 0 && ret != -EAGAIN) {
 		pr_vl_dbg(3, "po: send() to %s (fd=%d; psrc=%s; pdst=%s; thread=%u): %s",
 			  dst_name,
@@ -2108,6 +2207,9 @@ static int do_pipe_epoll_out(struct server_wrk *w, struct client_state *c,
 			  strerror(-ret));
 		return ret;
 	}
+
+	if (ret > 0)
+		consume_token(c, dir, (size_t)ret);
 
 	if (src->len == 0) {
 		pr_vl_dbg(3, "Disabling EPOLLOUT on dst=%s (fd=%d; psrc=%s; pdst=%s; thread=%u)",
