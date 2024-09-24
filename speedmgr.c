@@ -775,7 +775,7 @@ static int init_socket(struct server_ctx *ctx)
 
 	ctx->accept_stopped = false;
 	family = ctx->cfg.bind_addr.sa.sa_family;
-	tcp_fd = socket(family, SOCK_STREAM | SOCK_STREAM, 0);
+	tcp_fd = socket(family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
 	if (tcp_fd < 0) {
 		pr_error("Failed to create socket: %s", strerror(errno));
 		return -errno;
