@@ -44,8 +44,8 @@
 
 #define NR_INIT_SPD_BUCKET_ARR	32
 
-#define NR_INIT_RECV_BUF_BYTES	(1024 * 1024 * 32)
-#define NR_MAX_RECV_BUF_BYTES	(1024 * 1024 * 512)
+#define NR_INIT_RECV_BUF_BYTES	1600
+#define NR_MAX_RECV_BUF_BYTES	1600
 
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -83,7 +83,7 @@
 #define IP6T_SO_ORIGINAL_DST 80
 #endif
 
-#define g_dbg_level (3)
+#define g_dbg_level (1)
 static volatile bool *g_stop;
 static uint8_t g_verbose;
 
@@ -129,7 +129,6 @@ struct sockaddr_in46 {
 struct spd_tkn {
 	_Atomic(uint64_t)	tkn;
 	_Atomic(uint64_t)	last_fill;
-	uint64_t		nr_fill;
 	uint64_t		fill_intv;
 	uint64_t		max;
 };
@@ -1449,6 +1448,20 @@ static void init_ip_spd_bucket(struct ip_spd_bucket *b)
 	memset(b, 0, sizeof(*b));
 }
 
+static uint64_t get_time_us(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000 + (uint64_t)ts.tv_nsec / 1000;
+}
+
+static void us_to_timespec(uint64_t us, struct timespec *ts)
+{
+	ts->tv_sec = us / 1000000;
+	ts->tv_nsec = (us % 1000000) * 1000;
+}
+
 static struct ip_spd_bucket *get_ip_spd_bucket(struct server_wrk *w,
 					       struct ip_spd_map *map,
 					       const struct sockaddr_in46 *addr)
@@ -1494,14 +1507,17 @@ static struct ip_spd_bucket *get_ip_spd_bucket(struct server_wrk *w,
 		b = NULL;
 	} else {
 		struct server_cfg *cfg = &w->ctx->cfg;
+		uint64_t now = get_time_us();
 
 		map->len++;
-		b->dn_tkn.fill_intv = cfg->down_interval;
+		b->dn_tkn.fill_intv = cfg->down_interval * 1000;
 		b->dn_tkn.max = cfg->down_limit;
-		b->up_tkn.fill_intv = cfg->up_interval;
+		b->up_tkn.fill_intv = cfg->up_interval * 1000;
 		b->up_tkn.max = cfg->up_limit;
 		atomic_store_explicit(&b->up_tkn.tkn, b->up_tkn.max, memory_order_relaxed);
 		atomic_store_explicit(&b->dn_tkn.tkn, b->dn_tkn.max, memory_order_relaxed);
+		atomic_store_explicit(&b->up_tkn.last_fill, now, memory_order_relaxed);
+		atomic_store_explicit(&b->dn_tkn.last_fill, now, memory_order_relaxed);
 	}
 
 	pthread_mutex_unlock(&map->lock);
@@ -2038,20 +2054,6 @@ enum size_direction {
 	MAX_DN_SIZE
 };
 
-static uint64_t get_time_ns(void)
-{
-	struct timespec ts;
-
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (uint64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
-}
-
-static void ns_to_timespec(uint64_t ns, struct timespec *ts)
-{
-	ts->tv_sec = ns / 1000000000;
-	ts->tv_nsec = ns % 1000000000;
-}
-
 static int arm_timer(struct server_wrk *w)
 {
 	struct itimerspec its;
@@ -2061,7 +2063,7 @@ static int arm_timer(struct server_wrk *w)
 	if (!w->ctx->need_timer)
 		return 0;
 
-	now = get_time_ns();
+	now = get_time_us();
 	ret = timerfd_settime(w->timer_fd, TFD_TIMER_ABSTIME, &its, NULL);
 	if (ret) {
 		ret = -errno;
@@ -2073,6 +2075,7 @@ static int arm_timer(struct server_wrk *w)
 
 static size_t get_max_send_size(struct client_state *c, enum size_direction dir)
 {
+	static _Atomic(uint8_t) p;
 	uint64_t cur, last, now, delta, fill, new_tkn;
 	struct ip_spd_bucket *b = c->spd;
 	struct client_endp *src;
@@ -2089,18 +2092,22 @@ static size_t get_max_send_size(struct client_state *c, enum size_direction dir)
 	if (!b)
 		return (size_t)~0ull;
 
-	now  = get_time_ns();
+	now  = get_time_us();
 	cur  = atomic_load_explicit(&tkn->tkn, memory_order_relaxed);
 	last = atomic_load_explicit(&tkn->last_fill, memory_order_relaxed);
 
-	delta   = now - last;
-	fill    = (tkn->nr_fill * delta) / tkn->fill_intv;
+	delta = now - last;
+	fill = (tkn->max * delta) / (tkn->fill_intv);
 	new_tkn = MIN(cur + fill, tkn->max);
 	if (new_tkn != cur) {
 		atomic_store_explicit(&tkn->tkn, new_tkn, memory_order_relaxed);
 		atomic_store_explicit(&tkn->last_fill, now, memory_order_relaxed);
 		cur = new_tkn;
 	}
+
+	if (p++ % 32 == 0)
+		printf("%s cur=%lu; fill=%lu; delta=%lu;\n",
+		       dir == MAX_UP_SIZE ? "UP" : "DN", cur, fill, delta);
 
 	return cur;
 }
