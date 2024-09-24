@@ -2013,7 +2013,7 @@ static ssize_t do_ep_send(struct client_endp *src, struct client_endp *dst,
 	if (uret < len) {
 		src->len -= uret;
 		memmove(buf, buf + uret, src->len);
-		return -EAGAIN;
+		return ret;
 	}
 
 	src->len = 0;
@@ -2122,8 +2122,8 @@ static void consume_token(struct client_state *c, enum size_direction dir,
 	atomic_fetch_sub(&tkn->tkn, size);
 }
 
-static int do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
-			    struct client_endp *src, struct client_endp *dst)
+static ssize_t do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
+				struct client_endp *src, struct client_endp *dst)
 {
 	__unused struct sockaddr_in46 *psrc = (src == &c->client_ep) ? &c->client_ep.addr : &c->target_ep.addr;
 	__unused struct sockaddr_in46 *pdst = (dst == &c->client_ep) ? &c->client_ep.addr : &c->target_ep.addr;
@@ -2131,14 +2131,15 @@ static int do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 	__unused const char *dst_name = (dst == &c->client_ep) ? "Client" : "Target";
 	enum size_direction dir = (src == &c->client_ep) ? MAX_UP_SIZE : MAX_DN_SIZE;
 	size_t max_send_size = get_max_send_size(c, dir);
-	ssize_t ret;
+	ssize_t sock_ret;
+	int err;
 
-	ret = do_ep_recv(src);
-	if (ret < 0) {
-		if (ret == -EAGAIN)
+	sock_ret = do_ep_recv(src);
+	if (sock_ret < 0) {
+		if (sock_ret == -EAGAIN)
 			return 0;
-		if (ret != -ENOBUFS)
-			return ret;
+		if (sock_ret != -ENOBUFS)
+			return sock_ret;
 
 		pr_vl_dbg(3, "Disabling EPOLLIN on src=%s (fd=%d; psrc=%s; pdst=%s; thread=%u)",
 			  src_name,
@@ -2148,39 +2149,36 @@ static int do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 			  w->idx);
 
 		src->ep_mask &= ~EPOLLIN;
-		ret = apply_ep_mask(w, c, src);
-		if (ret)
-			return ret;
+		err = apply_ep_mask(w, c, src);
+		if (err)
+			return (ssize_t)err;
 	}
 
 	if (dst->ep_mask & EPOLLOUT)
 		return 0;
+	if (dst == &c->target_ep && !c->target_connected)
+		goto enable_out_dst;
+	if (max_send_size == 0)
+		goto enable_out_dst;
 
-	if (dst == &c->target_ep && !c->target_connected) {
-		dst->ep_mask |= EPOLLOUT;
-		return apply_ep_mask(w, c, dst);
+	sock_ret = do_ep_send(src, dst, max_send_size);
+	if (sock_ret < 0 && sock_ret != -EAGAIN) {
+		pr_vl_dbg(3, "po: send() to %s (fd=%d; psrc=%s; pdst=%s; thread=%u): %s",
+			  dst_name,
+			  dst->fd,
+			  sockaddr_to_str(psrc),
+			  sockaddr_to_str(pdst),
+			  w->idx,
+			  strerror((int)-sock_ret));
+
+		return sock_ret;
 	}
 
-	if (max_send_size == 0) {
-		dst->ep_mask |= EPOLLOUT;
-		return apply_ep_mask(w, c, dst);
-	}
+	if (sock_ret > 0)
+		consume_token(c, dir, (size_t)sock_ret);
 
-	ret = do_ep_send(src, dst, max_send_size);
-	if (ret < 0) {
-		if (ret != -EAGAIN) {
-
-			pr_vl_dbg(3, "po: send() to %s (fd=%d; psrc=%s; pdst=%s; thread=%u): %s",
-				  dst_name,
-				  dst->fd,
-				  sockaddr_to_str(psrc),
-				  sockaddr_to_str(pdst),
-				  w->idx,
-				  strerror(-ret));
-
-			return ret;
-		}
-
+enable_out_dst:
+	if (src->len > 0) {
 		pr_vl_dbg(3, "Enabling  EPOLLOUT on dst=%s (fd=%d; psrc=%s; pdst=%s; thread=%u)",
 			  dst_name,
 			  dst->fd,
@@ -2189,17 +2187,16 @@ static int do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 			  w->idx);
 
 		dst->ep_mask |= EPOLLOUT;
-		ret = apply_ep_mask(w, c, dst);
+		err = apply_ep_mask(w, c, dst);
+		if (err)
+			return (ssize_t)err;
 	}
 
-	if (ret > 0)
-		consume_token(c, dir, (size_t)ret);
-
-	return ret;
+	return sock_ret;
 }
 
-static int do_pipe_epoll_out(struct server_wrk *w, struct client_state *c,
-			     struct client_endp *src, struct client_endp *dst)
+static ssize_t do_pipe_epoll_out(struct server_wrk *w, struct client_state *c,
+				 struct client_endp *src, struct client_endp *dst)
 {
 	__unused struct sockaddr_in46 *psrc = (src == &c->client_ep) ? &c->client_ep.addr : &c->target_ep.addr;
 	__unused struct sockaddr_in46 *pdst = (dst == &c->client_ep) ? &c->client_ep.addr : &c->target_ep.addr;
@@ -2208,22 +2205,23 @@ static int do_pipe_epoll_out(struct server_wrk *w, struct client_state *c,
 	enum size_direction dir = (src == &c->client_ep) ? MAX_UP_SIZE : MAX_DN_SIZE;
 	size_t max_send_size = get_max_send_size(c, dir);
 	size_t remain_bsize;
-	ssize_t ret;
+	ssize_t sock_ret;
+	int err;
 
-	ret = do_ep_send(src, dst, max_send_size);
-	if (ret < 0 && ret != -EAGAIN) {
+	sock_ret = do_ep_send(src, dst, max_send_size);
+	if (sock_ret < 0 && sock_ret != -EAGAIN) {
 		pr_vl_dbg(3, "po: send() to %s (fd=%d; psrc=%s; pdst=%s; thread=%u): %s",
 			  dst_name,
 			  dst->fd,
 			  sockaddr_to_str(psrc),
 			  sockaddr_to_str(pdst),
 			  w->idx,
-			  strerror(-ret));
-		return ret;
+			  strerror((int)-sock_ret));
+		return sock_ret;
 	}
 
-	if (ret > 0)
-		consume_token(c, dir, (size_t)ret);
+	if (sock_ret > 0)
+		consume_token(c, dir, (size_t)sock_ret);
 
 	if (src->len == 0) {
 		pr_vl_dbg(3, "Disabling EPOLLOUT on dst=%s (fd=%d; psrc=%s; pdst=%s; thread=%u)",
@@ -2234,9 +2232,9 @@ static int do_pipe_epoll_out(struct server_wrk *w, struct client_state *c,
 			  w->idx);
 
 		dst->ep_mask &= ~EPOLLOUT;
-		ret = apply_ep_mask(w, c, dst);
-		if (ret)
-			return ret;
+		err = apply_ep_mask(w, c, dst);
+		if (err)
+			return err;
 	}
 
 	remain_bsize = src->cap - src->len;
@@ -2248,10 +2246,15 @@ static int do_pipe_epoll_out(struct server_wrk *w, struct client_state *c,
 			  sockaddr_to_str(pdst),
 			  w->idx);
 		src->ep_mask |= EPOLLIN;
-		ret = apply_ep_mask(w, c, src);
+		err = apply_ep_mask(w, c, src);
+		if (err)
+			return (ssize_t)err;
 	}
 
-	return ret;
+	if (sock_ret == -EAGAIN)
+		sock_ret = 0;
+
+	return sock_ret;
 }
 
 static int handle_event_client_data(struct server_wrk *w, struct epoll_event *ev)
