@@ -2006,13 +2006,15 @@ static ssize_t do_ep_recv(struct client_endp *ep, size_t max_send_size)
 static ssize_t do_ep_send(struct client_endp *src, struct client_endp *dst,
 			  size_t max_send)
 {
-	size_t len = MIN(src->len, max_send);
+	size_t len = src->len;
 	char *buf = src->buf;
 	ssize_t ret;
 	size_t uret;
 
 	if (!len)
 		return 0;
+	if (max_send < len)
+		return -EAGAIN;
 
 	ret = send(dst->fd, buf, len, MSG_DONTWAIT);
 	if (ret < 0) {
@@ -2101,10 +2103,6 @@ static size_t get_max_send_size(struct client_state *c, enum size_direction dir)
 
 	delta = now - last;
 	fill = ((tkn->max * delta * tkn->fill_intv) / tkn->fill_intv) / tkn->fill_intv;
-
-	if (fill < (100*1024))
-		fill = 0;
-
 	new_tkn = MIN(cur + fill, tkn->max);
 	if (new_tkn > cur) {
 		atomic_store_explicit(&tkn->tkn, new_tkn, memory_order_relaxed);
@@ -2166,6 +2164,9 @@ static ssize_t do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 		err = apply_ep_mask(w, c, src);
 		if (err)
 			return (ssize_t)err;
+
+		sock_ret = 0;
+		goto enable_out_dst;
 	}
 
 	if (dst->ep_mask & EPOLLOUT)
@@ -2277,11 +2278,6 @@ static int handle_event_client_data(struct server_wrk *w, struct epoll_event *ev
 	uint32_t events = ev->events;
 	int ret;
 
-	if (unlikely(events & (EPOLLERR | EPOLLHUP))) {
-		pr_errorv("rhup: Client socket hit EPOLLERR|EPOLLHUP: %s -> %s (thread %u)", sockaddr_to_str(&c->client_ep.addr), sockaddr_to_str(&c->target_ep.addr), w->idx);
-		return -ECONNRESET;
-	}
-
 	if (events & EPOLLIN) {
 		ret = do_pipe_epoll_in(w, c, &c->client_ep, &c->target_ep);
 		if (ret < 0)
@@ -2302,11 +2298,6 @@ static int handle_event_target_data(struct server_wrk *w, struct epoll_event *ev
 	struct client_state *c = GET_EPL_DT(ev->data.u64);
 	uint32_t events = ev->events;
 	int ret;
-
-	if (unlikely(events & (EPOLLERR | EPOLLHUP))) {
-		pr_errorv("thup: Target socket hit EPOLLERR|EPOLLHUP: %s -> %s (thread %u)", sockaddr_to_str(&c->client_ep.addr), sockaddr_to_str(&c->target_ep.addr), w->idx);
-		return -ECONNRESET;
-	}
 
 	if (events & EPOLLIN) {
 		ret = do_pipe_epoll_in(w, c, &c->target_ep, &c->client_ep);
