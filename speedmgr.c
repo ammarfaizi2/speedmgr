@@ -45,7 +45,7 @@
 #define NR_INIT_SPD_BUCKET_ARR	32
 
 #define NR_INIT_RECV_BUF_BYTES	4096
-#define NR_MAX_RECV_BUF_BYTES	(1024 * 1024 * 2)
+#define NR_MAX_RECV_BUF_BYTES	8192
 
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -83,12 +83,20 @@
 #define IP6T_SO_ORIGINAL_DST 80
 #endif
 
-#define g_dbg_level (3)
+#define g_dbg_level (1)
 static volatile bool *g_stop;
 static uint8_t g_verbose;
 
 #ifndef __unused
 #define __unused __attribute__((__unused__))
+#endif
+
+#ifndef atomic_load_relaxed
+#define atomic_load_relaxed(p) atomic_load_explicit(p, memory_order_relaxed)
+#endif
+
+#ifndef atomic_store_relaxed
+#define atomic_store_relaxed(p, v) atomic_store_explicit(p, v, memory_order_relaxed)
 #endif
 
 #if 1
@@ -127,11 +135,11 @@ struct sockaddr_in46 {
 };
 
 struct spd_tkn {
-	_Atomic(uint64_t)	tkn;
-	_Atomic(uint64_t)	last_fill;
-	uint64_t		nr_fill;
-	uint64_t		fill_intv;
-	uint64_t		max;
+	uint64_t	tkn;
+	uint64_t	last_fill;
+	uint64_t	nr_fill;
+	uint64_t	fill_intv;
+	uint64_t	max;
 };
 
 struct ip_spd_bucket {
@@ -1449,6 +1457,14 @@ static void init_ip_spd_bucket(struct ip_spd_bucket *b)
 	memset(b, 0, sizeof(*b));
 }
 
+static uint64_t get_time_us(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
 static struct ip_spd_bucket *get_ip_spd_bucket(struct server_wrk *w,
 					       struct ip_spd_map *map,
 					       const struct sockaddr_in46 *addr)
@@ -1494,14 +1510,19 @@ static struct ip_spd_bucket *get_ip_spd_bucket(struct server_wrk *w,
 		b = NULL;
 	} else {
 		struct server_cfg *cfg = &w->ctx->cfg;
+		uint64_t bonus_init = 1024*1024*1;
+		uint64_t now = get_time_us();
 
 		map->len++;
-		b->dn_tkn.fill_intv = cfg->down_interval;
+
+		b->dn_tkn.fill_intv = cfg->down_interval * 1000;
+		b->up_tkn.fill_intv = cfg->up_interval * 1000;
 		b->dn_tkn.max = cfg->down_limit;
-		b->up_tkn.fill_intv = cfg->up_interval;
 		b->up_tkn.max = cfg->up_limit;
-		atomic_store_explicit(&b->up_tkn.tkn, b->up_tkn.max, memory_order_relaxed);
-		atomic_store_explicit(&b->dn_tkn.tkn, b->dn_tkn.max, memory_order_relaxed);
+		atomic_store_explicit(&b->up_tkn.tkn, b->up_tkn.max + bonus_init, memory_order_relaxed);
+		atomic_store_explicit(&b->dn_tkn.tkn, b->dn_tkn.max + bonus_init, memory_order_relaxed);
+		atomic_store_explicit(&b->up_tkn.last_fill, now, memory_order_relaxed);
+		atomic_store_explicit(&b->dn_tkn.last_fill, now, memory_order_relaxed);
 		atomic_store_explicit(&b->nr_conns, 1u, memory_order_relaxed);
 	}
 
@@ -2015,13 +2036,11 @@ static ssize_t do_ep_send(struct client_endp *src, struct client_endp *dst,
 		return -ECONNRESET;
 
 	uret = (size_t)ret;
-	if (uret < len) {
-		src->len -= uret;
-		memmove(buf, buf + uret, src->len);
-		return ret;
-	}
+	src->len -= uret;
 
-	src->len = 0;
+	if (src->len > 0)
+		memmove(src->buf, src->buf + uret, src->len);
+
 	return ret;
 }
 
@@ -2043,68 +2062,37 @@ enum size_direction {
 	MAX_DN_SIZE
 };
 
-static uint64_t get_time_ns(void)
-{
-	struct timespec ts;
-
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (uint64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
-}
-
-static void ns_to_timespec(uint64_t ns, struct timespec *ts)
-{
-	ts->tv_sec = ns / 1000000000;
-	ts->tv_nsec = ns % 1000000000;
-}
-
-static int arm_timer(struct server_wrk *w)
-{
-	struct itimerspec its;
-	uint64_t now, interval;
-	int ret;
-
-	if (!w->ctx->need_timer)
-		return 0;
-
-	now = get_time_ns();
-	ret = timerfd_settime(w->timer_fd, TFD_TIMER_ABSTIME, &its, NULL);
-	if (ret) {
-		ret = -errno;
-		pr_error("Failed to arm timer: %s", strerror(-ret));
-	}
-
-	return ret;
-}
-
 static size_t get_max_send_size(struct client_state *c, enum size_direction dir)
 {
-	uint64_t cur, last, now, delta, fill, new_tkn;
+	uint64_t cur, now, delta, to_fill;
 	struct ip_spd_bucket *b = c->spd;
-	struct client_endp *src;
 	struct spd_tkn *tkn;
-
-	if (dir == MAX_UP_SIZE) {
-		src = &c->client_ep;
-		tkn = &b->up_tkn;
-	} else {
-		src = &c->target_ep;
-		tkn = &b->dn_tkn;
-	}
 
 	if (!b)
 		return (size_t)~0ull;
 
-	now  = get_time_ns();
-	cur  = atomic_load_explicit(&tkn->tkn, memory_order_relaxed);
-	last = atomic_load_explicit(&tkn->last_fill, memory_order_relaxed);
+	if (dir == MAX_UP_SIZE)
+		tkn = &b->up_tkn;
+	else
+		tkn = &b->dn_tkn;
 
-	delta   = now - last;
-	fill    = (tkn->nr_fill * delta) / tkn->fill_intv;
-	new_tkn = MIN(cur + fill, tkn->max);
-	if (new_tkn != cur) {
-		atomic_store_explicit(&tkn->tkn, new_tkn, memory_order_relaxed);
-		atomic_store_explicit(&tkn->last_fill, now, memory_order_relaxed);
-		cur = new_tkn;
+	if (tkn->max == 0)
+		return 0;
+
+	cur = tkn->tkn;
+	if (cur < tkn->max) {
+		now = get_time_us();
+		delta = now - tkn->last_fill;
+		to_fill = (tkn->max * delta) / tkn->fill_intv;
+
+		if (to_fill) {
+			tkn->last_fill = now;
+			cur += to_fill;
+			if (cur > tkn->max)
+				cur = tkn->max;
+
+			tkn->tkn = cur;
+		}
 	}
 
 	return cur;
@@ -2124,7 +2112,7 @@ static void consume_token(struct client_state *c, enum size_direction dir,
 	else
 		tkn = &b->dn_tkn;
 
-	atomic_fetch_sub(&tkn->tkn, size);
+	tkn->tkn -= size;
 }
 
 static ssize_t do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
