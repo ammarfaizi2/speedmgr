@@ -199,7 +199,7 @@ struct server_wrk {
 	uint32_t		idx;
 	uint32_t		client_arr_size;
 	_Atomic(uint32_t)	nr_online_clients;
-	uint64_t		next_timer_ns;
+	uint64_t		next_timer_us;
 
 	pthread_t		thread;
 	pthread_mutex_t		epass_mutex;	/* When passing a client to another worker */
@@ -1170,7 +1170,7 @@ static int init_timer(struct server_wrk *w)
 	if (ret)
 		return ret;
 
-	w->next_timer_ns = 0;
+	w->next_timer_us = 0;
 	return 0;
 }
 
@@ -2131,6 +2131,91 @@ static void consume_token(struct client_state *c, enum size_direction dir,
 	tkn->tkn -= size;
 }
 
+static void us_to_timespec(uint64_t us, struct timespec *ts)
+{
+	ts->tv_sec = us / 1000000;
+	ts->tv_nsec = (us % 1000000) * 1000;
+}
+
+static int arm_timer(struct server_wrk *w, uint64_t us, uint64_t repeat_intv)
+{
+	uint64_t now, next_fire;
+	struct itimerspec its;
+	int ret;
+
+	if (us == 0)
+		return 0;
+
+	now = get_time_us();
+	next_fire = now + us;
+	if (w->next_timer_us && next_fire >= w->next_timer_us)
+		return 0;
+
+	us_to_timespec(us, &its.it_value);
+	us_to_timespec(repeat_intv, &its.it_interval);
+	ret = timerfd_settime(w->timer_fd, TFD_TIMER_ABSTIME, &its, NULL);
+	if (ret) {
+		ret = -errno;
+		pr_error("Failed to arm timer: %s", strerror(-ret));
+		return ret;
+	}
+
+	w->next_timer_us = next_fire;
+	return 0;
+}
+
+static int disarm_timer(struct server_wrk *w)
+{
+	struct itimerspec its;
+	int ret;
+
+	memset(&its, 0, sizeof(its));
+	ret = timerfd_settime(w->timer_fd, 0, &its, NULL);
+	if (ret) {
+		ret = -errno;
+		pr_error("Failed to disarm timer: %s", strerror(-ret));
+		return ret;
+	}
+
+	w->next_timer_us = 0;
+	return 0;
+}
+
+static int rate_limit(struct server_wrk *w, struct client_state *c,
+		      enum size_direction dir)
+{
+	static const uint64_t to_fill = 10;
+	struct client_endp *ep;
+	struct spd_tkn *tkn;
+	uint64_t delay;
+	int ret;
+
+	if (dir == MAX_UP_SIZE) {
+		ep = &c->target_ep;
+		tkn = &c->spd->up_tkn;
+		c->rate_limit_flags |= RTF_UP_RATE_LIMITED;
+	} else {
+		ep = &c->client_ep;
+		tkn = &c->spd->dn_tkn;
+		c->rate_limit_flags |= RTF_DN_RATE_LIMITED;
+	}
+
+	delay = (to_fill * tkn->fill_intv) / tkn->max;
+	ep->ep_mask &= ~EPOLLOUT;
+	ret = apply_ep_mask(w, c, ep);
+	if (ret)
+		return ret;
+
+	pr_vl_dbg(2, "%s rate limited %s -> %s (fd=%d; thread=%u)",
+		  (dir == MAX_UP_SIZE) ? "Upstream" : "Downstream",
+		  sockaddr_to_str(&c->client_ep.addr),
+		  sockaddr_to_str(&c->target_ep.addr),
+		  ep->fd,
+		  w->idx);
+
+	return arm_timer(w, delay, tkn->fill_intv);
+}
+
 static ssize_t do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 				struct client_endp *src, struct client_endp *dst)
 {
@@ -2168,7 +2253,7 @@ static ssize_t do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 	if (dst == &c->target_ep && !c->target_connected)
 		goto enable_out_dst;
 	if (max_send_size == 0)
-		goto enable_out_dst;
+		return rate_limit(w, c, dir);
 
 	sock_ret = do_ep_send(src, dst, max_send_size);
 	if (sock_ret < 0 && sock_ret != -EAGAIN) {
@@ -2366,7 +2451,41 @@ static int handle_event_target_conn(struct server_wrk *w, struct epoll_event *ev
 
 static int handle_event_timer(struct server_wrk *w)
 {
-	return 0;
+	struct client_state *c;
+	size_t nr_limited = 0;
+	uint32_t i;
+	int ret;
+
+	assert(w->ctx->need_timer);
+
+	pthread_mutex_lock(&w->cl_stack.lock);
+	for (i = 0; i < w->client_arr_size; i++) {
+		c = w->clients[i];
+		if (!c || !c->is_used)
+			continue;
+
+		if (c->rate_limit_flags & RTF_UP_RATE_LIMITED) {
+			nr_limited++;
+			c->target_ep.ep_mask |= EPOLLOUT;
+			ret = apply_ep_mask(w, c, &c->client_ep);
+			if (ret)
+				break;
+		}
+
+		if (c->rate_limit_flags & RTF_DN_RATE_LIMITED) {
+			nr_limited++;
+			c->client_ep.ep_mask |= EPOLLOUT;
+			ret = apply_ep_mask(w, c, &c->client_ep);
+			if (ret)
+				break;
+		}
+	}
+	pthread_mutex_unlock(&w->cl_stack.lock);
+
+	if (nr_limited == 0)
+		ret = disarm_timer(w);
+
+	return ret;
 }
 
 static int handle_event(struct server_wrk *w, struct epoll_event *ev)
