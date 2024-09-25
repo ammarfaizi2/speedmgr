@@ -45,7 +45,7 @@
 #define NR_INIT_SPD_BUCKET_ARR	32
 
 #define NR_INIT_RECV_BUF_BYTES	4096
-#define NR_MAX_RECV_BUF_BYTES	8192
+#define NR_MAX_RECV_BUF_BYTES	(1024*1024*128)
 
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -199,7 +199,7 @@ struct server_wrk {
 	uint32_t		idx;
 	uint32_t		client_arr_size;
 	_Atomic(uint32_t)	nr_online_clients;
-	uint64_t		next_timer_us;
+	uint64_t		next_timer_ms;
 
 	pthread_t		thread;
 	pthread_mutex_t		epass_mutex;	/* When passing a client to another worker */
@@ -271,6 +271,7 @@ static const struct option long_options[] = {
 	{ NULL,			0,			NULL,	0 },
 };
 static const char short_options[] = "hVw:b:t:vB:U:I:D:d:o:";
+static const uint64_t spd_min_fill = 1024*128;
 
 static void show_help(const void *app)
 {
@@ -1170,7 +1171,7 @@ static int init_timer(struct server_wrk *w)
 	if (ret)
 		return ret;
 
-	w->next_timer_us = 0;
+	w->next_timer_ms = 0;
 	return 0;
 }
 
@@ -1381,6 +1382,12 @@ static int init_ctx(struct server_ctx *ctx)
 		return -ret;
 	}
 
+	pr_infov("up_limit=%lu; up_interval=%lu; down_limit=%lu; down_interval=%lu",
+		 cfg->up_limit,
+		 cfg->up_interval,
+		 cfg->down_limit,
+		 cfg->down_interval);
+
 	ret = init_workers(ctx);
 	if (ret) {
 		pthread_mutex_destroy(&ctx->accept_mutex);
@@ -1463,7 +1470,23 @@ static uint64_t get_time_us(void)
 	struct timespec ts;
 
 	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+	return (uint64_t)ts.tv_sec * 1000000 + (uint64_t)ts.tv_nsec / 1000;
+}
+
+static void us_to_timespec(uint64_t ns, struct timespec *ts)
+{
+	ts->tv_sec = ns / 1000000000;
+	ts->tv_nsec = ns % 1000000000;
+}
+
+static void ts_add_us(struct timespec *ts, uint64_t us)
+{
+	ts->tv_sec += us / 1000000;
+	ts->tv_nsec += (us % 1000000) * 1000;
+	if (ts->tv_nsec >= 1000000000) {
+		ts->tv_sec++;
+		ts->tv_nsec -= 1000000000;
+	}
 }
 
 static struct ip_spd_bucket *get_ip_spd_bucket(struct server_ctx *ctx,
@@ -1511,21 +1534,20 @@ static struct ip_spd_bucket *get_ip_spd_bucket(struct server_ctx *ctx,
 		b = NULL;
 	} else {
 		struct server_cfg *cfg = &ctx->cfg;
-		uint64_t bonus_init = 1024*1024*1;
+		uint64_t bonus_init_bytes = 0;
 		uint64_t now = get_time_us();
 
 		map->len++;
-
 		b->nr_conns = 1;
 		b->wrk_idx = -1;
 		b->dn_tkn.fill_intv = cfg->down_interval * 1000;
 		b->up_tkn.fill_intv = cfg->up_interval * 1000;
 		b->dn_tkn.max = cfg->down_limit;
 		b->up_tkn.max = cfg->up_limit;
-		atomic_store_explicit(&b->up_tkn.tkn, b->up_tkn.max + bonus_init, memory_order_relaxed);
-		atomic_store_explicit(&b->dn_tkn.tkn, b->dn_tkn.max + bonus_init, memory_order_relaxed);
-		atomic_store_explicit(&b->up_tkn.last_fill, now, memory_order_relaxed);
-		atomic_store_explicit(&b->dn_tkn.last_fill, now, memory_order_relaxed);
+		b->dn_tkn.last_fill = now;
+		b->up_tkn.last_fill = now;
+		b->dn_tkn.tkn = b->dn_tkn.max + bonus_init_bytes;
+		b->up_tkn.tkn = b->up_tkn.max + bonus_init_bytes;
 	}
 
 	pthread_mutex_unlock(&map->lock);
@@ -1557,8 +1579,6 @@ static void put_ip_spd_bucket(struct ip_spd_map *map, struct sockaddr_in46 *addr
 		map->bucket_arr[idx] = NULL;
 		free(b);
 	}
-
-	printf("put_ip_spd_bucket: %s -> %u\n", sockaddr_to_str(addr), n);
 
 	/*
 	 * Shrink the bucket array if it's too large.
@@ -2073,96 +2093,10 @@ static int apply_ep_mask(struct server_wrk *w, struct client_state *c,
 	return epoll_mod(w->ep_fd, ep->fd, ep->ep_mask, data);
 }
 
-enum size_direction {
-	MAX_UP_SIZE,
-	MAX_DN_SIZE
+enum stream_dir {
+	UP_DIR,
+	DN_DIR
 };
-
-static size_t get_max_send_size(struct client_state *c, enum size_direction dir)
-{
-	uint64_t cur, now, delta, to_fill;
-	struct ip_spd_bucket *b = c->spd;
-	struct spd_tkn *tkn;
-
-	if (!b)
-		return (size_t)~0ull;
-
-	if (dir == MAX_UP_SIZE)
-		tkn = &b->up_tkn;
-	else
-		tkn = &b->dn_tkn;
-
-	if (tkn->max == 0)
-		return 0;
-
-	cur = tkn->tkn;
-	if (cur < tkn->max) {
-		now = get_time_us();
-		delta = now - tkn->last_fill;
-		to_fill = (tkn->max * delta) / tkn->fill_intv;
-
-		if (to_fill) {
-			tkn->last_fill = now;
-			cur += to_fill;
-			if (cur > tkn->max)
-				cur = tkn->max;
-
-			tkn->tkn = cur;
-		}
-	}
-
-	return cur;
-}
-
-static void consume_token(struct client_state *c, enum size_direction dir,
-			  size_t size)
-{
-	struct ip_spd_bucket *b = c->spd;
-	struct spd_tkn *tkn;
-
-	if (!b)
-		return;
-
-	if (dir == MAX_UP_SIZE)
-		tkn = &b->up_tkn;
-	else
-		tkn = &b->dn_tkn;
-
-	tkn->tkn -= size;
-}
-
-static void us_to_timespec(uint64_t us, struct timespec *ts)
-{
-	ts->tv_sec = us / 1000000;
-	ts->tv_nsec = (us % 1000000) * 1000;
-}
-
-static int arm_timer(struct server_wrk *w, uint64_t us, uint64_t repeat_intv)
-{
-	uint64_t now, next_fire;
-	struct itimerspec its;
-	int ret;
-
-	if (us == 0)
-		return 0;
-
-	now = get_time_us();
-	next_fire = now + us;
-	if (w->next_timer_us && next_fire >= w->next_timer_us)
-		return 0;
-
-	us_to_timespec(us, &its.it_value);
-	us_to_timespec(repeat_intv, &its.it_interval);
-	ret = timerfd_settime(w->timer_fd, TFD_TIMER_ABSTIME, &its, NULL);
-	if (ret) {
-		ret = -errno;
-		pr_error("Failed to arm timer: %s", strerror(-ret));
-		return ret;
-	}
-
-	w->next_timer_us = next_fire;
-	return 0;
-}
 
 static int disarm_timer(struct server_wrk *w)
 {
@@ -2174,46 +2108,131 @@ static int disarm_timer(struct server_wrk *w)
 	if (ret) {
 		ret = -errno;
 		pr_error("Failed to disarm timer: %s", strerror(-ret));
+	}
+
+	return ret;
+}
+
+static size_t get_max_send_size(struct client_state *c, enum stream_dir dir)
+{
+	static _Atomic(uint32_t) nr_counter;
+	uint64_t cur, now = 0, delta = 0, to_fill = 0;
+	struct ip_spd_bucket *b = c->spd;
+	struct spd_tkn *tkn;
+
+	if (!b)
+		return (size_t)~0ull;
+
+	if (dir == UP_DIR)
+		tkn = &b->up_tkn;
+	else
+		tkn = &b->dn_tkn;
+
+	if (!tkn->max || !tkn->fill_intv)
+		return (size_t)~0ull;
+
+	cur = tkn->tkn;
+	if (cur < tkn->max) {
+		now = get_time_us();
+		delta = now - tkn->last_fill;
+
+		to_fill = (delta * tkn->max) / tkn->fill_intv;
+		if (to_fill >= spd_min_fill) {
+			cur += to_fill;
+			if (cur > tkn->max)
+				cur = tkn->max;
+
+			tkn->last_fill = now;
+			tkn->tkn = cur;
+		}
+	}
+
+	if ((nr_counter++ % 2) == 0) {
+		pr_vl_dbg(0, "%s: cur=%lu; max=%lu; delta=%lu; to_fill=%lu %s",
+			  (dir == UP_DIR) ? "up" : "dn",
+			  cur,
+			  tkn->max,
+			  delta,
+			  to_fill,
+			  (cur == 0) ? "============================================================" : "");
+	}
+
+	return cur;
+}
+
+static void consume_token(struct client_state *c, enum stream_dir dir,
+			  size_t size)
+{
+	struct ip_spd_bucket *b = c->spd;
+	struct spd_tkn *tkn;
+
+	if (!b)
+		return;
+
+	if (dir == UP_DIR)
+		tkn = &b->up_tkn;
+	else
+		tkn = &b->dn_tkn;
+
+	tkn->tkn -= size;
+}
+
+static int arm_timer(struct server_wrk *w, uint64_t delta_us)
+{
+	struct itimerspec its;
+	struct timespec now;
+	int ret;
+
+	ret = clock_gettime(CLOCK_MONOTONIC, &now);
+	if (ret) {
+		ret = -errno;
+		pr_error("Failed to get current time: %s", strerror(-ret));
 		return ret;
 	}
 
-	w->next_timer_us = 0;
-	return 0;
+	ts_add_us(&now, delta_us);
+	its.it_value = now;
+	its.it_interval.tv_sec = 0;
+	its.it_interval.tv_nsec = 0;
+	ret = timerfd_settime(w->timer_fd, TFD_TIMER_ABSTIME, &its, NULL);
+	if (ret) {
+		ret = -errno;
+		pr_error("Failed to arm timer: %s", strerror(-ret));
+	}
+
+	return ret;
 }
 
-static int rate_limit(struct server_wrk *w, struct client_state *c,
-		      enum size_direction dir)
+static int do_rate_limit(struct server_wrk *w, struct client_state *c,
+			 enum stream_dir dir)
 {
-	static const uint64_t to_fill = 10;
+	struct ip_spd_bucket *b = c->spd;
 	struct client_endp *ep;
 	struct spd_tkn *tkn;
-	uint64_t delay;
+	uint64_t delta_us;
 	int ret;
 
-	if (dir == MAX_UP_SIZE) {
+	assert(b);
+	if (dir == UP_DIR) {
 		ep = &c->target_ep;
-		tkn = &c->spd->up_tkn;
+		tkn = &b->up_tkn;
 		c->rate_limit_flags |= RTF_UP_RATE_LIMITED;
 	} else {
 		ep = &c->client_ep;
-		tkn = &c->spd->dn_tkn;
+		tkn = &b->dn_tkn;
 		c->rate_limit_flags |= RTF_DN_RATE_LIMITED;
 	}
 
-	delay = (to_fill * tkn->fill_intv) / tkn->max;
+	delta_us = (spd_min_fill * tkn->fill_intv) / tkn->max;
+	if (!delta_us)
+		return 0;
+
 	ep->ep_mask &= ~EPOLLOUT;
 	ret = apply_ep_mask(w, c, ep);
 	if (ret)
 		return ret;
 
-	pr_vl_dbg(2, "%s rate limited %s -> %s (fd=%d; thread=%u)",
-		  (dir == MAX_UP_SIZE) ? "Upstream" : "Downstream",
-		  sockaddr_to_str(&c->client_ep.addr),
-		  sockaddr_to_str(&c->target_ep.addr),
-		  ep->fd,
-		  w->idx);
-
-	return arm_timer(w, delay, tkn->fill_intv);
+	return arm_timer(w, delta_us);
 }
 
 static ssize_t do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
@@ -2223,7 +2242,7 @@ static ssize_t do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 	__unused struct sockaddr_in46 *pdst = (dst == &c->client_ep) ? &c->client_ep.addr : &c->target_ep.addr;
 	__unused const char *src_name = (src == &c->client_ep) ? "Client" : "Target";
 	__unused const char *dst_name = (dst == &c->client_ep) ? "Client" : "Target";
-	enum size_direction dir = (src == &c->client_ep) ? MAX_UP_SIZE : MAX_DN_SIZE;
+	enum stream_dir dir = (src == &c->client_ep) ? UP_DIR : DN_DIR;
 	size_t max_send_size = get_max_send_size(c, dir);
 	ssize_t sock_ret;
 	int err;
@@ -2252,8 +2271,8 @@ static ssize_t do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 		return 0;
 	if (dst == &c->target_ep && !c->target_connected)
 		goto enable_out_dst;
-	if (max_send_size == 0)
-		return rate_limit(w, c, dir);
+	if (!max_send_size)
+		return do_rate_limit(w, c, dir);
 
 	sock_ret = do_ep_send(src, dst, max_send_size);
 	if (sock_ret < 0 && sock_ret != -EAGAIN) {
@@ -2296,11 +2315,14 @@ static ssize_t do_pipe_epoll_out(struct server_wrk *w, struct client_state *c,
 	__unused struct sockaddr_in46 *pdst = (dst == &c->client_ep) ? &c->client_ep.addr : &c->target_ep.addr;
 	__unused const char *src_name = (src == &c->client_ep) ? "Client" : "Target";
 	__unused const char *dst_name = (dst == &c->client_ep) ? "Client" : "Target";
-	enum size_direction dir = (src == &c->client_ep) ? MAX_UP_SIZE : MAX_DN_SIZE;
+	enum stream_dir dir = (src == &c->client_ep) ? UP_DIR : DN_DIR;
 	size_t max_send_size = get_max_send_size(c, dir);
 	size_t remain_bsize;
 	ssize_t sock_ret;
 	int err;
+
+	if (!max_send_size)
+		return do_rate_limit(w, c, dir);
 
 	sock_ret = do_ep_send(src, dst, max_send_size);
 	if (sock_ret < 0 && sock_ret != -EAGAIN) {
@@ -2457,7 +2479,6 @@ static int handle_event_timer(struct server_wrk *w)
 	int ret;
 
 	assert(w->ctx->need_timer);
-
 	pthread_mutex_lock(&w->cl_stack.lock);
 	for (i = 0; i < w->client_arr_size; i++) {
 		c = w->clients[i];
@@ -2467,6 +2488,7 @@ static int handle_event_timer(struct server_wrk *w)
 		if (c->rate_limit_flags & RTF_UP_RATE_LIMITED) {
 			nr_limited++;
 			c->target_ep.ep_mask |= EPOLLOUT;
+			c->rate_limit_flags &= ~RTF_UP_RATE_LIMITED;
 			ret = apply_ep_mask(w, c, &c->client_ep);
 			if (ret)
 				break;
@@ -2475,6 +2497,7 @@ static int handle_event_timer(struct server_wrk *w)
 		if (c->rate_limit_flags & RTF_DN_RATE_LIMITED) {
 			nr_limited++;
 			c->client_ep.ep_mask |= EPOLLOUT;
+			c->rate_limit_flags &= ~RTF_DN_RATE_LIMITED;
 			ret = apply_ep_mask(w, c, &c->client_ep);
 			if (ret)
 				break;
