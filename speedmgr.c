@@ -143,10 +143,10 @@ struct spd_tkn {
 };
 
 struct ip_spd_bucket {
-	struct spd_tkn		up_tkn;
-	struct spd_tkn		dn_tkn;
-	_Atomic(uint16_t)	nr_conns;
-	int32_t			wrk_idx;
+	struct spd_tkn	up_tkn;
+	struct spd_tkn	dn_tkn;
+	uint16_t	nr_conns;
+	int32_t		wrk_idx;
 };
 
 struct ip_spd_map {
@@ -1479,8 +1479,8 @@ static struct ip_spd_bucket *get_ip_spd_bucket(struct server_ctx *ctx,
 	pthread_mutex_lock(&map->lock);
 	if (!get_bucket_index(map, addr, &idx)) {
 		b = map->bucket_arr[idx];
+		b->nr_conns++;
 		pthread_mutex_unlock(&map->lock);
-		atomic_fetch_add(&b->nr_conns, 1u);
 		return b;
 	}
 
@@ -1516,6 +1516,7 @@ static struct ip_spd_bucket *get_ip_spd_bucket(struct server_ctx *ctx,
 
 		map->len++;
 
+		b->nr_conns = 1;
 		b->wrk_idx = -1;
 		b->dn_tkn.fill_intv = cfg->down_interval * 1000;
 		b->up_tkn.fill_intv = cfg->up_interval * 1000;
@@ -1525,7 +1526,6 @@ static struct ip_spd_bucket *get_ip_spd_bucket(struct server_ctx *ctx,
 		atomic_store_explicit(&b->dn_tkn.tkn, b->dn_tkn.max + bonus_init, memory_order_relaxed);
 		atomic_store_explicit(&b->up_tkn.last_fill, now, memory_order_relaxed);
 		atomic_store_explicit(&b->dn_tkn.last_fill, now, memory_order_relaxed);
-		atomic_store_explicit(&b->nr_conns, 1u, memory_order_relaxed);
 	}
 
 	pthread_mutex_unlock(&map->lock);
