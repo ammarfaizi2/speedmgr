@@ -146,6 +146,7 @@ struct ip_spd_bucket {
 	struct spd_tkn		up_tkn;
 	struct spd_tkn		dn_tkn;
 	_Atomic(uint16_t)	nr_conns;
+	int32_t			wrk_idx;
 };
 
 struct ip_spd_map {
@@ -1465,7 +1466,7 @@ static uint64_t get_time_us(void)
 	return ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 }
 
-static struct ip_spd_bucket *get_ip_spd_bucket(struct server_wrk *w,
+static struct ip_spd_bucket *get_ip_spd_bucket(struct server_ctx *ctx,
 					       struct ip_spd_map *map,
 					       const struct sockaddr_in46 *addr)
 {
@@ -1509,12 +1510,13 @@ static struct ip_spd_bucket *get_ip_spd_bucket(struct server_wrk *w,
 		free(b);
 		b = NULL;
 	} else {
-		struct server_cfg *cfg = &w->ctx->cfg;
+		struct server_cfg *cfg = &ctx->cfg;
 		uint64_t bonus_init = 1024*1024*1;
 		uint64_t now = get_time_us();
 
 		map->len++;
 
+		b->wrk_idx = -1;
 		b->dn_tkn.fill_intv = cfg->down_interval * 1000;
 		b->up_tkn.fill_intv = cfg->up_interval * 1000;
 		b->dn_tkn.max = cfg->down_limit;
@@ -1692,27 +1694,41 @@ static void put_client_slot_no_epoll(struct server_wrk *w, struct client_state *
 	__put_client_slot(w, c, false, false);
 }
 
-static struct server_wrk *pick_worker_for_new_conn(struct server_ctx *ctx)
+static struct server_wrk *pick_worker_for_new_conn(struct server_ctx *ctx,
+						   struct ip_spd_bucket *b)
 {
-	struct server_wrk *w = NULL;
-	uint32_t i, min;
+	uint32_t i, min, idx = 0;
 
-	w = &ctx->workers[0];
+	if (b) {
+		pthread_mutex_lock(&ctx->spd_map.lock);
+		if (b->wrk_idx >= 0) {
+			pthread_mutex_unlock(&ctx->spd_map.lock);
+			return &ctx->workers[b->wrk_idx];
+		}
+	}
+
 	min = atomic_load(&ctx->workers[0].nr_online_clients);
 	for (i = 1; i < ctx->cfg.nr_workers; i++) {
 		uint32_t nr;
 
 		nr = atomic_load(&ctx->workers[i].nr_online_clients);
-		if (nr < 5)
-			return &ctx->workers[i];
+		if (nr < 5) {
+			idx = i;
+			break;
+		}
 
 		if (nr < min) {
 			min = nr;
-			w = &ctx->workers[i];
+			idx = i;
 		}
 	}
 
-	return w;
+	if (b) {
+		b->wrk_idx = idx;
+		pthread_mutex_unlock(&ctx->spd_map.lock);
+	}
+
+	return &ctx->workers[idx];
 }
 
 static int get_target_addr(struct server_wrk *w, struct client_state *c,
@@ -1867,7 +1883,8 @@ static int give_client_fd_to_a_worker(struct server_ctx *ctx, int fd,
 	struct server_wrk *w;
 	int r;
 
-	w = pick_worker_for_new_conn(ctx);
+	b = get_ip_spd_bucket(ctx, &ctx->spd_map, addr);
+	w = pick_worker_for_new_conn(ctx, b);
 	r = get_client_slot(w, &c);
 	if (r) {
 		close(fd);
@@ -1875,7 +1892,6 @@ static int give_client_fd_to_a_worker(struct server_ctx *ctx, int fd,
 		return -ENOMEM;
 	}
 
-	b = get_ip_spd_bucket(w, &ctx->spd_map, addr);
 	if (b)
 		c->spd = b;
 
