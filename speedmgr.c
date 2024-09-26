@@ -44,8 +44,8 @@
 
 #define NR_INIT_SPD_BUCKET_ARR	32
 
-#define NR_INIT_RECV_BUF_BYTES	2048
-#define NR_MAX_RECV_BUF_BYTES	4096
+#define NR_INIT_RECV_BUF_BYTES	1600
+#define NR_MAX_RECV_BUF_BYTES	2048
 
 #include <stdatomic.h>
 #include <stdbool.h>
