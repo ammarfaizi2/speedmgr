@@ -208,6 +208,7 @@ struct server_wrk {
 	struct client_state	**clients;
 	struct stack_u32	cl_stack;
 
+	uint16_t		nr_zero_limited;
 	bool			handle_events_should_stop;
 	bool			timer_is_armed;
 	struct epoll_event	events[NR_EPOLL_EVENTS];
@@ -373,7 +374,7 @@ static int parse_args(int argc, char *argv[], struct server_cfg *cfg)
 		bool got_down_interval;
 	} p;
 
-	cfg->backlog = 300;
+	cfg->backlog = 4096;
 	cfg->nr_workers = 4;
 	cfg->verbose = 0;
 
@@ -1173,6 +1174,7 @@ static int init_timer(struct server_wrk *w)
 		return ret;
 
 	memset(&w->next_timer_fire, 0, sizeof(w->next_timer_fire));
+	w->nr_zero_limited = 0;
 	return 0;
 }
 
@@ -2520,8 +2522,8 @@ static int handle_event_target_conn(struct server_wrk *w, struct epoll_event *ev
 			return ret;
 		}
 	}
-
 	pthread_mutex_unlock(&w->epass_mutex);
+
 	pr_infov("conn: %s -> %s (fd=%d; tfd=%d; thread=%u)",
 		 sockaddr_to_str(&c->client_ep.addr),
 		 sockaddr_to_str(&c->target_ep.addr),
@@ -2562,26 +2564,34 @@ static int handle_event_timer(struct server_wrk *w)
 
 		if (c->rate_limit_flags & RTF_UP_RATE_LIMITED) {
 			nr_limited++;
-			c->target_ep.ep_mask |= EPOLLOUT;
-			c->rate_limit_flags &= ~RTF_UP_RATE_LIMITED;
-			ret = apply_ep_mask(w, c, &c->target_ep);
-			if (ret)
-				break;
+			if (get_max_send_size(c, UP_DIR)) {
+				c->target_ep.ep_mask |= EPOLLOUT;
+				c->rate_limit_flags &= ~RTF_UP_RATE_LIMITED;
+				ret = apply_ep_mask(w, c, &c->target_ep);
+				if (ret)
+					break;
+			}
 		}
 
 		if (c->rate_limit_flags & RTF_DN_RATE_LIMITED) {
 			nr_limited++;
-			c->client_ep.ep_mask |= EPOLLOUT;
-			c->rate_limit_flags &= ~RTF_DN_RATE_LIMITED;
-			ret = apply_ep_mask(w, c, &c->client_ep);
-			if (ret)
-				break;
+			if (get_max_send_size(c, DN_DIR)) {
+				c->client_ep.ep_mask |= EPOLLOUT;
+				c->rate_limit_flags &= ~RTF_DN_RATE_LIMITED;
+				ret = apply_ep_mask(w, c, &c->client_ep);
+				if (ret)
+					break;
+			}
 		}
 	}
 	pthread_mutex_unlock(&w->cl_stack.lock);
 
-	if (nr_limited == 0)
-		ret = disarm_timer(w);
+	if (nr_limited == 0) {
+		if (++w->nr_zero_limited > 1024)
+			ret = disarm_timer(w);
+	} else {
+		w->nr_zero_limited = 0;
+	}
 
 	return ret;
 }
