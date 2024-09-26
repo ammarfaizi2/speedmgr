@@ -2597,7 +2597,6 @@ static int handle_event(struct server_wrk *w, struct epoll_event *ev,
 		ret = consume_event_fd(w);
 		break;
 	case EPL_EV_TCP_ACCEPT:
-		ret = 0;
 		*has_event_accept = true;
 		break;
 	case EPL_EV_TCP_CLIENT_DATA:
@@ -2613,7 +2612,6 @@ static int handle_event(struct server_wrk *w, struct epoll_event *ev,
 			ret = handle_event_target_conn(w, ev);
 		break;
 	case EPL_EV_TIMERFD:
-		ret = 0;
 		*has_event_timer = true;
 		break;
 	default:
