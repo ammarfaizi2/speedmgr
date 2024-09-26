@@ -1,9 +1,9 @@
 
 CC = gcc
 CXX = g++
-CFLAGS = -Wall -Wextra -ggdb3 -O0 -std=c99
-CXXFLAGS = -Wall -Wextra -ggdb3 -O0 -std=c++14
-LDFLAGS = -ggdb -O0
+CFLAGS = -Wall -Wextra -ggdb3 -Os -std=c99
+CXXFLAGS = -Wall -Wextra -ggdb3 -Os -std=c++14
+LDFLAGS = -ggdb -Os
 LIBS = -lpthread
 
 TARGET := speedmgr

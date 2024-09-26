@@ -1989,7 +1989,7 @@ do_accept:
 
 	ret = give_client_fd_to_a_worker(w->ctx, ret, &addr);
 	if (ret)
-		return ret;
+		return 0;
 
 	if (++counter < NR_MAX_ACCEPT_CYCLE)
 		goto do_accept;
