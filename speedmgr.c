@@ -2550,8 +2550,8 @@ static int handle_event_timer(struct server_wrk *w)
 {
 	struct client_state *c;
 	size_t nr_limited = 0;
+	int ret = 0;
 	uint32_t i;
-	int ret;
 
 	assert(w->ctx->need_timer);
 
