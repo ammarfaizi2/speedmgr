@@ -272,7 +272,7 @@ static const struct option long_options[] = {
 	{ NULL,			0,			NULL,	0 },
 };
 static const char short_options[] = "hVw:b:t:vB:U:I:D:d:o:";
-static const uint64_t spd_min_fill = 1024;
+static const uint64_t spd_min_fill = 1024*128;
 
 static void show_help(const void *app)
 {
@@ -1861,7 +1861,7 @@ static int prepare_target_connect(struct server_wrk *w, struct client_state *c)
 	if (ret) {
 		ret = errno;
 		if (ret != EINPROGRESS) {
-			pr_error("Failed to connect to target: %s", strerror(ret));
+			pr_error("Failed to connect to target %s: %s", sockaddr_to_str(&taddr), strerror(ret));
 			close(fd);
 			return -ret;
 		}
@@ -1960,7 +1960,7 @@ static int set_optional_sockopt(int fd)
 
 static int handle_event_accept(struct server_wrk *w)
 {
-	static const uint32_t NR_MAX_ACCEPT_CYCLE = 32;
+	static const uint32_t NR_MAX_ACCEPT_CYCLE = 4;
 	struct server_ctx *ctx = w->ctx;
 	struct sockaddr_in46 addr;
 	uint32_t counter = 0;
@@ -2112,7 +2112,6 @@ enum stream_dir {
 
 static size_t get_max_send_size(struct client_state *c, enum stream_dir dir)
 {
-	static _Atomic(uint32_t) nr_counter;
 	uint64_t cur, now = 0, delta = 0, to_fill = 0;
 	struct ip_spd_bucket *b = c->spd;
 	struct spd_tkn *tkn;
@@ -2144,7 +2143,7 @@ static size_t get_max_send_size(struct client_state *c, enum stream_dir dir)
 		}
 	}
 
-	return cur;
+	return cur / b->nr_conns;
 }
 
 static void consume_token(struct client_state *c, enum stream_dir dir,
@@ -2321,7 +2320,11 @@ static ssize_t do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 		return 0;
 	if (dst == &c->target_ep && !c->target_connected)
 		goto enable_out_dst;
-	if (max_send_size == 0)
+	if (dir == UP_DIR && (c->rate_limit_flags & RTF_UP_RATE_LIMITED))
+		return 0;
+	if (dir == DN_DIR && (c->rate_limit_flags & RTF_DN_RATE_LIMITED))
+		return 0;
+	if (!max_send_size)
 		return do_rate_limit(w, c, dir);
 
 	sock_ret = do_ep_send(src, dst, max_send_size);
@@ -2342,6 +2345,11 @@ static ssize_t do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 
 enable_out_dst:
 	if (src->len > 0) {
+		if (dir == UP_DIR && (c->rate_limit_flags & RTF_UP_RATE_LIMITED))
+			return 0;
+		if (dir == DN_DIR && (c->rate_limit_flags & RTF_DN_RATE_LIMITED))
+			return 0;
+
 		pr_vl_dbg(3, "Enabling  EPOLLOUT on dst=%s (fd=%d; psrc=%s; pdst=%s; thread=%u)",
 			  dst_name,
 			  dst->fd,
@@ -2578,7 +2586,8 @@ static int handle_event_timer(struct server_wrk *w)
 	return ret;
 }
 
-static int handle_event(struct server_wrk *w, struct epoll_event *ev)
+static int handle_event(struct server_wrk *w, struct epoll_event *ev,
+			bool *has_event_timer, bool *has_event_accept)
 {
 	uint64_t evt = GET_EPL_EV(ev->data.u64);
 	int ret = 0;
@@ -2588,19 +2597,24 @@ static int handle_event(struct server_wrk *w, struct epoll_event *ev)
 		ret = consume_event_fd(w);
 		break;
 	case EPL_EV_TCP_ACCEPT:
-		ret = handle_event_accept(w);
+		ret = 0;
+		*has_event_accept = true;
 		break;
 	case EPL_EV_TCP_CLIENT_DATA:
-		ret = handle_event_client_data(w, ev);
+		if (!w->handle_events_should_stop)
+			ret = handle_event_client_data(w, ev);
 		break;
 	case EPL_EV_TCP_TARGET_DATA:
-		ret = handle_event_target_data(w, ev);
+		if (!w->handle_events_should_stop)
+			ret = handle_event_target_data(w, ev);
 		break;
 	case EPL_EV_TCP_TARGET_CONN:
-		ret = handle_event_target_conn(w, ev);
+		if (!w->handle_events_should_stop)
+			ret = handle_event_target_conn(w, ev);
 		break;
 	case EPL_EV_TIMERFD:
-		ret = handle_event_timer(w);
+		ret = 0;
+		*has_event_timer = true;
 		break;
 	default:
 		pr_error("Unknown event type: %lu (thread %u)", evt, w->idx);
@@ -2625,17 +2639,33 @@ static int handle_event(struct server_wrk *w, struct epoll_event *ev)
 
 static int handle_events(struct server_wrk *w, int nr_events)
 {
+	/*
+	 * Accept and timer are low priority. They are handled after all
+	 * other client events are processed.
+	 */
+	bool has_event_timer = false;
+	bool has_event_accept = false;
 	int ret = 0;
 	int i;
 
 	for (i = 0; i < nr_events; i++) {
 		struct epoll_event *ev = &w->events[i];
 
-		ret = handle_event(w, ev);
+		ret = handle_event(w, ev, &has_event_timer, &has_event_accept);
 		if (ret < 0)
 			break;
-		if (w->handle_events_should_stop)
-			break;
+	}
+
+	if (has_event_timer) {
+		ret = handle_event_timer(w);
+		if (ret)
+			return ret;
+	}
+
+	if (has_event_accept) {
+		ret = handle_event_accept(w);
+		if (ret)
+			return ret;
 	}
 
 	return ret;
