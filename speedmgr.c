@@ -44,8 +44,8 @@
 
 #define NR_INIT_SPD_BUCKET_ARR	32
 
-#define NR_INIT_RECV_BUF_BYTES	4096
-#define NR_MAX_RECV_BUF_BYTES	(1024*1024*128)
+#define NR_INIT_RECV_BUF_BYTES	2048
+#define NR_MAX_RECV_BUF_BYTES	4096
 
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -199,7 +199,8 @@ struct server_wrk {
 	uint32_t		idx;
 	uint32_t		client_arr_size;
 	_Atomic(uint32_t)	nr_online_clients;
-	uint64_t		next_timer_ms;
+	struct timespec		next_timer_fire;
+	struct timespec		next_intv;
 
 	pthread_t		thread;
 	pthread_mutex_t		epass_mutex;	/* When passing a client to another worker */
@@ -271,7 +272,7 @@ static const struct option long_options[] = {
 	{ NULL,			0,			NULL,	0 },
 };
 static const char short_options[] = "hVw:b:t:vB:U:I:D:d:o:";
-static const uint64_t spd_min_fill = 1024*128;
+static const uint64_t spd_min_fill = 1024;
 
 static void show_help(const void *app)
 {
@@ -1171,7 +1172,7 @@ static int init_timer(struct server_wrk *w)
 	if (ret)
 		return ret;
 
-	w->next_timer_ms = 0;
+	memset(&w->next_timer_fire, 0, sizeof(w->next_timer_fire));
 	return 0;
 }
 
@@ -1994,35 +1995,46 @@ do_accept:
 	return 0;
 }
 
+static int resize_buffer_if_needed(struct client_endp *ep)
+{
+	size_t new_cap;
+	char *new_buf;
+
+	if (ep->len < ep->cap)
+		return 0;
+
+	if (ep->cap == 0)
+		new_cap = NR_INIT_RECV_BUF_BYTES;
+	else
+		new_cap = (ep->cap * 2u) + 1u;
+
+	new_cap = MIN(new_cap, NR_MAX_RECV_BUF_BYTES);
+	if (new_cap <= NR_MAX_RECV_BUF_BYTES) {
+		new_buf = realloc(ep->buf, new_cap);
+		if (!new_buf) {
+			if (ep->cap > 0)
+				return -ENOBUFS;
+
+			pr_error("Failed to realloc receive buffer: %s", strerror(ENOMEM));
+			return -ENOMEM;
+		}
+
+		ep->buf = new_buf;
+		ep->cap = new_cap;
+	}
+
+	return 0;
+}
+
 static ssize_t do_ep_recv(struct client_endp *ep)
 {
 	ssize_t ret;
 	size_t len;
 	char *buf;
 
-	if (ep->len == ep->cap) {
-		size_t new_cap;
-		char *tmp;
-
-		if (ep->cap == 0)
-			new_cap = NR_INIT_RECV_BUF_BYTES;
-		else
-			new_cap = (ep->cap * 2u) + 1u;
-
-		new_cap = MIN(new_cap, NR_MAX_RECV_BUF_BYTES);
-		if (new_cap <= NR_MAX_RECV_BUF_BYTES) {
-			tmp = realloc(ep->buf, new_cap);
-			if (!tmp) {
-				if (ep->cap > 0)
-					return -ENOBUFS;
-				pr_error("Failed to realloc receive buffer: %s", strerror(ENOMEM));
-				return -ENOMEM;
-			}
-
-			ep->buf = tmp;
-			ep->cap = new_cap;
-		}
-	}
+	ret = resize_buffer_if_needed(ep);
+	if (ret)
+		return ret;
 
 	assert(ep->len <= ep->cap);
 	assert(ep->buf);
@@ -2098,21 +2110,6 @@ enum stream_dir {
 	DN_DIR
 };
 
-static int disarm_timer(struct server_wrk *w)
-{
-	struct itimerspec its;
-	int ret;
-
-	memset(&its, 0, sizeof(its));
-	ret = timerfd_settime(w->timer_fd, 0, &its, NULL);
-	if (ret) {
-		ret = -errno;
-		pr_error("Failed to disarm timer: %s", strerror(-ret));
-	}
-
-	return ret;
-}
-
 static size_t get_max_send_size(struct client_state *c, enum stream_dir dir)
 {
 	static _Atomic(uint32_t) nr_counter;
@@ -2147,16 +2144,6 @@ static size_t get_max_send_size(struct client_state *c, enum stream_dir dir)
 		}
 	}
 
-	if ((nr_counter++ % 2) == 0) {
-		pr_vl_dbg(0, "%s: cur=%lu; max=%lu; delta=%lu; to_fill=%lu %s",
-			  (dir == UP_DIR) ? "up" : "dn",
-			  cur,
-			  tkn->max,
-			  delta,
-			  to_fill,
-			  (cur == 0) ? "============================================================" : "");
-	}
-
 	return cur;
 }
 
@@ -2177,10 +2164,31 @@ static void consume_token(struct client_state *c, enum stream_dir dir,
 	tkn->tkn -= size;
 }
 
+static int timespec_cmp(const struct timespec *a, const struct timespec *b)
+{
+	if (a->tv_sec < b->tv_sec)
+		return -1;
+	if (a->tv_sec > b->tv_sec)
+		return 1;
+
+	if (a->tv_nsec < b->tv_nsec)
+		return -1;
+	if (a->tv_nsec > b->tv_nsec)
+		return 1;
+
+	return 0;
+}
+
+static int timespec_non_zero(const struct timespec *ts)
+{
+	return ts->tv_sec | ts->tv_nsec;
+}
+
 static int arm_timer(struct server_wrk *w, uint64_t delta_us)
 {
+	struct timespec *next = &w->next_timer_fire;
+	struct timespec now, next_intv;
 	struct itimerspec its;
-	struct timespec now;
 	int ret;
 
 	ret = clock_gettime(CLOCK_MONOTONIC, &now);
@@ -2191,13 +2199,39 @@ static int arm_timer(struct server_wrk *w, uint64_t delta_us)
 	}
 
 	ts_add_us(&now, delta_us);
+
+	/*
+	 * If next_timer_fire is smaller than @now, skip arming the timer.
+	 */
+	if (timespec_non_zero(next) && timespec_cmp(next, &now) < 0)
+		return 0;
+
+	us_to_timespec(delta_us, &next_intv);
+
+	w->next_timer_fire = now;
+	w->next_intv = next_intv;
 	its.it_value = now;
-	its.it_interval.tv_sec = 0;
-	its.it_interval.tv_nsec = 0;
+	its.it_interval = next_intv;
 	ret = timerfd_settime(w->timer_fd, TFD_TIMER_ABSTIME, &its, NULL);
 	if (ret) {
 		ret = -errno;
 		pr_error("Failed to arm timer: %s", strerror(-ret));
+	}
+
+	return ret;
+}
+
+static int disarm_timer(struct server_wrk *w)
+{
+	struct itimerspec its;
+	int ret;
+
+	memset(&its, 0, sizeof(its));
+	memset(&w->next_timer_fire, 0, sizeof(w->next_timer_fire));
+	ret = timerfd_settime(w->timer_fd, 0, &its, NULL);
+	if (ret) {
+		ret = -errno;
+		pr_error("Failed to disarm timer: %s", strerror(-ret));
 	}
 
 	return ret;
@@ -2214,10 +2248,16 @@ static int do_rate_limit(struct server_wrk *w, struct client_state *c,
 
 	assert(b);
 	if (dir == UP_DIR) {
+		if (c->rate_limit_flags & RTF_UP_RATE_LIMITED)
+			return 0;
+
 		ep = &c->target_ep;
 		tkn = &b->up_tkn;
 		c->rate_limit_flags |= RTF_UP_RATE_LIMITED;
 	} else {
+		if (c->rate_limit_flags & RTF_DN_RATE_LIMITED)
+			return 0;
+
 		ep = &c->client_ep;
 		tkn = &b->dn_tkn;
 		c->rate_limit_flags |= RTF_DN_RATE_LIMITED;
@@ -2251,9 +2291,15 @@ static ssize_t do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 	if (sock_ret < 0) {
 		if (sock_ret == -EAGAIN)
 			return 0;
+
 		if (sock_ret != -ENOBUFS)
 			return sock_ret;
 
+		/*
+		 * The receive buffer is full. Disable EPOLLIN on the source
+		 * endpoint. Also, enable EPOLLOUT on the destination endpoint
+		 * to drain the buffer.
+		 */
 		pr_vl_dbg(3, "Disabling EPOLLIN on src=%s (fd=%d; psrc=%s; pdst=%s; thread=%u)",
 			  src_name,
 			  src->fd,
@@ -2261,17 +2307,21 @@ static ssize_t do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 			  sockaddr_to_str(pdst),
 			  w->idx);
 
+		assert(src->len > 0);
 		src->ep_mask &= ~EPOLLIN;
 		err = apply_ep_mask(w, c, src);
 		if (err)
 			return (ssize_t)err;
+
+		sock_ret = 0;
+		goto enable_out_dst;
 	}
 
 	if (dst->ep_mask & EPOLLOUT)
 		return 0;
 	if (dst == &c->target_ep && !c->target_connected)
 		goto enable_out_dst;
-	if (!max_send_size)
+	if (max_send_size == 0)
 		return do_rate_limit(w, c, dir);
 
 	sock_ret = do_ep_send(src, dst, max_send_size);
@@ -2304,6 +2354,9 @@ enable_out_dst:
 		if (err)
 			return (ssize_t)err;
 	}
+
+	if (sock_ret == -EAGAIN)
+		sock_ret = 0;
 
 	return sock_ret;
 }
@@ -2471,6 +2524,18 @@ static int handle_event_target_conn(struct server_wrk *w, struct epoll_event *ev
 	return 0;
 }
 
+static int timespec_add(struct timespec *a, const struct timespec *b)
+{
+	a->tv_sec += b->tv_sec;
+	a->tv_nsec += b->tv_nsec;
+	if (a->tv_nsec >= 1000000000) {
+		a->tv_sec++;
+		a->tv_nsec -= 1000000000;
+	}
+
+	return 0;
+}
+
 static int handle_event_timer(struct server_wrk *w)
 {
 	struct client_state *c;
@@ -2479,6 +2544,8 @@ static int handle_event_timer(struct server_wrk *w)
 	int ret;
 
 	assert(w->ctx->need_timer);
+
+	timespec_add(&w->next_timer_fire, &w->next_intv);
 	pthread_mutex_lock(&w->cl_stack.lock);
 	for (i = 0; i < w->client_arr_size; i++) {
 		c = w->clients[i];
@@ -2489,7 +2556,7 @@ static int handle_event_timer(struct server_wrk *w)
 			nr_limited++;
 			c->target_ep.ep_mask |= EPOLLOUT;
 			c->rate_limit_flags &= ~RTF_UP_RATE_LIMITED;
-			ret = apply_ep_mask(w, c, &c->client_ep);
+			ret = apply_ep_mask(w, c, &c->target_ep);
 			if (ret)
 				break;
 		}
