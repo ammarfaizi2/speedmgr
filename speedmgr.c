@@ -44,8 +44,8 @@
 
 #define NR_INIT_SPD_BUCKET_ARR	32
 
-#define NR_INIT_RECV_BUF_BYTES	1600
-#define NR_MAX_RECV_BUF_BYTES	2048
+#define NR_INIT_RECV_BUF_BYTES	4096
+#define NR_MAX_RECV_BUF_BYTES	8192
 
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -273,7 +273,7 @@ static const struct option long_options[] = {
 	{ NULL,			0,			NULL,	0 },
 };
 static const char short_options[] = "hVw:b:t:vB:U:I:D:d:o:";
-static const uint64_t spd_min_fill = 1024*128;
+static const uint64_t spd_min_fill = 1024*32;
 
 static void show_help(const void *app)
 {
@@ -1582,21 +1582,6 @@ static void put_ip_spd_bucket(struct ip_spd_map *map, struct sockaddr_in46 *addr
 		map->bucket_arr[idx] = NULL;
 		free(b);
 	}
-
-	/*
-	 * Shrink the bucket array if it's too large.
-	 */
-	if ((map->cap - map->len) > 32) {
-		struct ip_spd_bucket **new_arr;
-		size_t new_cap = map->len;
-
-		new_arr = realloc(map->bucket_arr, new_cap * sizeof(*new_arr));
-		if (new_arr) {
-			map->bucket_arr = new_arr;
-			map->cap = new_cap;
-		}
-	}
-
 	pthread_mutex_unlock(&map->lock);
 }
 
