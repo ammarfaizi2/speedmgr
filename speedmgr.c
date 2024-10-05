@@ -1,10 +1,40 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
 /*
- * For tproxy:
- *    sudo ./speedmgr -w 1 -b [::]:4444 -t [::]:0 -U 1M -I 1000 -D 1M -d 1000 -o 1111;
- *    sudo iptables -t nat -I OUTPUT -p tcp -j REDIRECT --to-ports 4444;
- *    sudo iptables -t nat -I OUTPUT -m mark --mark 1111 -j ACCEPT;
+ *
+ * Copyright (C) 2024  Ammar Faizi <ammarfaizi2@gnuweeb.org>
+ *
+ * speedmgr - A simple speed manager for Linux.
+ * 
+ * Key features:
+ *   - Raw TCP proxy.
+ *   - Speed limit.
+ *   - socks5 proxy.
+ * 
+ * # Run transparent TCP proxy:
+ *    sudo ./speedmgr -b [::]:4444 -t [::]:0 -o 1111;
+ *
+ * # Run transparent TCP proxy with speed limit (upload 5MB/s, download 5MB/s; note that 5MB/s = 40Mbps):
+ *    sudo ./speedmgr -b [::]:4444 -t [::]:0 -U 1M -I 1000 -D 1M -d 1000 -o 1111 -U 5M -I 1s -D 5M -d 1s;
+ *
+ * # iptables settings for local transparent proxy:
+ *    sudo iptables -t nat -I OUTPUT -p tcp -m mark ! --mark 1111 -j REDIRECT --to-ports 4444;
+ *
+ * # iptables settings for gateway transparent proxy (as a router):
+ *    sudo iptables -t nat -I PREROUTING -p tcp -m mark ! --mark 1111 -j REDIRECT --to-ports 4444;
+ * 
+ * # Delete iptables rules:
+ *    sudo iptables -t nat -D OUTPUT -p tcp -m mark ! --mark 1111 -j REDIRECT --to-ports 4444;
+ *    sudo iptables -t nat -D PREROUTING -p tcp -m mark ! --mark 1111 -j REDIRECT --to-ports 4444;
+ *
+ * # Run socks5 proxy (no root required):
+ *    ./speedmgr -b [::]:4444 -S;
+ *
+ * # Run socks5 proxy with username and password:
+ *    SPEEDMGR_SOCKS5_USER=user SPEEDMGR_SOCKS5_PASS=pass ./speedmgr -b [::]:4444 -S;
+ *
+ * The socks5 proxy also supports speed limit.
+ *
  */
 
 #ifndef _GNU_SOURCE
@@ -562,7 +592,7 @@ static int parse_args(int argc, char *argv[], struct server_cfg *cfg)
 		return -EINVAL;
 	}
 
-	if (!p.got_target_addr) {
+	if (!cfg->as_socks5 && !p.got_target_addr) {
 		pr_error("Missing target address (the -t option)");
 		show_help(argv[0]);
 		return -EINVAL;
