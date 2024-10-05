@@ -2973,9 +2973,110 @@ static int evaluate_socks5_init(struct server_wrk *w, struct client_state *c)
 	}
 }
 
+static int send_socks5_auth_res(struct client_state *c, int code)
+{
+	uint8_t buf[2] = { 0x01, code };
+	ssize_t ret;
+
+	errno = 0;
+	ret = send(c->client_ep.fd, buf, sizeof(buf), MSG_DONTWAIT);
+	if (ret == sizeof(buf))
+		return 0;
+
+	pr_errorv("Failed to send SOCKS5 invalid authentication response: %s: send(): %zd", strerror(errno), ret);
+	return -EIO;
+}
+
+/*
+ *   This begins with the client producing a Username/Password request:
+ *
+ *           +----+------+----------+------+----------+
+ *           |VER | ULEN |  UNAME   | PLEN |  PASSWD  |
+ *           +----+------+----------+------+----------+
+ *           | 1  |  1   | 1 to 255 |  1   | 1 to 255 |
+ *           +----+------+----------+------+----------+
+ *
+ *   The VER field contains the current version of the subnegotiation,
+ *   which is X'01'. The ULEN field contains the length of the UNAME field
+ *   that follows. The UNAME field contains the username as known to the
+ *   source operating system. The PLEN field contains the length of the
+ *   PASSWD field that follows. The PASSWD field contains the password
+ *   association with the given UNAME.
+ *
+ *   The server verifies the supplied UNAME and PASSWD, and sends the
+ *   following response:
+ *
+ *                        +----+--------+
+ *                        |VER | STATUS |
+ *                        +----+--------+
+ *                        | 1  |   1    |
+ *                        +----+--------+
+ *
+ *   A STATUS field of X'00' indicates success. If the server returns a
+ *   `failure' (STATUS value other than X'00') status, it MUST close the
+ *   connection.
+ */
 static int evaluate_socks5_auth(struct server_wrk *w, struct client_state *c)
 {
-	return 0;
+	const char *suname = w->ctx->cfg.socks5_user;
+	const char *spasswd = w->ctx->cfg.socks5_pass;
+	size_t suname_len, spasswd_len;
+
+	struct socks5_data *sd = c->socks5;
+	size_t len = sd->len, expected_len;
+	uint8_t *buf = (uint8_t *)sd->buf;
+	uint8_t ulen, plen, *uname, *passwd;
+
+	assert(suname);
+	assert(spasswd);
+
+	if (len < 2)
+		return -EAGAIN;
+
+	if (buf[0] != 0x01) {
+		pr_errorv("Invalid SOCKS5 authentication version: %u", buf[0]);
+		return -EINVAL;
+	}
+
+	ulen = buf[1];
+	expected_len = 2 + ulen; /* VER + ULEN + UNAME */
+	if (len < expected_len)
+		return -EAGAIN;
+
+	expected_len += 1; /* PLEN */
+	if (len < expected_len)
+		return -EAGAIN;
+
+	plen = buf[2 + ulen];
+	expected_len += plen; /* PASSWD */
+	if (len < expected_len)
+		return -EAGAIN;
+
+	if (len > expected_len) {
+		pr_errorv("Invalid SOCKS5 authentication message length: %zu", len);
+		return -EINVAL;
+	}
+
+	uname = buf + 2;
+	passwd = buf + 3 + ulen;
+	suname_len = strlen(suname);
+	spasswd_len = strlen(spasswd);
+
+	if (ulen != suname_len || memcmp(uname, suname, suname_len)) {
+		pr_errorv("Invalid SOCKS5 username: %.*s", ulen, uname);
+		send_socks5_auth_res(c, 1);
+		return -EPERM;
+	}
+
+	if (plen != spasswd_len || memcmp(passwd, spasswd, spasswd_len)) {
+		pr_errorv("Invalid SOCKS5 password: %.*s", plen, passwd);
+		send_socks5_auth_res(c, 2);
+		return -EPERM;
+	}
+
+	sd->state = SOCKS5_STATE_REQ;
+	sd->len = 0;
+	return send_socks5_auth_res(c, 0);
 }
 
 /*
