@@ -45,7 +45,7 @@
 #define NR_INIT_SPD_BUCKET_ARR	32
 
 #define NR_INIT_RECV_BUF_BYTES	4096
-#define NR_MAX_RECV_BUF_BYTES	8192
+#define NR_MAX_RECV_BUF_BYTES	4096
 
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -171,10 +171,51 @@ enum {
 	RTF_DN_RATE_LIMITED	= (1u << 1u),
 };
 
+enum {
+	SOCKS5_STATE_INIT	= 0,
+	SOCKS5_STATE_AUTH	= 1,
+	SOCKS5_STATE_REQ	= 2,
+	SOCKS5_STATE_SPLICE	= 3,
+};
+
+enum {
+	SOCKS5_AUTH_NONE	= 0x00,
+	SOCKS5_AUTH_GSSAPI	= 0x01,
+	SOCKS5_AUTH_USERPASS	= 0x02,
+	SOCKS5_AUTH_NOACCEPT	= 0xff,
+};
+
+enum {
+	SOCKS5_CMD_CONNECT	= 0x01,
+	SOCKS5_CMD_BIND		= 0x02,
+	SOCKS5_CMD_UDP_ASSOC	= 0x03,
+};
+
+enum {
+	SOCKS5_ATYP_IPV4	= 0x01,
+	SOCKS5_ATYP_DOMAIN	= 0x03,
+	SOCKS5_ATYP_IPV6	= 0x04,
+};
+
+struct socks5_data {
+	uint8_t			state;
+	uint8_t			auth_method;
+	char			*buf;
+	size_t			len;
+	size_t			cap;
+	uint8_t			atyp;
+	union {
+		uint8_t		ipv4[4];
+		uint8_t		ipv6[16];
+	};
+	uint16_t		port;
+};
+
 struct client_state {
 	struct client_endp	client_ep;
 	struct client_endp	target_ep;
 	struct ip_spd_bucket	*spd;
+	struct socks5_data	*socks5;
 	uint32_t		idx;
 	uint8_t			rate_limit_flags;
 	bool			target_connected;
@@ -219,6 +260,7 @@ struct server_wrk {
  */
 struct server_cfg {
 	uint8_t			verbose;
+	uint8_t			as_socks5;
 	int			backlog;
 	uint32_t		nr_workers;
 	uint32_t		out_mark;
@@ -228,6 +270,8 @@ struct server_cfg {
 	uint64_t		down_interval;
 	struct sockaddr_in46	bind_addr;
 	struct sockaddr_in46	target_addr;
+	const char		*socks5_user;
+	const char		*socks5_pass;
 };
 
 /*
@@ -245,12 +289,14 @@ struct server_ctx {
 };
 
 enum {
-	EPL_EV_EVENTFD		= (0x0001ull << 48ull),
-	EPL_EV_TCP_ACCEPT	= (0x0002ull << 48ull),
-	EPL_EV_TCP_CLIENT_DATA	= (0x0003ull << 48ull),
-	EPL_EV_TCP_TARGET_DATA	= (0x0004ull << 48ull),
-	EPL_EV_TCP_TARGET_CONN	= (0x0005ull << 48ull),
-	EPL_EV_TIMERFD		= (0x0006ull << 48ull)
+	EPL_EV_EVENTFD			= (0x0001ull << 48ull),
+	EPL_EV_TCP_ACCEPT		= (0x0002ull << 48ull),
+	EPL_EV_TCP_CLIENT_DATA		= (0x0003ull << 48ull),
+	EPL_EV_TCP_TARGET_DATA		= (0x0004ull << 48ull),
+	EPL_EV_TCP_TARGET_CONN		= (0x0005ull << 48ull),
+	EPL_EV_TIMERFD			= (0x0006ull << 48ull),
+	EPL_EV_TCP_CLIENT_SOCKS5	= (0x0007ull << 48ull),
+	EPL_EV_TCP_TARGET_SOCKS5_CONN	= (0x0008ull << 48ull),
 };
 
 #define EPL_EV_MASK		(0xffffull << 48ull)
@@ -270,9 +316,10 @@ static const struct option long_options[] = {
 	{ "down-limit",		required_argument,	NULL,	'D' },
 	{ "down-interval",	required_argument,	NULL,	'd' },
 	{ "out-mark",		required_argument,	NULL,	'o' },
+	{ "as-socks5",		no_argument,		NULL,	'S' },
 	{ NULL,			0,			NULL,	0 },
 };
-static const char short_options[] = "hVw:b:t:vB:U:I:D:d:o:";
+static const char short_options[] = "hVw:b:t:vB:U:I:D:d:o:S";
 static const uint64_t spd_min_fill = 1024*32;
 
 static void show_help(const void *app)
@@ -291,6 +338,7 @@ static void show_help(const void *app)
 	printf("  -D, --down-limit=NUM\t\tDownload speed limit (bytes)\n");
 	printf("  -d, --down-interval=NUM\tDownload fill interval (seconds)\n");
 	printf("  -o, --out-mark=NUM\t\tOutgoing connection packet mark\n");
+	printf("  -S, --as-socks5\t\tUse as a SOCKS5 proxy server\n");
 }
 
 static int parse_addr_and_port(const char *str, struct sockaddr_in46 *out)
@@ -498,6 +546,9 @@ static int parse_args(int argc, char *argv[], struct server_cfg *cfg)
 				return -EINVAL;
 			}
 			break;
+		case 'S':
+			cfg->as_socks5 = 1;
+			break;
 		case '?':
 			return -EINVAL;
 		default:
@@ -529,6 +580,8 @@ static int parse_args(int argc, char *argv[], struct server_cfg *cfg)
 		return -EINVAL;
 	}
 
+	cfg->socks5_user = getenv("SPEEDMGR_SOCKS5_USER");
+	cfg->socks5_pass = getenv("SPEEDMGR_SOCKS5_PASS");
 	return 0;
 }
 
@@ -839,6 +892,7 @@ static void init_client_state(struct client_state *c)
 	init_client_ep(&c->client_ep);
 	init_client_ep(&c->target_ep);
 	c->spd = NULL;
+	c->socks5 = NULL;
 	c->rate_limit_flags = 0;
 	c->target_connected = false;
 	c->is_used = false;
@@ -881,6 +935,37 @@ static void reset_client_ep(struct client_endp *ep, bool preserve_buf,
 	memset(&ep->addr, 0, sizeof(ep->addr));
 }
 
+static struct socks5_data *alloc_socks5_data(void)
+{
+	struct socks5_data *sd;
+
+	sd = malloc(sizeof(*sd));
+	if (!sd)
+		return NULL;
+
+	sd->len = 0;
+	sd->cap = 2048;
+	sd->state = SOCKS5_STATE_INIT;
+	sd->buf = malloc(sd->cap);
+	if (!sd->buf) {
+		free(sd);
+		return NULL;
+	}
+
+	return sd;
+}
+
+static void free_socks5_data(struct socks5_data *sd)
+{
+	if (!sd)
+		return;
+
+	if (sd->buf)
+		free(sd->buf);
+
+	free(sd);
+}
+
 static void reset_client_state(struct client_state *c, bool preserve_buf,
 			       size_t max_preserve)
 {
@@ -896,6 +981,11 @@ static void reset_client_state(struct client_state *c, bool preserve_buf,
 
 	reset_client_ep(&c->client_ep, preserve_buf, max_preserve);
 	reset_client_ep(&c->target_ep, preserve_buf, max_preserve);
+
+	if (c->socks5) {
+		free_socks5_data(c->socks5);
+		c->socks5 = NULL;
+	}
 
 	c->spd = NULL;
 	c->rate_limit_flags = 0;
@@ -1610,6 +1700,7 @@ static int get_client_slot(struct server_wrk *w, struct client_state **c)
 
 	assert(!t->is_used);
 	assert(!t->spd);
+	assert(!t->socks5);
 	assert(t->client_ep.fd < 0);
 	assert(t->client_ep.len == 0);
 	assert(t->target_ep.fd < 0);
@@ -1792,7 +1883,31 @@ static inline void set_epoll_data(union epoll_data *data, struct client_state *c
 	data->u64 |= ev_mask;
 }
 
-static int prepare_target_connect(struct server_wrk *w, struct client_state *c)
+static int get_target_addr_socks5(struct client_state *c, struct sockaddr_in46 *addr)
+{
+	struct socks5_data *sd = c->socks5;
+
+	assert(sd);
+	assert(sd->state == SOCKS5_STATE_REQ);
+
+	if (sd->atyp == SOCKS5_ATYP_IPV4) {
+		addr->sa.sa_family = AF_INET;
+		addr->in4.sin_port = sd->port;
+		memcpy(&addr->in4.sin_addr, sd->ipv4, sizeof(addr->in4.sin_addr));
+	} else if (sd->atyp == SOCKS5_ATYP_IPV6) {
+		addr->sa.sa_family = AF_INET6;
+		addr->in6.sin6_port = sd->port;
+		memcpy(&addr->in6.sin6_addr, sd->ipv6, sizeof(addr->in6.sin6_addr));
+	} else {
+		pr_errorv("Invalid SOCKS5 ATYP: %u", sd->atyp);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int prepare_target_connect(struct server_wrk *w, struct client_state *c,
+				  bool for_socks5)
 {
 	struct sockaddr_in46 taddr;
 	union epoll_data data;
@@ -1800,7 +1915,11 @@ static int prepare_target_connect(struct server_wrk *w, struct client_state *c)
 	int fd, ret;
 
 	memset(&taddr, 0, sizeof(taddr));
-	ret = get_target_addr(w, c, &taddr);
+	if (for_socks5)
+		ret = get_target_addr_socks5(c, &taddr);
+	else
+		ret = get_target_addr(w, c, &taddr);
+
 	if (ret)
 		return ret;
 
@@ -1856,28 +1975,54 @@ static int prepare_target_connect(struct server_wrk *w, struct client_state *c)
 
 	pthread_mutex_lock(&w->epass_mutex);
 	c->target_ep.ep_mask = EPOLLOUT;
-	set_epoll_data(&data, c, EPL_EV_TCP_TARGET_CONN);
-	ret = epoll_add(w->ep_fd, c->target_ep.fd, c->target_ep.ep_mask, data);
-	if (ret) {
-		pthread_mutex_unlock(&w->epass_mutex);
-		close(c->target_ep.fd);
-		c->target_ep.fd = -1;
-		return ret;
-	}
+	if (for_socks5)
+		set_epoll_data(&data, c, EPL_EV_TCP_TARGET_SOCKS5_CONN);
+	else
+		set_epoll_data(&data, c, EPL_EV_TCP_TARGET_CONN);
 
-	c->client_ep.ep_mask = EPOLLIN;
-	set_epoll_data(&data, c, EPL_EV_TCP_CLIENT_DATA);
-	ret = epoll_add(w->ep_fd, c->client_ep.fd, c->client_ep.ep_mask, data);
-	if (ret) {
-		pthread_mutex_unlock(&w->epass_mutex);
-		close(c->target_ep.fd);
-		c->target_ep.fd = -1;
-		return ret;
+	ret = epoll_add(w->ep_fd, c->target_ep.fd, c->target_ep.ep_mask, data);
+	if (ret)
+		goto out_epoll_err;
+
+	if (!for_socks5) {
+		c->client_ep.ep_mask = EPOLLIN;
+		set_epoll_data(&data, c, EPL_EV_TCP_CLIENT_DATA);
+		ret = epoll_add(w->ep_fd, c->client_ep.fd, c->client_ep.ep_mask, data);
+		if (ret)
+			goto out_epoll_err;
+
+		send_event_fd(w);
 	}
-	send_event_fd(w);
 	pthread_mutex_unlock(&w->epass_mutex);
 	atomic_fetch_add(&w->nr_online_clients, 1u);
 	return 0;
+
+out_epoll_err:
+	pthread_mutex_unlock(&w->epass_mutex);
+	close(c->target_ep.fd);
+	c->target_ep.fd = -1;
+	return ret;
+}
+
+static int prepare_socks5_handshake(struct server_wrk *w, struct client_state *c)
+{
+	union epoll_data data;
+	int ret;
+
+	c->socks5 = alloc_socks5_data();
+	if (!c->socks5) {
+		pr_error("Failed to allocate SOCKS5 data");
+		return -ENOMEM;
+	}
+
+	c->client_ep.ep_mask = EPOLLIN;
+	set_epoll_data(&data, c, EPL_EV_TCP_CLIENT_SOCKS5);
+	pthread_mutex_lock(&w->epass_mutex);
+	ret = epoll_add(w->ep_fd, c->client_ep.fd, c->client_ep.ep_mask, data);
+	if (!ret)
+		send_event_fd(w);
+	pthread_mutex_unlock(&w->epass_mutex);
+	return ret;
 }
 
 /*
@@ -1905,7 +2050,11 @@ static int give_client_fd_to_a_worker(struct server_ctx *ctx, int fd,
 
 	c->client_ep.fd = fd;
 	c->client_ep.addr = *addr;
-	r = prepare_target_connect(w, c);
+	if (ctx->cfg.as_socks5)
+		r = prepare_socks5_handshake(w, c);
+	else
+		r = prepare_target_connect(w, c, false);
+
 	if (r) {
 		put_client_slot_no_epoll(w, c);
 		return r;
@@ -2473,6 +2622,134 @@ static int handle_event_target_data(struct server_wrk *w, struct epoll_event *ev
 	return 0;
 }
 
+/*
+ *
+ *   The server evaluates the request, and returns a reply formed as follows:
+ *
+ *        +----+-----+-------+------+----------+----------+
+ *        |VER | REP |  RSV  | ATYP | BND.ADDR | BND.PORT |
+ *        +----+-----+-------+------+----------+----------+
+ *        | 1  |  1  | X'00' |  1   | Variable |    2     |
+ *        +----+-----+-------+------+----------+----------+
+ *
+ *     Where:
+ *
+ *          o  VER    protocol version: X'05'
+ *          o  REP    Reply field:
+ *             o  X'00' succeeded
+ *             o  X'01' general SOCKS server failure
+ *             o  X'02' connection not allowed by ruleset
+ *             o  X'03' Network unreachable
+ *             o  X'04' Host unreachable
+ *             o  X'05' Connection refused
+ *             o  X'06' TTL expired
+ *             o  X'07' Command not supported
+ *             o  X'08' Address type not supported
+ *             o  X'09' to X'FF' unassigned
+ *          o  RSV    RESERVED
+ *          o  ATYP   address type of following address
+ *             o  IP V4 address: X'01'
+ *             o  DOMAINNAME: X'03'
+ *             o  IP V6 address: X'04'
+ *          o  BND.ADDR       server bound address
+ *          o  BND.PORT       server bound port in network octet order
+ *
+ *   Fields marked RESERVED (RSV) must be set to X'00'.
+ */
+static int respond_socks5_request(struct server_wrk *w, struct client_state *c, int err)
+{
+	uint8_t buf[1 + 1 + 1 + 1 + 16 + 2];
+	struct socks5_data *sd = c->socks5;
+	union epoll_data data;
+	size_t len = 0;
+	ssize_t ret;
+
+	buf[0] = 0x05; /* VER */
+	len++;
+
+	/* REP */
+	len++;
+	switch (err) {
+	case 0:
+		/* Succeeded. */
+		buf[1] = 0x00;
+		break;
+	case EPERM:
+	case EACCES:
+		/* Connection not allowed by ruleset. */
+		buf[1] = 0x02;
+		break;
+	case ENETUNREACH:
+		/* Network unreachable. */
+		buf[1] = 0x03;
+		break;
+	case EHOSTUNREACH:
+		/* Host unreachable. */
+		buf[1] = 0x04;
+		break;
+	case ECONNREFUSED:
+		/* Connection refused. */
+		buf[1] = 0x05;
+		break;
+	default:
+		/* General SOCKS server failure. */
+		buf[1] = 0x01;
+		break;
+	}
+
+	buf[2] = 0x00; /* RSV */
+	len++;
+
+	buf[3] = sd->atyp; /* ATYP */
+	len++;
+
+	switch (sd->atyp) {
+	case SOCKS5_ATYP_IPV4:
+		memcpy(buf + 4, sd->ipv4, 4);
+		memcpy(buf + 8, &sd->port, 2);
+		len += 6;
+		break;
+	case SOCKS5_ATYP_IPV6:
+		memcpy(buf + 4, sd->ipv6, 16);
+		memcpy(buf + 20, &sd->port, 2);
+		len += 18;
+		break;
+	default:
+		pr_errorv("Invalid SOCKS5 ATYP: %u", sd->atyp);
+		return -EINVAL;
+	}
+
+	ret = send(c->client_ep.fd, buf, len, MSG_DONTWAIT);
+	if ((size_t)ret != len) {
+		pr_errorv("Failed to send SOCKS5 response: %s: send(): %zd", strerror(errno), ret);
+		return -ECONNRESET;
+	}
+
+	if (err)
+		return -err;
+
+	free_socks5_data(sd);
+	c->socks5 = NULL;
+
+	pthread_mutex_lock(&w->epass_mutex);
+	c->client_ep.ep_mask = EPOLLIN;
+	set_epoll_data(&data, c, EPL_EV_TCP_CLIENT_DATA);
+	ret = epoll_mod(w->ep_fd, c->client_ep.fd, c->client_ep.ep_mask, data);
+	if (ret)
+		goto out;
+
+	c->target_ep.ep_mask = EPOLLIN;
+	set_epoll_data(&data, c, EPL_EV_TCP_TARGET_DATA);
+	ret = epoll_mod(w->ep_fd, c->target_ep.fd, c->target_ep.ep_mask, data);
+	if (ret)
+		goto out;
+	
+	send_event_fd(w);
+out:
+	pthread_mutex_unlock(&w->epass_mutex);
+	return ret;
+}
+
 static int handle_event_target_conn(struct server_wrk *w, struct epoll_event *ev)
 {
 	struct client_state *c = GET_EPL_DT(ev->data.u64);
@@ -2487,27 +2764,37 @@ static int handle_event_target_conn(struct server_wrk *w, struct epoll_event *ev
 		if (tmp < 0)
 			tmp = -tmp;
 		pr_error("Connect error: %s: %s", sockaddr_to_str(&c->target_ep.addr), strerror(tmp));
+
+		if (c->socks5) {
+			ret = respond_socks5_request(w, c, tmp);
+			if (ret)
+				return ret;
+		}
 		return -ECONNRESET;
 	}
 
-	pthread_mutex_lock(&w->epass_mutex);
-	c->target_connected = true;
-	c->target_ep.ep_mask |= EPOLLIN;
-	ret = apply_ep_mask(w, c, &c->target_ep);
-	if (ret) {
-		pthread_mutex_unlock(&w->epass_mutex);
-		return ret;
-	}
-
-	if (!(c->client_ep.ep_mask & EPOLLIN)) {
-		c->client_ep.ep_mask |= EPOLLIN;
-		ret = apply_ep_mask(w, c, &c->client_ep);
+	if (c->socks5) {
+		ret = respond_socks5_request(w, c, 0);
+	} else {
+		pthread_mutex_lock(&w->epass_mutex);
+		c->target_connected = true;
+		c->target_ep.ep_mask |= EPOLLIN;
+		ret = apply_ep_mask(w, c, &c->target_ep);
 		if (ret) {
 			pthread_mutex_unlock(&w->epass_mutex);
 			return ret;
 		}
+
+		if (!(c->client_ep.ep_mask & EPOLLIN)) {
+			c->client_ep.ep_mask |= EPOLLIN;
+			ret = apply_ep_mask(w, c, &c->client_ep);
+			if (ret) {
+				pthread_mutex_unlock(&w->epass_mutex);
+				return ret;
+			}
+		}
+		pthread_mutex_unlock(&w->epass_mutex);
 	}
-	pthread_mutex_unlock(&w->epass_mutex);
 
 	pr_infov("conn: %s -> %s (fd=%d; tfd=%d; thread=%u)",
 		 sockaddr_to_str(&c->client_ep.addr),
@@ -2516,7 +2803,7 @@ static int handle_event_target_conn(struct server_wrk *w, struct epoll_event *ev
 		 c->target_ep.fd,
 		 w->idx);
 
-	return 0;
+	return ret;
 }
 
 static int timespec_add(struct timespec *a, const struct timespec *b)
@@ -2581,6 +2868,258 @@ static int handle_event_timer(struct server_wrk *w)
 	return ret;
 }
 
+static int send_socks5_auth_method(struct client_state *c)
+{
+	char buf[2] = { 0x05, c->socks5->auth_method };
+	ssize_t ret;
+
+	errno = 0;
+	ret = send(c->client_ep.fd, buf, sizeof(buf), MSG_DONTWAIT);
+	if (ret != sizeof(buf)) {
+		/*
+		 * Don't bother checking for EAGAIN or EINTR here.
+		 * Just drop the client if we can't just send 2 bytes.
+		 */
+		pr_errorv("Failed to send SOCKS5 authentication method: %s: send(): %zd", strerror(errno), ret);
+		return -ECONNRESET;
+	}
+
+	return 0;
+}
+
+static int evaluate_socks5_init(struct server_wrk *w, struct client_state *c)
+{
+	uint8_t nr_methods, *methods, expected_method;
+	struct socks5_data *sd = c->socks5;
+	size_t len = sd->len, expected_len;
+	char *buf = sd->buf;
+
+	if (len < 2)
+		return -EAGAIN;
+
+	if (buf[0] != 0x05) {
+		pr_errorv("Invalid SOCKS5 version: %u", buf[0]);
+		return -EINVAL;
+	}
+
+	nr_methods = buf[1];
+	expected_len = (size_t)(nr_methods + 2);
+	if (len < expected_len) {
+		/*
+		 * We have not received all methods yet.
+		 * Wait for more data.
+		 */
+		return -EAGAIN;
+	}
+
+	if (len > expected_len) {
+		pr_errorv("Invalid SOCKS5 method negotiation message length: %zu", len);
+		return -EINVAL;
+	}
+
+	assert(len == expected_len);
+
+	if (w->ctx->cfg.socks5_user && w->ctx->cfg.socks5_pass)
+		expected_method = SOCKS5_AUTH_USERPASS;
+	else
+		expected_method = SOCKS5_AUTH_NONE;
+
+	methods = (uint8_t *)(buf + 2);
+	sd->len = 0;
+
+	if (memchr(methods, expected_method, nr_methods)) {
+		if (expected_method == SOCKS5_AUTH_USERPASS)
+			sd->state = SOCKS5_STATE_AUTH;
+		else
+			sd->state = SOCKS5_STATE_REQ;
+
+		sd->auth_method = expected_method;
+		return send_socks5_auth_method(c);
+	} else {
+		pr_errorv("Unsupported SOCKS5 authentication method: %u", expected_method);
+		sd->auth_method = SOCKS5_AUTH_NOACCEPT;
+		send_socks5_auth_method(c);
+		return -EINVAL;
+	}
+}
+
+static int evaluate_socks5_auth(struct server_wrk *w, struct client_state *c)
+{
+	return 0;
+}
+
+/*
+ *   The SOCKS request is formed as follows:
+ *
+ *        +----+-----+-------+------+----------+----------+
+ *        |VER | CMD |  RSV  | ATYP | DST.ADDR | DST.PORT |
+ *        +----+-----+-------+------+----------+----------+
+ *        | 1  |  1  | X'00' |  1   | Variable |    2     |
+ *        +----+-----+-------+------+----------+----------+
+ *
+ *     Where:
+ *
+ *          o  VER    protocol version: X'05'
+ *          o  CMD
+ *             o  CONNECT X'01'
+ *             o  BIND X'02'
+ *             o  UDP ASSOCIATE X'03'
+ *          o  RSV    RESERVED
+ *          o  ATYP   address type of following address
+ *             o  IP V4 address: X'01'
+ *             o  DOMAINNAME: X'03'
+ *             o  IP V6 address: X'04'
+ *          o  DST.ADDR       desired destination address
+ *          o  DST.PORT desired destination port in network octet
+ *             order
+ *
+ *   The SOCKS server will typically evaluate the request based on source
+ *   and destination addresses, and return one or more reply messages, as
+ *   appropriate for the request type.
+ */
+static int evaluate_socks5_req(struct server_wrk *w, struct client_state *c)
+{
+	struct socks5_data *sd = c->socks5;
+	size_t len = sd->len, expected_len = 4;
+	uint8_t *buf = (uint8_t *)sd->buf;
+
+	if (buf[0] != 0x05) {
+		pr_errorv("Invalid SOCKS5 version: %u", buf[0]);
+		return -EINVAL;
+	}
+
+	if (len < expected_len)
+		return -EAGAIN;
+
+	if (buf[1] != 0x01) {
+		/*
+		 * Currently, we only support CONNECT command.
+		 */
+		pr_errorv("Unsupported SOCKS5 command: %u", buf[1]);
+		return -EINVAL;
+	}
+
+	if (buf[2] != 0x00) {
+		pr_errorv("Invalid SOCKS5 reserved byte: %u", buf[2]);
+		return -EINVAL;
+	}
+
+	switch (buf[3]) {
+	case SOCKS5_ATYP_IPV4:
+		expected_len += 4 + 2;
+		break;
+	case SOCKS5_ATYP_DOMAIN:
+		expected_len += 1;
+		break;
+	case SOCKS5_ATYP_IPV6:
+		expected_len += 16 + 2;
+		break;
+	default:
+		pr_errorv("Invalid SOCKS5 address type: %u", buf[3]);
+		return -EINVAL;
+	}
+
+	if (len < expected_len)
+		return -EAGAIN;
+
+	if (len > expected_len) {
+		pr_errorv("Invalid SOCKS5 request message length: %zu", len);
+		return -EINVAL;
+	}
+
+	switch (buf[3]) {
+	case SOCKS5_ATYP_IPV4:
+		sd->atyp = SOCKS5_ATYP_IPV4;
+		memcpy(&sd->ipv4, buf + 4, 4);
+		memcpy(&sd->port, buf + 8, 2);
+		break;
+	case SOCKS5_ATYP_DOMAIN:
+		/*
+		 * To be implemented.
+		 */
+		return -ENOSYS;
+	case SOCKS5_ATYP_IPV6:
+		sd->atyp = SOCKS5_ATYP_IPV6;
+		memcpy(&sd->ipv6, buf + 4, 16);
+		memcpy(&sd->port, buf + 20, 2);
+		break;
+	}
+
+	sd->len = 0;
+	return prepare_target_connect(w, c, true);
+}
+
+static int evaluate_socks5_data(struct server_wrk *w, struct client_state *c)
+{
+	switch (c->socks5->state) {
+	case SOCKS5_STATE_INIT:
+		return evaluate_socks5_init(w, c);
+	case SOCKS5_STATE_AUTH:
+		return evaluate_socks5_auth(w, c);
+	case SOCKS5_STATE_REQ:
+		return evaluate_socks5_req(w, c);
+	default:
+		pr_error("Unknown SOCKS5 state: %u", c->socks5->state);
+		assert(0);
+		return -EINVAL;
+	}
+}
+
+static int handle_event_client_socks5_in(struct server_wrk *w, struct client_state *c)
+{
+	struct socks5_data *sd = c->socks5;
+	ssize_t ret;
+	size_t len;
+	char *buf;
+
+	buf = sd->buf + sd->len;
+	len = sd->cap - sd->len;
+	if (len == 0)
+		return -ENOBUFS;
+
+	ret = recv(c->client_ep.fd, buf, len, MSG_DONTWAIT);
+	if (ret < 0) {
+		ret = -errno;
+		if (ret == -EAGAIN || ret == -EINTR)
+			return 0;
+
+		return ret;
+	}
+
+	if (ret == 0)
+		return -ECONNRESET;
+
+	sd->len += (size_t)ret;
+
+	ret = evaluate_socks5_data(w, c);
+	if (ret == -EAGAIN)
+		ret = 0;
+
+	return ret;
+}
+
+static int handle_event_client_socks5(struct server_wrk *w, struct epoll_event *ev)
+{
+	struct client_state *c = GET_EPL_DT(ev->data.u64);
+	uint32_t events = ev->events;
+	int ret;
+
+	if (unlikely(events & (EPOLLERR | EPOLLHUP))) {
+		pr_errorv("shup: Client socket hit EPOLLERR|EPOLLHUP: %s -> %s (thread %u)", sockaddr_to_str(&c->client_ep.addr), sockaddr_to_str(&c->target_ep.addr), w->idx);
+		return -ECONNRESET;
+	}
+
+	assert(!(events & EPOLLOUT));
+
+	if (events & EPOLLIN) {
+		ret = handle_event_client_socks5_in(w, c);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
 static int handle_event(struct server_wrk *w, struct epoll_event *ev,
 			bool *has_event_timer, bool *has_event_accept)
 {
@@ -2603,11 +3142,16 @@ static int handle_event(struct server_wrk *w, struct epoll_event *ev,
 			ret = handle_event_target_data(w, ev);
 		break;
 	case EPL_EV_TCP_TARGET_CONN:
+	case EPL_EV_TCP_TARGET_SOCKS5_CONN:
 		if (!w->handle_events_should_stop)
 			ret = handle_event_target_conn(w, ev);
 		break;
 	case EPL_EV_TIMERFD:
 		*has_event_timer = true;
+		break;
+	case EPL_EV_TCP_CLIENT_SOCKS5:
+		if (!w->handle_events_should_stop)
+			ret = handle_event_client_socks5(w, ev);
 		break;
 	default:
 		pr_error("Unknown event type: %lu (thread %u)", evt, w->idx);
@@ -2617,6 +3161,7 @@ static int handle_event(struct server_wrk *w, struct epoll_event *ev,
 	if (ret < 0) {
 		switch (evt) {
 		case EPL_EV_TCP_TARGET_CONN:
+		case EPL_EV_TCP_TARGET_SOCKS5_CONN:
 		case EPL_EV_TCP_CLIENT_DATA:
 		case EPL_EV_TCP_TARGET_DATA:
 			put_client_slot(w, GET_EPL_DT(ev->data.u64));
