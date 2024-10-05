@@ -3295,6 +3295,7 @@ static int handle_event(struct server_wrk *w, struct epoll_event *ev,
 		case EPL_EV_TCP_TARGET_SOCKS5_CONN:
 		case EPL_EV_TCP_CLIENT_DATA:
 		case EPL_EV_TCP_TARGET_DATA:
+		case EPL_EV_TCP_CLIENT_SOCKS5:
 			put_client_slot(w, GET_EPL_DT(ev->data.u64));
 			ret = 0;
 			break;
