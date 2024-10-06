@@ -74,8 +74,8 @@
 
 #define NR_INIT_SPD_BUCKET_ARR	32
 
-#define NR_INIT_RECV_BUF_BYTES	4096
-#define NR_MAX_RECV_BUF_BYTES	4096
+#define NR_INIT_RECV_BUF_BYTES	2048
+#define NR_MAX_RECV_BUF_BYTES	2048
 
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -102,6 +102,7 @@
 #include <getopt.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sched.h>
 #include <netdb.h>
 
 #include "ht.h"
@@ -391,7 +392,7 @@ static const struct option long_options[] = {
 	{ NULL,			0,			NULL,	0 },
 };
 static const char short_options[] = "hVw:b:t:vB:U:I:D:d:o:S";
-static const uint64_t spd_min_fill = 1024*32;
+static const uint64_t spd_min_fill = 1024*8;
 
 static void show_help(const void *app)
 {
@@ -3723,6 +3724,18 @@ static int poll_events(struct server_wrk *w)
 	return ret;
 }
 
+static void pin_cpu(int n)
+{
+	cpu_set_t cpuset;
+
+	CPU_ZERO(&cpuset);
+	CPU_SET(n, &cpuset);
+	if (n > 0)
+		pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+	else
+		sched_setaffinity(0, sizeof(cpuset), &cpuset);
+}
+
 static void *worker_entry(void *arg)
 {
 	struct server_wrk *w = arg;
@@ -3730,6 +3743,7 @@ static void *worker_entry(void *arg)
 	int ret = 0;
 	void *ptr;
 
+	pin_cpu(w->idx);
 	while (!ctx->should_stop) {
 		ret = poll_events(w);
 		if (ret < 0)
