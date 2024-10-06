@@ -3783,7 +3783,7 @@ static void resolve_dns_query(struct dns_query *dq, bool skip_resolve)
 	bool is_client_freed;
 	int ret;
 
-	const struct addrinfo hints = {
+	static const struct addrinfo hints = {
 		.ai_family = AF_UNSPEC,
 		.ai_socktype = SOCK_STREAM,
 		.ai_protocol = IPPROTO_TCP,
