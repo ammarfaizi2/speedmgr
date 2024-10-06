@@ -1562,6 +1562,14 @@ static int init_dns_resolver(struct server_ctx *ctx)
 	struct dns_resolver *dr;
 	int ret;
 
+	/*
+	 * Only needed for SOCKS5.
+	 */
+	if (!ctx->cfg.as_socks5) {
+		ctx->dns_resolver = NULL;
+		return 0;
+	}
+
 	dr = calloc(1, sizeof(*dr));
 	if (!dr)
 		return -ENOMEM;
