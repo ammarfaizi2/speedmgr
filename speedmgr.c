@@ -102,6 +102,7 @@
 #include <getopt.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <netdb.h>
 
 #include "ht.h"
 
@@ -237,8 +238,10 @@ struct socks5_data {
 	union {
 		uint8_t		ipv4[4];
 		uint8_t		ipv6[16];
+		uint8_t		domain[256];
 	};
 	uint16_t		port;
+	int			dns_notify_fd;
 };
 
 struct client_state {
@@ -246,6 +249,7 @@ struct client_state {
 	struct client_endp	target_ep;
 	struct ip_spd_bucket	*spd;
 	struct socks5_data	*socks5;
+	struct dns_query	*dq;
 	uint32_t		idx;
 	uint8_t			rate_limit_flags;
 	bool			target_connected;
@@ -304,6 +308,41 @@ struct server_cfg {
 	const char		*socks5_pass;
 };
 
+struct dns_query {
+	char			*domain;
+	pthread_mutex_t		lock;
+	struct sockaddr_in46	resolved;	/* Filled by the DNS resolver thread. */
+	int			err;		/* Filled by the DNS resolver thread. */
+	int			notify_fd;	/* Used to notify that the query has been resolved. */
+	uint16_t		port;
+
+	bool			is_client_freed;
+	bool			is_resolving;
+};
+
+struct dns_resolver;
+
+struct dns_resolver_worker {
+	struct dns_resolver	*dr;
+	pthread_t		thread;
+	struct dns_query	*cur_query;
+};
+
+struct dns_resolver {
+	struct server_ctx		*ctx;
+
+	pthread_cond_t			cond;
+	pthread_mutex_t			lock;
+	struct dns_query		**queues;
+	struct dns_resolver_worker	*workers;
+	size_t				qcap;
+	size_t				qhead;
+	size_t				qtail;
+
+	uint16_t			nr_dns_resolvers;
+	volatile bool			need_signal;
+};
+
 /*
  * Server context.
  */
@@ -316,6 +355,7 @@ struct server_ctx {
 	struct server_cfg	cfg;
 	struct ip_spd_map	spd_map;
 	pthread_mutex_t		accept_mutex;
+	struct dns_resolver	*dns_resolver;
 };
 
 enum {
@@ -327,6 +367,7 @@ enum {
 	EPL_EV_TIMERFD			= (0x0006ull << 48ull),
 	EPL_EV_TCP_CLIENT_SOCKS5	= (0x0007ull << 48ull),
 	EPL_EV_TCP_TARGET_SOCKS5_CONN	= (0x0008ull << 48ull),
+	EPL_EV_DNS_RESOLUTION		= (0x0009ull << 48ull),
 };
 
 #define EPL_EV_MASK		(0xffffull << 48ull)
@@ -1369,22 +1410,27 @@ out_err:
 	return ret;
 }
 
-static int send_event_fd(struct server_wrk *w)
+static int __send_event_fd(int fd)
 {
 	uint64_t val = 1;
 	int ret;
 
-	ret = write(w->ev_fd, &val, sizeof(val));
+	ret = write(fd, &val, sizeof(val));
 	if (ret != sizeof(val)) {
 		ret = errno;
 		if (ret == EAGAIN)
 			return 0;
 
-		pr_error("Failed to write to event FD: %s (thread %u)", strerror(ret), w->idx);
+		pr_error("Failed to write to event FD: %s", strerror(ret));
 		return -ret;
 	}
 
 	return 0;
+}
+
+static int send_event_fd(struct server_wrk *w)
+{
+	return __send_event_fd(w->ev_fd);
 }
 
 static int consume_event_fd(struct server_wrk *w)
@@ -1472,6 +1518,118 @@ static void free_workers(struct server_ctx *ctx)
 	ctx->workers = NULL;
 }
 
+static void *dns_resolver_func(void *arg);
+
+static int init_dns_resolver_workers(struct dns_resolver *dr)
+{
+	size_t i;
+
+	for (i = 0; i < dr->nr_dns_resolvers; i++) {
+		struct dns_resolver_worker *w = &dr->workers[i];
+		char buf[sizeof("dns-resolver") + 16];
+		int ret;
+
+		w->dr = dr;
+		ret = pthread_create(&w->thread, NULL, &dns_resolver_func, w);
+		if (ret) {
+			pr_error("Failed to create DNS resolver worker thread %zu: %s", i, strerror(ret));
+			goto out_err;
+		}
+
+		snprintf(buf, sizeof(buf), "dns-resolver-%zu", i);
+		pthread_setname_np(w->thread, buf);
+	}
+
+	return 0;
+
+out_err:
+	pthread_mutex_lock(&dr->lock);
+	dr->ctx->should_stop = true;
+	pthread_cond_broadcast(&dr->cond);
+	pthread_mutex_unlock(&dr->lock);
+
+	while (i--) {
+		struct dns_resolver_worker *w = &dr->workers[i];
+
+		pthread_join(w->thread, NULL);
+	}
+
+	return -ENOMEM;
+}
+
+static int init_dns_resolver(struct server_ctx *ctx)
+{
+	struct dns_resolver *dr;
+	int ret;
+
+	dr = calloc(1, sizeof(*dr));
+	if (!dr)
+		return -ENOMEM;
+
+	ctx->dns_resolver = dr;
+	dr->ctx = ctx;
+	dr->qcap = 1024;
+	dr->qhead = 0;
+	dr->qtail = 0;
+	dr->nr_dns_resolvers = 6;
+
+	dr->workers = calloc(dr->nr_dns_resolvers, sizeof(*dr->workers));
+	if (!dr->workers)
+		goto out_dr;
+	dr->queues = calloc(dr->qcap, sizeof(*dr->queues));
+	if (!dr->queues)
+		goto out_workers;
+	ret = pthread_mutex_init(&dr->lock, NULL);
+	if (ret)
+		goto out_queues;
+	ret = pthread_cond_init(&dr->cond, NULL);
+	if (ret)
+		goto out_lock;
+	ret = init_dns_resolver_workers(dr);
+	if (ret)
+		goto out_cond;
+
+	return 0;
+
+out_cond:
+	pthread_cond_destroy(&dr->cond);
+out_lock:
+	pthread_mutex_destroy(&dr->lock);
+out_queues:
+	free(dr->queues);
+out_workers:
+	free(dr->workers);
+out_dr:
+	free(dr);
+	ctx->dns_resolver = NULL;
+	return -ENOMEM;
+}
+
+static void free_dns_resolver(struct server_ctx *ctx)
+{
+	struct dns_resolver *dr = ctx->dns_resolver;
+	size_t i;
+
+	if (!dr)
+		return;
+
+	pthread_mutex_lock(&dr->lock);
+	ctx->should_stop = true;
+	pthread_cond_broadcast(&dr->cond);
+	pthread_mutex_unlock(&dr->lock);
+
+	for (i = 0; i < dr->nr_dns_resolvers; i++) {
+		struct dns_resolver_worker *w = &dr->workers[i];
+
+		pthread_join(w->thread, NULL);
+	}
+
+	pthread_mutex_destroy(&dr->lock);
+	pthread_cond_destroy(&dr->cond);
+	free(dr->workers);
+	free(dr);
+}
+
 static int init_ctx(struct server_ctx *ctx)
 {
 	struct server_cfg *cfg = &ctx->cfg;
@@ -1492,14 +1650,22 @@ static int init_ctx(struct server_ctx *ctx)
 	if (ret)
 		return ret;
 
+	ret = init_dns_resolver(ctx);
+	if (ret) {
+		free_socket(ctx);
+		return ret;
+	}
+
 	ret = init_spd_map(ctx);
 	if (ret) {
+		free_dns_resolver(ctx);
 		free_socket(ctx);
 		return ret;
 	}
 
 	ret = pthread_mutex_init(&ctx->accept_mutex, NULL);
 	if (ret) {
+		free_dns_resolver(ctx);
 		free_spd_map(ctx);
 		free_socket(ctx);
 		return -ret;
@@ -1526,6 +1692,7 @@ static void free_ctx(struct server_ctx *ctx)
 {
 	free_workers(ctx);
 	pthread_mutex_destroy(&ctx->accept_mutex);
+	free_dns_resolver(ctx);
 	free_spd_map(ctx);
 	free_socket(ctx);
 }
@@ -1742,11 +1909,45 @@ static int get_client_slot(struct server_wrk *w, struct client_state **c)
 	return 0;
 }
 
+static void free_dns_query(struct dns_query *dq)
+{
+	if (dq->notify_fd >= 0) {
+		close(dq->notify_fd);
+		dq->notify_fd = -1;
+	}
+
+	free(dq->domain);
+}
+
+static void free_dns_query_from_client_ctx(struct server_wrk *w, struct dns_query *dq)
+{
+	struct server_ctx *ctx = w->ctx;
+	struct dns_resolver *dr = ctx->dns_resolver;
+	bool is_resolving;
+
+	pthread_mutex_lock(&dr->lock);
+	pthread_mutex_lock(&dq->lock);
+	if (dq->notify_fd >= 0) {
+		close(dq->notify_fd);
+		dq->notify_fd = -1;
+	}
+
+	dq->is_client_freed = true;
+	is_resolving = dq->is_resolving;
+	pthread_mutex_unlock(&dq->lock);
+	pthread_mutex_unlock(&dr->lock);
+	if (!is_resolving)
+		free_dns_query(dq);
+}
+
 static void __put_client_slot(struct server_wrk *w, struct client_state *c,
 			      bool epl_del, bool preserve_buf)
 {
 	bool hess = false;
 	int ret;
+
+	if (c->dq)
+		free_dns_query_from_client_ctx(w, c->dq);
 
 	if (epl_del) {
 		pthread_mutex_lock(&w->epass_mutex);
@@ -3079,6 +3280,82 @@ static int evaluate_socks5_auth(struct server_wrk *w, struct client_state *c)
 	return send_socks5_auth_res(c, 0);
 }
 
+static int push_dns_query_queue(struct dns_resolver *dr, struct dns_query *dq);
+
+static struct dns_query *alloc_dns_query(const char *domain, uint16_t port)
+{
+	struct dns_query *dq;
+	int ret;
+
+	dq = malloc(sizeof(*dq));
+	if (!dq)
+		return NULL;
+
+	ret = pthread_mutex_init(&dq->lock, NULL);
+	if (ret) {
+		free(dq);
+		return NULL;
+	}
+
+	dq->domain = strdup(domain);
+	if (!dq->domain) {
+		pthread_mutex_destroy(&dq->lock);
+		free(dq);
+		return NULL;
+	}
+
+	dq->port = port;
+	dq->err = 0;
+	dq->is_resolving = false;
+	dq->is_client_freed = false;
+	dq->notify_fd = eventfd(0, EFD_NONBLOCK);
+	if (dq->notify_fd < 0) {
+		free(dq->domain);
+		pthread_mutex_destroy(&dq->lock);
+		free(dq);
+		return NULL;
+	}
+
+	memset(&dq->resolved, 0, sizeof(dq->resolved));
+	return dq;
+}
+
+static int evaluate_socks5_req_domain(struct server_wrk *w, struct client_state *c)
+{
+	struct dns_resolver *dr = w->ctx->dns_resolver;
+	struct socks5_data *sd = c->socks5;
+	union epoll_data data;
+	struct dns_query *dq;
+	uint16_t port;
+	int ret;
+
+	port = ntohs(sd->port);
+	dr = w->ctx->dns_resolver;
+	dq = alloc_dns_query((const char *)sd->domain, port);
+	if (!dq) {
+		pr_errorv("Failed to allocate DNS query for domain: %s:%hu", sd->domain, port);
+		return -ENOMEM;
+	}
+
+	c->dq = dq;
+	set_epoll_data(&data, c, EPL_EV_DNS_RESOLUTION);
+	ret = epoll_add(w->ep_fd, dq->notify_fd, EPOLLIN, data);
+	if (ret) {
+		pr_errorv("Failed to add DNS query notification FD to epoll: %s", strerror(-ret));
+		free_dns_query(dq);
+		return ret;
+	}
+
+	ret = push_dns_query_queue(dr, dq);
+	if (ret) {
+		pr_errorv("Failed to push DNS query to resolver queue: %s", strerror(-ret));
+		free_dns_query(dq);
+		return ret;
+	}
+
+	return 0;
+}
+
 /*
  *   The SOCKS request is formed as follows:
  *
@@ -3113,6 +3390,8 @@ static int evaluate_socks5_req(struct server_wrk *w, struct client_state *c)
 	struct socks5_data *sd = c->socks5;
 	size_t len = sd->len, expected_len = 4;
 	uint8_t *buf = (uint8_t *)sd->buf;
+	uint8_t domain_len;
+	int ret;
 
 	if (buf[0] != 0x05) {
 		pr_errorv("Invalid SOCKS5 version: %u", buf[0]);
@@ -3140,7 +3419,8 @@ static int evaluate_socks5_req(struct server_wrk *w, struct client_state *c)
 		expected_len += 4 + 2;
 		break;
 	case SOCKS5_ATYP_DOMAIN:
-		expected_len += 1;
+		domain_len = buf[4];
+		expected_len += 1 + domain_len + 2;
 		break;
 	case SOCKS5_ATYP_IPV6:
 		expected_len += 16 + 2;
@@ -3158,26 +3438,34 @@ static int evaluate_socks5_req(struct server_wrk *w, struct client_state *c)
 		return -EINVAL;
 	}
 
+	sd->len = 0;
+	c->client_ep.ep_mask &= ~EPOLLIN;
+	ret = apply_ep_mask(w, c, &c->client_ep);
+	if (ret)
+		return ret;
+
 	switch (buf[3]) {
 	case SOCKS5_ATYP_IPV4:
 		sd->atyp = SOCKS5_ATYP_IPV4;
 		memcpy(&sd->ipv4, buf + 4, 4);
 		memcpy(&sd->port, buf + 8, 2);
-		break;
+		return prepare_target_connect(w, c, true);
 	case SOCKS5_ATYP_DOMAIN:
-		/*
-		 * To be implemented.
-		 */
-		return -ENOSYS;
+		sd->atyp = SOCKS5_ATYP_DOMAIN;
+		domain_len = buf[4];
+		memcpy(sd->domain, buf + 5, domain_len);
+		sd->domain[domain_len] = '\0';
+		memcpy(&sd->port, buf + 5 + domain_len, 2);
+		return evaluate_socks5_req_domain(w, c);
 	case SOCKS5_ATYP_IPV6:
 		sd->atyp = SOCKS5_ATYP_IPV6;
 		memcpy(&sd->ipv6, buf + 4, 16);
 		memcpy(&sd->port, buf + 20, 2);
-		break;
+		return prepare_target_connect(w, c, true);
+	default:
+		pr_errorv("Invalid SOCKS5 address type: %u", buf[3]);
+		return -EINVAL;
 	}
-
-	sd->len = 0;
-	return prepare_target_connect(w, c, true);
 }
 
 static int evaluate_socks5_data(struct server_wrk *w, struct client_state *c)
@@ -3251,6 +3539,46 @@ static int handle_event_client_socks5(struct server_wrk *w, struct epoll_event *
 	return 0;
 }
 
+static int handle_event_dns_resolution(struct server_wrk *w, struct epoll_event *ev)
+{
+	struct client_state *c = GET_EPL_DT(ev->data.u64);
+	struct socks5_data *sd = c->socks5;
+	struct dns_query *dq = c->dq;
+	int ret;
+
+	assert(sd);
+	assert(dq);
+	assert(!dq->is_resolving);
+
+	if (dq->err) {
+		pr_errorv("DNS resolution failed: %s: %s", dq->domain, strerror(dq->err));
+		return -dq->err;
+	}
+
+	switch (dq->resolved.sa.sa_family) {
+	case AF_INET:
+		sd->atyp = SOCKS5_ATYP_IPV4;
+		memcpy(&sd->ipv4, &dq->resolved.in4.sin_addr.s_addr, 4);
+		memcpy(&sd->port, &dq->resolved.in4.sin_port, 2);
+		break;
+	case AF_INET6:
+		sd->atyp = SOCKS5_ATYP_IPV6;
+		memcpy(&sd->ipv6, &dq->resolved.in6.sin6_addr, 16);
+		memcpy(&sd->port, &dq->resolved.in6.sin6_port, 2);
+		break;
+	}
+
+	ret = epoll_del(w->ep_fd, dq->notify_fd);
+	if (ret) {
+		pr_error("Failed to delete DNS query notification FD from epoll: %s", strerror(-ret));
+		return ret;
+	}
+
+	free_dns_query(dq);
+	c->dq = NULL;
+	return prepare_target_connect(w, c, true);
+}
+
 static int handle_event(struct server_wrk *w, struct epoll_event *ev,
 			bool *has_event_timer, bool *has_event_accept)
 {
@@ -3284,6 +3612,10 @@ static int handle_event(struct server_wrk *w, struct epoll_event *ev,
 		if (!w->handle_events_should_stop)
 			ret = handle_event_client_socks5(w, ev);
 		break;
+	case EPL_EV_DNS_RESOLUTION:
+		if (!w->handle_events_should_stop)
+			ret = handle_event_dns_resolution(w, ev);
+		break;
 	default:
 		pr_error("Unknown event type: %lu (thread %u)", evt, w->idx);
 		return -EINVAL;
@@ -3296,6 +3628,7 @@ static int handle_event(struct server_wrk *w, struct epoll_event *ev,
 		case EPL_EV_TCP_CLIENT_DATA:
 		case EPL_EV_TCP_TARGET_DATA:
 		case EPL_EV_TCP_CLIENT_SOCKS5:
+		case EPL_EV_DNS_RESOLUTION:
 			put_client_slot(w, GET_EPL_DT(ev->data.u64));
 			ret = 0;
 			break;
@@ -3390,6 +3723,171 @@ static int run_ctx(struct server_ctx *ctx)
 	ret = (intptr_t)tmp;
 
 	return (int)ret;
+}
+
+static int push_dns_query_queue(struct dns_resolver *dr, struct dns_query *dq)
+{
+	size_t nr_queues;
+	size_t idx;
+	int ret = 0;
+
+	pthread_mutex_lock(&dr->lock);
+
+	nr_queues = dr->qtail - dr->qhead;
+	if (nr_queues >= dr->qcap) {
+		pr_error("Cannot push DNS query queue: queue is full");
+		ret = -EAGAIN;
+		goto out;
+	}
+
+	idx = dr->qtail++ % dr->qcap;
+	pthread_mutex_lock(&dq->lock);
+	dq->is_resolving = true;
+	dr->queues[idx] = dq;
+	pthread_mutex_unlock(&dq->lock);
+
+	if (dr->need_signal)
+		pthread_cond_signal(&dr->cond);
+out:
+	pthread_mutex_unlock(&dr->lock);
+	return ret;
+}
+
+/*
+ * MUST be called with the dr->lock held.
+ */
+static void __pop_dns_query_queue(struct dns_resolver *dr, struct dns_query **dq_p)
+{
+	size_t nr_queues = dr->qtail - dr->qhead;
+	struct dns_query *dq;
+	size_t idx;
+
+	if (nr_queues == 0) {
+		*dq_p = NULL;
+		return;
+	}
+
+	idx = dr->qhead++ % dr->qcap;
+	dq = dr->queues[idx];
+	*dq_p = dq;
+}
+
+static void resolve_dns_query(struct dns_query *dq, bool skip_resolve)
+{
+	struct sockaddr_in46 *addr = &dq->resolved;
+	const char *domain = dq->domain;
+	struct addrinfo *res = NULL;
+	uint16_t port = dq->port;
+	char service[6] = { 0 };
+	bool is_client_freed;
+	int ret;
+
+	const struct addrinfo hints = {
+		.ai_family = AF_UNSPEC,
+		.ai_socktype = SOCK_STREAM,
+		.ai_protocol = IPPROTO_TCP,
+	};
+
+	assert(dq->is_resolving);
+	if (skip_resolve)
+		goto out;
+
+	snprintf(service, sizeof(service), "%u", port);
+	pr_infov("Resolving DNS query: %s:%s", domain, service);
+	ret = getaddrinfo(domain, service, &hints, &res);
+	if (ret) {
+		pr_error("Failed to resolve DNS query: %s: getaddrinfo(): %s", domain, gai_strerror(ret));
+		goto out;
+	}
+
+	if (!res) {
+		dq->err = EADDRNOTAVAIL;
+		pr_error("Failed to resolve DNS query: %s: getaddrinfo(): no address found", domain);
+		goto out;
+	}
+
+	if (res->ai_family == AF_INET) {
+		struct sockaddr_in *sin = (struct sockaddr_in *)res->ai_addr;
+		dq->err = 0;
+		addr->in4 = *sin;
+	} else if (res->ai_family == AF_INET6) {
+		struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)res->ai_addr;
+		dq->err = 0;
+		addr->in6 = *sin6;
+	} else {
+		dq->err = EADDRNOTAVAIL;
+		goto out;
+	}
+
+
+out:
+	pthread_mutex_lock(&dq->lock);
+	dq->is_resolving = false;
+	is_client_freed = dq->is_client_freed;
+	if (!is_client_freed) {
+		assert(dq->notify_fd >= 0);
+		__send_event_fd(dq->notify_fd);
+	}
+	pthread_mutex_unlock(&dq->lock);
+
+	if (res)
+		freeaddrinfo(res);
+	if (is_client_freed)
+		free_dns_query(dq);
+}
+
+/*
+ * MUST be called with the dr->lock held.
+ */
+static void handle_dns_queue(struct dns_resolver_worker *w)
+{
+	struct dns_resolver *dr = w->dr;
+	struct server_ctx *ctx = dr->ctx;
+	struct dns_query *dq;
+
+	while (1) {
+		if (ctx->should_stop)
+			break;
+
+		__pop_dns_query_queue(dr, &dq);
+		if (!dq)
+			return;
+
+		/*
+		 * Don't hold the lock while resolving the DNS query to avoid
+		 * blocking other threads. It's safe to release the lock here
+		 * because the DNS query is already popped from the queue.
+		 */
+		pthread_mutex_unlock(&dr->lock);
+		resolve_dns_query(dq, ctx->should_stop);
+		pthread_mutex_lock(&dr->lock);
+	}
+}
+
+static void *dns_resolver_func(void *arg)
+{
+	struct dns_resolver_worker *w = arg;
+	struct dns_resolver *dr = w->dr;
+	struct server_ctx *ctx = dr->ctx;
+
+	pthread_mutex_lock(&dr->lock);
+	dr->need_signal = false;
+	while (1) {
+		if (ctx->should_stop)
+			break;
+
+		handle_dns_queue(w);
+
+		dr->need_signal = true;
+		pthread_cond_wait(&dr->cond, &dr->lock);
+		dr->need_signal = false;
+
+		if (ctx->should_stop)
+			break;
+	}
+	pthread_mutex_unlock(&dr->lock);
+
+	return NULL;
 }
 
 int main(int argc, char *argv[])
