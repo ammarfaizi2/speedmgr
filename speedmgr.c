@@ -1613,6 +1613,8 @@ out_dr:
 	return -ENOMEM;
 }
 
+static void free_dns_query(struct dns_query *dq);
+
 static void free_dns_resolver(struct server_ctx *ctx)
 {
 	struct dns_resolver *dr = ctx->dns_resolver;
@@ -1632,8 +1634,16 @@ static void free_dns_resolver(struct server_ctx *ctx)
 		pthread_join(w->thread, NULL);
 	}
 
+	for (i = 0; i < dr->qcap; i++) {
+		struct dns_query *dq = dr->queues[i];
+
+		if (dq)
+			free_dns_query(dq);
+	}
+
 	pthread_mutex_destroy(&dr->lock);
 	pthread_cond_destroy(&dr->cond);
+	free(dr->queues);
 	free(dr->workers);
 	free(dr);
 }
@@ -1906,6 +1916,7 @@ static int get_client_slot(struct server_wrk *w, struct client_state **c)
 	assert(!t->is_used);
 	assert(!t->spd);
 	assert(!t->socks5);
+	assert(!t->dq);
 	assert(t->client_ep.fd < 0);
 	assert(t->client_ep.len == 0);
 	assert(t->target_ep.fd < 0);
@@ -1924,7 +1935,9 @@ static void free_dns_query(struct dns_query *dq)
 		dq->notify_fd = -1;
 	}
 
+	pthread_mutex_destroy(&dq->lock);
 	free(dq->domain);
+	free(dq);
 }
 
 static void free_dns_query_from_client_ctx(struct server_wrk *w, struct dns_query *dq)
@@ -1954,8 +1967,10 @@ static void __put_client_slot(struct server_wrk *w, struct client_state *c,
 	bool hess = false;
 	int ret;
 
-	if (c->dq)
+	if (c->dq) {
 		free_dns_query_from_client_ctx(w, c->dq);
+		c->dq = NULL;
+	}
 
 	if (epl_del) {
 		pthread_mutex_lock(&w->epass_mutex);
@@ -3355,6 +3370,7 @@ static int evaluate_socks5_req_domain(struct server_wrk *w, struct client_state 
 	if (ret) {
 		pr_errorv("Failed to add DNS query notification FD to epoll: %s", strerror(-ret));
 		free_dns_query(dq);
+		c->dq = NULL;
 		return ret;
 	}
 
@@ -3362,6 +3378,7 @@ static int evaluate_socks5_req_domain(struct server_wrk *w, struct client_state 
 	if (ret) {
 		pr_errorv("Failed to push DNS query to resolver queue: %s", strerror(-ret));
 		free_dns_query(dq);
+		c->dq = NULL;
 		return ret;
 	}
 
@@ -3774,7 +3791,6 @@ out:
 static void __pop_dns_query_queue(struct dns_resolver *dr, struct dns_query **dq_p)
 {
 	size_t nr_queues = dr->qtail - dr->qhead;
-	struct dns_query *dq;
 	size_t idx;
 
 	if (nr_queues == 0) {
@@ -3783,8 +3799,8 @@ static void __pop_dns_query_queue(struct dns_resolver *dr, struct dns_query **dq
 	}
 
 	idx = dr->qhead++ % dr->qcap;
-	dq = dr->queues[idx];
-	*dq_p = dq;
+	*dq_p = dr->queues[idx];
+	dr->queues[idx] = NULL;
 }
 
 static void resolve_dns_query(struct dns_query *dq, bool skip_resolve)
@@ -3793,8 +3809,8 @@ static void resolve_dns_query(struct dns_query *dq, bool skip_resolve)
 	const char *domain = dq->domain;
 	struct addrinfo *res = NULL;
 	uint16_t port = dq->port;
-	char service[6] = { 0 };
 	bool is_client_freed;
+	char service[6];
 	int ret;
 
 	static const struct addrinfo hints = {
