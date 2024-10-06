@@ -1,9 +1,9 @@
 
 CC = gcc
 CXX = g++
-CFLAGS = -Wall -Wextra -ggdb3 -O2 -std=c99
-CXXFLAGS = -Wall -Wextra -ggdb3 -O2 -std=c++14
-LDFLAGS = -ggdb -O2
+CFLAGS = -Wall -Wextra -ggdb3 -Os -std=c99
+CXXFLAGS = -Wall -Wextra -ggdb3 -Os -std=c++14
+LDFLAGS = -ggdb -Os
 LIBS = -lpthread
 
 TARGET := speedmgr
@@ -22,14 +22,14 @@ endif
 
 all: $(TARGET)
 
-$(TARGET): speedmgr.o ip_map.o
+$(TARGET): speedmgr.o ht.o
 	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 %.o: %.cpp
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+	$(CC) $(CXXFLAGS) -c $< -o $@
 
 clean:
 	rm -f *.o $(TARGET)
