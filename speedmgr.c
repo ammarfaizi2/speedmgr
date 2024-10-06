@@ -84,6 +84,7 @@
 #include <stdlib.h>
 #include <assert.h>
 #include <stdio.h>
+#include <ctype.h>
 #include <errno.h>
 
 #include <netinet/in.h>
@@ -207,7 +208,6 @@ enum {
 	SOCKS5_STATE_INIT	= 0,
 	SOCKS5_STATE_AUTH	= 1,
 	SOCKS5_STATE_REQ	= 2,
-	SOCKS5_STATE_SPLICE	= 3,
 };
 
 enum {
@@ -245,6 +245,12 @@ struct socks5_data {
 	int			dns_notify_fd;
 };
 
+enum {
+	FWD_TO_SOCKS5_STATE_INIT	= 0,
+	FWD_TO_SOCKS5_STATE_AUTH	= 1,
+	FWD_TO_SOCKS5_STATE_REQ		= 2,
+};
+
 struct client_state {
 	struct client_endp	client_ep;
 	struct client_endp	target_ep;
@@ -253,6 +259,7 @@ struct client_state {
 	struct dns_query	*dq;
 	uint32_t		idx;
 	uint8_t			rate_limit_flags;
+	uint8_t			fwd_to_sock5_state;
 	bool			target_connected;
 	bool			is_used;
 };
@@ -307,6 +314,7 @@ struct server_cfg {
 	struct sockaddr_in46	target_addr;
 	const char		*socks5_user;
 	const char		*socks5_pass;
+	const char		*socks5_target;
 };
 
 struct dns_query {
@@ -344,6 +352,16 @@ struct dns_resolver {
 	volatile bool			need_signal;
 };
 
+struct socks5_target {
+	uint8_t			auth_method;
+	bool			resolve_domain;
+	uint8_t			ulen;
+	uint8_t			plen;
+	char			user[256];
+	char			pass[256];
+	struct sockaddr_in46	addr;
+};
+
 /*
  * Server context.
  */
@@ -351,24 +369,27 @@ struct server_ctx {
 	volatile bool		should_stop;
 	bool			accept_stopped;
 	bool			need_timer;
+	bool			fwd_to_sock5;
 	int			tcp_fd;
 	struct server_wrk	*workers;
 	struct server_cfg	cfg;
 	struct ip_spd_map	spd_map;
 	pthread_mutex_t		accept_mutex;
 	struct dns_resolver	*dns_resolver;
+	struct socks5_target	*socks5_target;
 };
 
 enum {
-	EPL_EV_EVENTFD			= (0x0001ull << 48ull),
-	EPL_EV_TCP_ACCEPT		= (0x0002ull << 48ull),
-	EPL_EV_TCP_CLIENT_DATA		= (0x0003ull << 48ull),
-	EPL_EV_TCP_TARGET_DATA		= (0x0004ull << 48ull),
-	EPL_EV_TCP_TARGET_CONN		= (0x0005ull << 48ull),
-	EPL_EV_TIMERFD			= (0x0006ull << 48ull),
-	EPL_EV_TCP_CLIENT_SOCKS5	= (0x0007ull << 48ull),
-	EPL_EV_TCP_TARGET_SOCKS5_CONN	= (0x0008ull << 48ull),
-	EPL_EV_DNS_RESOLUTION		= (0x0009ull << 48ull),
+	EPL_EV_EVENTFD				= (0x0001ull << 48ull),
+	EPL_EV_TCP_ACCEPT			= (0x0002ull << 48ull),
+	EPL_EV_TCP_CLIENT_DATA			= (0x0003ull << 48ull),
+	EPL_EV_TCP_TARGET_DATA			= (0x0004ull << 48ull),
+	EPL_EV_TCP_TARGET_CONN			= (0x0005ull << 48ull),
+	EPL_EV_TIMERFD				= (0x0006ull << 48ull),
+	EPL_EV_TCP_CLIENT_SOCKS5		= (0x0007ull << 48ull),
+	EPL_EV_TCP_TARGET_SOCKS5_CONN		= (0x0008ull << 48ull),
+	EPL_EV_DNS_RESOLUTION			= (0x0009ull << 48ull),
+	EPL_EV_TO_SOCKS5_SERVER			= (0x000aull << 48ull),
 };
 
 #define EPL_EV_MASK		(0xffffull << 48ull)
@@ -389,9 +410,10 @@ static const struct option long_options[] = {
 	{ "down-interval",	required_argument,	NULL,	'd' },
 	{ "out-mark",		required_argument,	NULL,	'o' },
 	{ "as-socks5",		no_argument,		NULL,	'S' },
+	{ "to-socks5",		required_argument,	NULL,	'T' },
 	{ NULL,			0,			NULL,	0 },
 };
-static const char short_options[] = "hVw:b:t:vB:U:I:D:d:o:S";
+static const char short_options[] = "hVw:b:t:vB:U:I:D:d:o:ST:";
 static const uint64_t spd_min_fill = 1024*8;
 
 static void show_help(const void *app)
@@ -411,6 +433,7 @@ static void show_help(const void *app)
 	printf("  -d, --down-interval=NUM\tDownload fill interval (seconds)\n");
 	printf("  -o, --out-mark=NUM\t\tOutgoing connection packet mark\n");
 	printf("  -S, --as-socks5\t\tUse as a SOCKS5 proxy server\n");
+	printf("  -T, --to-socks5=ADDR\t\tForward all traffic to a SOCKS5 server, addr:port\n");
 }
 
 static int parse_addr_and_port(const char *str, struct sockaddr_in46 *out)
@@ -447,7 +470,6 @@ static int parse_addr_and_port(const char *str, struct sockaddr_in46 *out)
 		out->sa.sa_family = AF_INET6;
 		ret = inet_pton(AF_INET6, addr + 1, &out->in6.sin6_addr);
 		if (ret != 1) {
-			pr_error("Invalid IPv6 address: %s", addr);
 			ret = -EINVAL;
 			goto out;
 		}
@@ -457,7 +479,6 @@ static int parse_addr_and_port(const char *str, struct sockaddr_in46 *out)
 		out->sa.sa_family = AF_INET;
 		ret = inet_pton(AF_INET, addr, &out->in4.sin_addr);
 		if (ret != 1) {
-			pr_error("Invalid IPv4 address: %s", addr);
 			ret = -EINVAL;
 			goto out;
 		}
@@ -478,6 +499,236 @@ static int parse_addr_and_port(const char *str, struct sockaddr_in46 *out)
 
 out:
 	free(addr);
+	return ret;
+}
+
+static int htoi(char *s)
+{
+	int value;
+	int c;
+
+	c = ((unsigned char *)s)[0];
+	if (isupper(c))
+		c = tolower(c);
+	value = (c >= '0' && c <= '9' ? c - '0' : c - 'a' + 10) * 16;
+
+	c = ((unsigned char *)s)[1];
+	if (isupper(c))
+		c = tolower(c);
+	value += c >= '0' && c <= '9' ? c - '0' : c - 'a' + 10;
+
+	return (value);
+}
+
+static size_t url_decode(char *str, size_t len)
+{
+	char *dest = str;
+	char *data = str;
+
+	while (len--) {
+		if (*data == '+') {
+			*dest = ' ';
+		} else if (*data == '%' && len >= 2 &&
+			   isxdigit((int) *(data + 1)) &&
+			   isxdigit((int) *(data + 2))) {
+			*dest = (char) htoi(data + 1);
+			data += 2;
+			len -= 2;
+		} else {
+			*dest = *data;
+		}
+		data++;
+		dest++;
+	}
+	*dest = '\0';
+	return dest - str;
+}
+
+static const char *sockaddr_to_str(struct sockaddr_in46 *addr)
+{
+	static __thread char _buf[8][INET6_ADDRSTRLEN + sizeof("[]:65535")];
+	static __thread uint8_t _counter;
+	char *buf = _buf[_counter++ % ARRAY_SIZE(_buf)];
+
+	if (addr->sa.sa_family == AF_INET) {
+		inet_ntop(AF_INET, &addr->in4.sin_addr, buf, INET_ADDRSTRLEN);
+		snprintf(buf + strlen(buf), sizeof(_buf[0]) - strlen(buf),
+			 ":%hu", ntohs(addr->in4.sin_port));
+		return buf;
+	}
+
+
+	if (IN6_IS_ADDR_V4MAPPED(&addr->in6.sin6_addr)) {
+		inet_ntop(AF_INET, &addr->in6.sin6_addr.s6_addr32[3], buf, INET_ADDRSTRLEN);
+		snprintf(buf + strlen(buf), sizeof(_buf[0]) - strlen(buf), ":%hu",
+			 ntohs(addr->in6.sin6_port));
+	} else {
+		*buf = '[';
+		inet_ntop(AF_INET6, &addr->in6.sin6_addr, buf + 1, INET6_ADDRSTRLEN);
+		snprintf(buf + strlen(buf), sizeof(_buf[0]) - strlen(buf), "]:%hu",
+			 ntohs(addr->in6.sin6_port));
+	}
+
+	return buf;
+}
+
+static int parse_socks5_uri(const char *str, struct socks5_target **t_p)
+{
+	struct socks5_target *t;
+	char *addr, *heap, *at;
+	int ret = 0;
+
+	t = malloc(sizeof(*t));
+	if (!t)
+		return -ENOMEM;
+
+	/*
+	 * socks5 URI format:
+	 *    socks5://<username>:<password>@server_host:port
+	 *    socks5h://<username>:<password>@server_host:port
+	 *
+	 * The username and password are optional. If provided,
+	 * the username and password must be URL encoded.
+	 */
+	heap = addr = strdup(str);
+	if (!addr) {
+		free(t);
+		return -ENOMEM;
+	}
+
+	/*
+	 * The prefix must be "socks5://" or "socks5h://".
+	 */
+	if (strncmp(addr, "socks5://", 9) == 0) {
+		t->resolve_domain = false;
+		addr += 9;
+	} else if (strncmp(addr, "socks5h://", 10) == 0) {
+		t->resolve_domain = true;
+		addr += 10;
+	} else {
+		pr_error("Invalid SOCKS5 URI: %s", str);
+		ret = -EINVAL;
+		goto out;
+	}
+
+	/*
+	 * Parse the username and password.
+	 *
+	 * Find the @ character.
+	 */
+	at = strchr(addr, '@');
+	if (at) {
+		char *start_cred = addr;
+		char *end_cred = at;
+		size_t ulen, plen;
+		char *u, *p;
+
+		*at = '\0';
+		addr = at + 1;
+
+		/*
+		 * Find the : character.
+		 */
+		at = strchr(start_cred, ':');
+		if (at) {
+			ulen = at - start_cred;
+			plen = end_cred - at - 1;
+
+			ulen = url_decode(start_cred, ulen);
+			plen = url_decode(at + 1, plen);
+			if (ulen > 255 || plen > 255) {
+				pr_error("Invalid username or password in the SOCKS5 URI: %s (max user/pass length is 255)", str);
+				ret = -EINVAL;
+				goto out;
+			}
+
+			u = start_cred;
+			p = at + 1;
+			*at = '\0';
+		} else {
+			ulen = end_cred - start_cred;
+			plen = 0;
+			u = start_cred;
+			p = NULL;
+
+			ulen = url_decode(u, ulen);
+			if (ulen > 255) {
+				pr_error("Invalid username in the SOCKS5 URI: %s (max user length is 255)", str);
+				ret = -EINVAL;
+				goto out;
+			}
+		}
+
+		t->auth_method = SOCKS5_AUTH_USERPASS;
+		t->ulen = (uint8_t)ulen;
+		t->plen = (uint8_t)plen;
+		memcpy(t->user, u, ulen);
+		t->user[ulen] = '\0';
+		if (p) {
+			memcpy(t->pass, p, plen);
+			t->pass[plen] = '\0';
+		}
+	} else {
+		t->auth_method = SOCKS5_AUTH_NONE;
+		t->ulen = 0;
+		t->plen = 0;
+	}
+
+	/*
+	 * Parse the server address and port.
+	 */
+	if (!parse_addr_and_port(addr, &t->addr)) {
+		ret = 0;
+	} else {
+		/*
+		 * Try resolving the domain name.
+		 */
+		static struct addrinfo hints = {
+			.ai_family = AF_UNSPEC,
+			.ai_socktype = SOCK_STREAM
+		};
+		struct addrinfo *res = NULL;
+		char *port = strchr(addr, ':');
+		int err;
+
+		if (port) {
+			*port = '\0';
+			port++;
+		} else {
+			port = (char *)"1080";
+		}
+
+		err = getaddrinfo(addr, port, &hints, &res);
+		if (err || !res) {
+			pr_error("Failed to resolve the SOCKS5 server address: %s", gai_strerror(err));
+			ret = -EINVAL;
+			goto out;
+		}
+
+		memset(&t->addr, 0, sizeof(t->addr));
+		if (res->ai_family == AF_INET) {
+			t->addr.in4 = *(struct sockaddr_in *)res->ai_addr;
+		} else if (res->ai_family == AF_INET6) {
+			t->addr.in6 = *(struct sockaddr_in6 *)res->ai_addr;
+		} else {
+			pr_error("Invalid address family: %d", res->ai_family);
+			ret = -EINVAL;
+		}
+
+		if (res)
+			freeaddrinfo(res);
+
+		pr_info("Resolved SOCKS5 server address: %s:%s -> %s", addr, port, sockaddr_to_str(&t->addr));
+	}
+
+out:
+	free(heap);
+
+	if (ret)
+		free(t);
+	else
+		*t_p = t;
+
 	return ret;
 }
 
@@ -621,6 +872,9 @@ static int parse_args(int argc, char *argv[], struct server_cfg *cfg)
 		case 'S':
 			cfg->as_socks5 = 1;
 			break;
+		case 'T':
+			cfg->socks5_target = optarg;
+			break;
 		case '?':
 			return -EINVAL;
 		default:
@@ -655,34 +909,6 @@ static int parse_args(int argc, char *argv[], struct server_cfg *cfg)
 	cfg->socks5_user = getenv("SPEEDMGR_SOCKS5_USER");
 	cfg->socks5_pass = getenv("SPEEDMGR_SOCKS5_PASS");
 	return 0;
-}
-
-static const char *sockaddr_to_str(struct sockaddr_in46 *addr)
-{
-	static __thread char _buf[8][INET6_ADDRSTRLEN + sizeof("[]:65535")];
-	static __thread uint8_t _counter;
-	char *buf = _buf[_counter++ % ARRAY_SIZE(_buf)];
-
-	if (addr->sa.sa_family == AF_INET) {
-		inet_ntop(AF_INET, &addr->in4.sin_addr, buf, INET_ADDRSTRLEN);
-		snprintf(buf + strlen(buf), sizeof(_buf[0]) - strlen(buf), 
-			 ":%hu", ntohs(addr->in4.sin_port));
-		return buf;
-	}
-
-
-	if (IN6_IS_ADDR_V4MAPPED(&addr->in6.sin6_addr)) {
-		inet_ntop(AF_INET, &addr->in6.sin6_addr.s6_addr32[3], buf, INET_ADDRSTRLEN);
-		snprintf(buf + strlen(buf), sizeof(_buf[0]) - strlen(buf), ":%hu",
-			 ntohs(addr->in6.sin6_port));
-	} else {
-		*buf = '[';
-		inet_ntop(AF_INET6, &addr->in6.sin6_addr, buf + 1, INET6_ADDRSTRLEN);
-		snprintf(buf + strlen(buf), sizeof(_buf[0]) - strlen(buf), "]:%hu",
-			 ntohs(addr->in6.sin6_port));
-	}
-
-	return buf;
 }
 
 static int init_stack_u32(struct stack_u32 *stack, uint32_t size)
@@ -968,6 +1194,7 @@ static void init_client_state(struct client_state *c)
 	c->rate_limit_flags = 0;
 	c->target_connected = false;
 	c->is_used = false;
+	c->fwd_to_sock5_state = FWD_TO_SOCKS5_STATE_INIT;
 }
 
 static struct client_state *alloc_client_state(void)
@@ -1659,6 +1886,19 @@ static int init_ctx(struct server_ctx *ctx)
 	else
 		ctx->need_timer = false;
 
+	if (cfg->socks5_target) {
+		ctx->cfg.as_socks5 = 1;
+		ret = parse_socks5_uri(cfg->socks5_target, &ctx->socks5_target);
+		if (ret)
+			return ret;
+
+		ctx->fwd_to_sock5 = true;
+		pr_info("Forwarding via SOCKS5 proxy at %s", cfg->socks5_target);
+	} else {
+		ctx->socks5_target = NULL;
+		ctx->fwd_to_sock5 = false;
+	}
+
 	g_verbose = ctx->cfg.verbose;
 	try_increase_rlimit_nofile();
 	ret = install_signal_handlers(ctx);
@@ -1912,6 +2152,7 @@ static int get_client_slot(struct server_wrk *w, struct client_state **c)
 		return -ENOMEM;
 	}
 
+	assert(t->fwd_to_sock5_state == FWD_TO_SOCKS5_STATE_INIT);
 	assert(!t->is_used);
 	assert(!t->spd);
 	assert(!t->socks5);
@@ -2243,9 +2484,9 @@ static int prepare_target_connect(struct server_wrk *w, struct client_state *c,
 		ret = epoll_add(w->ep_fd, c->client_ep.fd, c->client_ep.ep_mask, data);
 		if (ret)
 			goto out_epoll_err;
-
-		send_event_fd(w);
 	}
+	
+	send_event_fd(w);
 	pthread_mutex_unlock(&w->epass_mutex);
 	atomic_fetch_add(&w->nr_online_clients, 1u);
 	return 0;
