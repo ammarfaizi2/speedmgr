@@ -3922,7 +3922,6 @@ static void *dns_resolver_func(void *arg)
 			break;
 	}
 
-out:
 	pthread_mutex_unlock(&dr->lock);
 	return NULL;
 }
