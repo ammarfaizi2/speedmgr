@@ -2897,7 +2897,7 @@ static int handle_event_target_data(struct server_wrk *w, struct epoll_event *ev
  */
 static int respond_socks5_request(struct server_wrk *w, struct client_state *c, int err)
 {
-	uint8_t buf[1 + 1 + 1 + 1 + 16 + 2];
+	uint8_t buf[1 + 1 + 1 + 1 + 256 + 2];
 	struct socks5_data *sd = c->socks5;
 	union epoll_data data;
 	size_t len = 0;
@@ -2923,6 +2923,7 @@ static int respond_socks5_request(struct server_wrk *w, struct client_state *c, 
 		buf[1] = 0x03;
 		break;
 	case EHOSTUNREACH:
+	case EADDRNOTAVAIL:
 		/* Host unreachable. */
 		buf[1] = 0x04;
 		break;
@@ -2953,9 +2954,11 @@ static int respond_socks5_request(struct server_wrk *w, struct client_state *c, 
 		memcpy(buf + 20, &sd->port, 2);
 		len += 18;
 		break;
-	default:
-		pr_errorv("Invalid SOCKS5 ATYP: %u", sd->atyp);
-		return -EINVAL;
+	case SOCKS5_ATYP_DOMAIN:
+		buf[4] = (uint8_t)strlen((const char *)sd->domain);
+		memcpy(buf + 5, sd->domain, buf[4]);
+		len += 1 + buf[4];
+		break;
 	}
 
 	ret = send(c->client_ep.fd, buf, len, MSG_DONTWAIT);
@@ -3560,8 +3563,8 @@ static int handle_event_dns_resolution(struct server_wrk *w, struct epoll_event 
 	assert(!dq->is_resolving);
 
 	if (dq->err) {
-		pr_errorv("DNS resolution failed: %s: %s", dq->domain, strerror(dq->err));
-		return -dq->err;
+		respond_socks5_request(w, c, EADDRNOTAVAIL);
+		return -EINVAL;
 	}
 
 	switch (dq->resolved.sa.sa_family) {
@@ -3575,6 +3578,9 @@ static int handle_event_dns_resolution(struct server_wrk *w, struct epoll_event 
 		memcpy(&sd->ipv6, &dq->resolved.in6.sin6_addr, 16);
 		memcpy(&sd->port, &dq->resolved.in6.sin6_port, 2);
 		break;
+	default:
+		respond_socks5_request(w, c, EADDRNOTAVAIL);
+		return -EINVAL;
 	}
 
 	ret = epoll_del(w->ep_fd, dq->notify_fd);
@@ -3804,14 +3810,9 @@ static void resolve_dns_query(struct dns_query *dq, bool skip_resolve)
 	snprintf(service, sizeof(service), "%u", port);
 	pr_infov("Resolving DNS query: %s:%s", domain, service);
 	ret = getaddrinfo(domain, service, &hints, &res);
-	if (ret) {
-		pr_error("Failed to resolve DNS query: %s: getaddrinfo(): %s", domain, gai_strerror(ret));
-		goto out;
-	}
-
-	if (!res) {
+	if (ret || !res) {
 		dq->err = EADDRNOTAVAIL;
-		pr_error("Failed to resolve DNS query: %s: getaddrinfo(): no address found", domain);
+		pr_error("Failed to resolve DNS query: %s: %s", domain, gai_strerror(ret));
 		goto out;
 	}
 
@@ -3827,7 +3828,6 @@ static void resolve_dns_query(struct dns_query *dq, bool skip_resolve)
 		dq->err = EADDRNOTAVAIL;
 		goto out;
 	}
-
 
 out:
 	pthread_mutex_lock(&dq->lock);
