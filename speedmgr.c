@@ -3883,9 +3883,6 @@ static void handle_dns_queue(struct dns_resolver_worker *w)
 	struct dns_query *dq;
 
 	while (1) {
-		if (ctx->should_stop)
-			break;
-
 		__pop_dns_query_queue(dr, &dq);
 		if (!dq)
 			return;
@@ -3908,12 +3905,14 @@ static void *dns_resolver_func(void *arg)
 	struct server_ctx *ctx = dr->ctx;
 
 	pthread_mutex_lock(&dr->lock);
+
 	dr->need_signal = false;
-	while (1) {
+
+	while (!ctx->should_stop) {
+		handle_dns_queue(w);
+
 		if (ctx->should_stop)
 			break;
-
-		handle_dns_queue(w);
 
 		dr->need_signal = true;
 		pthread_cond_wait(&dr->cond, &dr->lock);
@@ -3922,8 +3921,9 @@ static void *dns_resolver_func(void *arg)
 		if (ctx->should_stop)
 			break;
 	}
-	pthread_mutex_unlock(&dr->lock);
 
+out:
+	pthread_mutex_unlock(&dr->lock);
 	return NULL;
 }
 
