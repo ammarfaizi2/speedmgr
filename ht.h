@@ -10,7 +10,6 @@ extern "C" {
 #include <stdint.h>
 
 typedef void *ht_t;
-typedef void *ht_t;
 
 struct ht_data {
 	union {

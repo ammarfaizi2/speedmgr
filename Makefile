@@ -1,6 +1,6 @@
 
-CC = gcc
-CXX = g++
+CC = clang
+CXX = clang++
 CFLAGS = -Wall -Wextra -ggdb3 -Os -std=c99
 CXXFLAGS = -Wall -Wextra -ggdb3 -Os -std=c++14
 LDFLAGS = -ggdb -Os

@@ -1866,7 +1866,6 @@ static void put_ip_spd_bucket(struct ip_spd_map *map, struct sockaddr_in46 *addr
 {
 	struct ip_spd_bucket *b;
 	uint32_t idx;
-	uint16_t n;
 
 	assert(map->bucket_arr);
 	pthread_mutex_lock(&map->lock);
@@ -1877,8 +1876,7 @@ static void put_ip_spd_bucket(struct ip_spd_map *map, struct sockaddr_in46 *addr
 	}
 
 	b = map->bucket_arr[idx];
-	n = atomic_fetch_sub(&b->nr_conns, 1u);
-	if (n == 1) {
+	if (b->nr_conns-- == 1) {
 		const void *key;
 		size_t key_len;
 
