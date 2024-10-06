@@ -2961,6 +2961,7 @@ static int respond_socks5_request(struct server_wrk *w, struct client_state *c, 
 
 	free_socks5_data(sd);
 	c->socks5 = NULL;
+	c->target_connected = true;
 
 	pthread_mutex_lock(&w->epass_mutex);
 	c->client_ep.ep_mask = EPOLLIN;
