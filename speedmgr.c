@@ -1890,7 +1890,6 @@ static int init_ctx(struct server_ctx *ctx)
 		ctx->need_timer = false;
 
 	if (cfg->socks5_target) {
-		ctx->cfg.as_socks5 = 1;
 		ret = parse_socks5_uri(cfg->socks5_target, &ctx->socks5_target);
 		if (ret)
 			return ret;
@@ -3921,9 +3920,12 @@ static int handle_fwd_to_socks5_init(struct server_wrk *w, struct client_state *
 	buf[0] = 0x05; /* VER */
 	buf[1] = 1; /* NMETHODS */
 	buf[2] = w->ctx->socks5_target->auth_method; /* METHOD */
+	errno = 0;
 	sret = send(c->target_ep.fd, buf, sizeof(buf), MSG_DONTWAIT);
 	if (sret != sizeof(buf)) {
-		pr_error("Failed to send SOCKS5 handshake: %s: send(): %zd", sockaddr_to_str(&c->client_ep.addr), sret);
+		sret = errno;
+		pr_error("Failed to send SOCKS5 handshake: %s: send(): %zd: %s",
+			sockaddr_to_str(&c->client_ep.addr), sret, strerror((int)sret));
 		return -ECONNRESET;
 	}
 
@@ -3993,7 +3995,7 @@ static int handle_fwd_to_socks5_auth(struct server_wrk *w, struct client_state *
 		return -ECONNRESET;
 
 	if (ret > 2) {
-		pr_error("System error: Received more than 2 bytes from SOCKS5 server: %s",
+		pr_error("fwd_to: System error: Received more than 2 bytes from SOCKS5 server: %s",
 			 sockaddr_to_str(&c->target_ep.addr));
 		return -EINVAL;
 	}
@@ -4004,12 +4006,12 @@ static int handle_fwd_to_socks5_auth(struct server_wrk *w, struct client_state *
 
 	ep->len = 0;
 	if (buf[0] != 0x05) {
-		pr_error("Invalid SOCKS5 version: %u", buf[0]);
+		pr_error("fwd_to: Invalid SOCKS5 version: %u", buf[0]);
 		return -EINVAL;
 	}
 
 	if (buf[1] != st->auth_method) {
-		pr_error("Invalid SOCKS5 authentication method: (expected %hhu; got %hhu)",
+		pr_error("fwd_to: Invalid SOCKS5 authentication method: (expected %hhu; got %hhu)",
 			 st->auth_method, buf[1]);
 		return -EINVAL;
 	}
@@ -4033,7 +4035,7 @@ static int handle_fwd_to_socks5_auth(struct server_wrk *w, struct client_state *
 	ret = send(c->target_ep.fd, buf, len, MSG_DONTWAIT);
 	free(buf);
 	if (ret != (ssize_t)len) {
-		pr_error("Failed to send SOCKS5 authentication: %s: send(): %zd",
+		pr_error("fwd_to: Failed to send SOCKS5 authentication: %s: send(): %zd",
 			 sockaddr_to_str(&c->target_ep.addr), ret);
 		return -ECONNRESET;
 	}
@@ -4051,7 +4053,7 @@ static int handle_fwd_to_socks5_auth_res(struct client_state *c, struct epoll_ev
 	char *buf;
 
 	if (unlikely(events & (EPOLLERR | EPOLLHUP))) {
-		pr_error("Target SOCKS5 server hit EPOLLERR|EPOLLHUP: %s", sockaddr_to_str(&c->target_ep.addr));
+		pr_error("fwd_to: Target SOCKS5 server hit EPOLLERR|EPOLLHUP: %s", sockaddr_to_str(&c->target_ep.addr));
 		return -ECONNRESET;
 	}
 
@@ -4076,7 +4078,7 @@ static int handle_fwd_to_socks5_auth_res(struct client_state *c, struct epoll_ev
 		return -ECONNRESET;
 
 	if (ret > 2) {
-		pr_error("System error: Received more than 2 bytes from SOCKS5 server: %s",
+		pr_error("fwd_to: System error: Received more than 2 bytes from SOCKS5 server: %s",
 			 sockaddr_to_str(&c->target_ep.addr));
 		return -EINVAL;
 	}
@@ -4087,12 +4089,12 @@ static int handle_fwd_to_socks5_auth_res(struct client_state *c, struct epoll_ev
 
 	ep->len = 0;
 	if (buf[0] != 0x01) {
-		pr_error("Invalid SOCKS5 authentication response version: %u", buf[0]);
+		pr_error("fwd_to: Invalid SOCKS5 authentication response version: %u", buf[0]);
 		return -EINVAL;
 	}
 
 	if (buf[1] != 0x00) {
-		pr_error("Authentication failed: %u", buf[1]);
+		pr_error("fwd_to: Authentication failed: %u", buf[1]);
 		return -EPERM;
 	}
 
@@ -4109,7 +4111,7 @@ static int handle_fwd_to_socks5_req(struct client_state *c, struct epoll_event *
 	char *buf;
 
 	if (unlikely(events & (EPOLLERR | EPOLLHUP))) {
-		pr_error("Target SOCKS5 server hit EPOLLERR|EPOLLHUP: %s", sockaddr_to_str(&c->target_ep.addr));
+		pr_error("fwd_to: Target SOCKS5 server hit EPOLLERR|EPOLLHUP: %s", sockaddr_to_str(&c->target_ep.addr));
 		return -ECONNRESET;
 	}
 
@@ -4126,7 +4128,7 @@ static int handle_fwd_to_socks5_req(struct client_state *c, struct epoll_event *
 			len += 16 + 2;
 			break;
 		default:
-			pr_error("Invalid SOCKS5 address type: %u", c->socks5->atyp);
+			pr_error("fwd_to: Invalid SOCKS5 address type: %u", c->socks5->atyp);
 			return -EINVAL;
 		}
 
@@ -4153,12 +4155,11 @@ static int handle_fwd_to_socks5_req(struct client_state *c, struct epoll_event *
 			memcpy(buf + 20, &c->socks5->port, 2);
 			break;
 		default:
-			pr_error("Invalid SOCKS5 address type: %u", c->socks5->atyp);
+			pr_error("fwd_to: Invalid SOCKS5 address type: %u", c->socks5->atyp);
 			free(buf);
 			return -EINVAL;
 		}
 	} else {
-		len += 4 + 2;
 		switch (c->target_ep.addr.sa.sa_family) {
 		case AF_INET:
 			len += 4;
@@ -4167,7 +4168,7 @@ static int handle_fwd_to_socks5_req(struct client_state *c, struct epoll_event *
 			len += 16;
 			break;
 		default:
-			pr_error("Invalid target address family: %u", c->target_ep.addr.sa.sa_family);
+			pr_error("fwd_to: Invalid target address family: %u", c->target_ep.addr.sa.sa_family);
 			return -EINVAL;
 		}
 
@@ -4190,7 +4191,7 @@ static int handle_fwd_to_socks5_req(struct client_state *c, struct epoll_event *
 			memcpy(buf + 20, &c->target_ep.addr.in6.sin6_port, 2);
 			break;
 		default:
-			pr_error("Invalid target address family: %u", c->target_ep.addr.sa.sa_family);
+			pr_error("fwd_to: Invalid target address family: %u", c->target_ep.addr.sa.sa_family);
 			free(buf);
 			return -EINVAL;
 		}
@@ -4199,7 +4200,7 @@ static int handle_fwd_to_socks5_req(struct client_state *c, struct epoll_event *
 	ret = send(ep->fd, buf, len, MSG_DONTWAIT);
 	free(buf);
 	if (ret != (ssize_t)len) {
-		pr_error("Failed to send SOCKS5 request: %s: send(): %zd", sockaddr_to_str(&c->target_ep.addr), ret);
+		pr_error("fwd_to: Failed to send SOCKS5 request: %s: send(): %zd", sockaddr_to_str(&c->target_ep.addr), ret);
 		return -ECONNRESET;
 	}
 
@@ -4218,7 +4219,7 @@ static int handle_fwd_to_socks5_req_res(struct server_wrk *w, struct client_stat
 	char *buf;
 
 	if (unlikely(events & (EPOLLERR | EPOLLHUP))) {
-		pr_error("Target SOCKS5 server hit EPOLLERR|EPOLLHUP: %s", sockaddr_to_str(&c->target_ep.addr));
+		pr_error("fwd_to: Target SOCKS5 server hit EPOLLERR|EPOLLHUP: %s", sockaddr_to_str(&c->target_ep.addr));
 		return -ECONNRESET;
 	}
 
@@ -4263,14 +4264,14 @@ static int handle_fwd_to_socks5_req_res(struct server_wrk *w, struct client_stat
 		expected_len += 16 + 2;
 		break;
 	default:
-		pr_error("Invalid SOCKS5 address type: %u", buf[3]);
+		pr_error("fwd_to: Invalid SOCKS5 address type: %u", buf[3]);
 		return -EINVAL;
 	}
 
 	if (ep->len < expected_len)
 		return 0;
 
-	pr_infov("Connected to SOCKS5 server: %s -> %s", sockaddr_to_str(&c->client_ep.addr), sockaddr_to_str(&c->target_ep.addr));
+	pr_infov("fwd_to: Connected to SOCKS5 server: %s -> %s", sockaddr_to_str(&c->client_ep.addr), sockaddr_to_str(&c->target_ep.addr));
 	c->fwd_to_socks5_state = FWD_TO_SOCKS5_STATE_INIT;
 	ep->len -= expected_len;
 
