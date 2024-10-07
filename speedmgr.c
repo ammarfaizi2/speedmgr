@@ -3977,11 +3977,10 @@ static int handle_fwd_to_socks5_auth(struct server_wrk *w, struct client_state *
 	assert(!(events & EPOLLOUT));
 	assert(events & EPOLLIN);
 	assert(ep->buf);
-	assert(!ep->len);
 	assert(ep->cap >= 2);
 
-	buf = ep->buf;
-	len = 2;
+	buf = ep->buf + ep->len;
+	len = 2 - ep->len;
 	ret = recv(ep->fd, buf, len, MSG_DONTWAIT);
 	if (ret < 0) {
 		ret = -errno;
@@ -4005,6 +4004,7 @@ static int handle_fwd_to_socks5_auth(struct server_wrk *w, struct client_state *
 		return 0;
 
 	ep->len = 0;
+	buf = ep->buf;
 	if (buf[0] != 0x05) {
 		pr_error("fwd_to: Invalid SOCKS5 version: %u", buf[0]);
 		return -EINVAL;
@@ -4104,7 +4104,6 @@ static int handle_fwd_to_socks5_auth_res(struct client_state *c, struct epoll_ev
 
 static int handle_fwd_to_socks5_req(struct client_state *c, struct epoll_event *ev)
 {
-	struct client_endp *ep = &c->target_ep;
 	uint32_t events = ev->events;
 	ssize_t ret;
 	size_t len;
@@ -4197,7 +4196,7 @@ static int handle_fwd_to_socks5_req(struct client_state *c, struct epoll_event *
 		}
 	}
 
-	ret = send(ep->fd, buf, len, MSG_DONTWAIT);
+	ret = send(c->target_ep.fd, buf, len, MSG_DONTWAIT);
 	free(buf);
 	if (ret != (ssize_t)len) {
 		pr_error("fwd_to: Failed to send SOCKS5 request: %s: send(): %zd", sockaddr_to_str(&c->target_ep.addr), ret);
@@ -4230,10 +4229,9 @@ static int handle_fwd_to_socks5_req_res(struct server_wrk *w, struct client_stat
 	assert(!(events & EPOLLOUT));
 	assert(events & EPOLLIN);
 	assert(ep->buf);
-	assert(!ep->len);
 
-	buf = ep->buf;
-	len = ep->cap;
+	buf = ep->buf + ep->len;
+	len = ep->cap - ep->len;
 	ret = recv(ep->fd, buf, len, MSG_DONTWAIT);
 	if (ret < 0) {
 		ret = -errno;
@@ -4249,6 +4247,17 @@ static int handle_fwd_to_socks5_req_res(struct server_wrk *w, struct client_stat
 	ep->len += (size_t)ret;
 	if (ep->len < 5)
 		return 0;
+
+	buf = ep->buf;
+	if (buf[0] != 0x05) {
+		pr_error("fwd_to: Invalid SOCKS5 version: %u", buf[0]);
+		return -EINVAL;
+	}
+
+	if (buf[1] != 0x00) {
+		pr_error("fwd_to: SOCKS5 request failed: %u", buf[1]);
+		return -EPERM;
+	}
 
 	expected_len = 4;
 	switch (buf[3]) {
