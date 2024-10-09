@@ -317,6 +317,7 @@ struct server_cfg {
 	const char		*socks5_user;
 	const char		*socks5_pass;
 	const char		*socks5_target;
+	const char		*socks5_dst_cauth;
 };
 
 struct dns_query {
@@ -364,6 +365,20 @@ struct socks5_target {
 	struct sockaddr_in46	addr;
 };
 
+struct ip_addr {
+	int ver;
+	union {
+		uint8_t	ip[4];
+		uint8_t	ip6[16];
+	};
+};
+
+struct whitelisted_src {
+	size_t			nr_ips;
+	pthread_mutex_t		lock;
+	struct ip_addr		*ips;
+};
+
 /*
  * Server context.
  */
@@ -372,6 +387,8 @@ struct server_ctx {
 	bool			accept_stopped;
 	bool			need_timer;
 	bool			fwd_to_socks5;
+	bool			has_socks5_dst_cauth;
+
 	int			tcp_fd;
 	struct server_wrk	*workers;
 	struct server_cfg	cfg;
@@ -379,6 +396,8 @@ struct server_ctx {
 	pthread_mutex_t		accept_mutex;
 	struct dns_resolver	*dns_resolver;
 	struct socks5_target	*socks5_target;
+	struct whitelisted_src	*whitelisted_src;
+	struct ip_addr		socks5_dst_cauth;
 };
 
 enum {
@@ -413,9 +432,10 @@ static const struct option long_options[] = {
 	{ "out-mark",		required_argument,	NULL,	'o' },
 	{ "as-socks5",		no_argument,		NULL,	'S' },
 	{ "to-socks5",		required_argument,	NULL,	'T' },
+	{ "socks5-dst-cauth",	required_argument,	NULL,	'C' },
 	{ NULL,			0,			NULL,	0 },
 };
-static const char short_options[] = "hVw:b:t:vB:U:I:D:d:o:ST:";
+static const char short_options[] = "hVw:b:t:vB:U:I:D:d:o:ST:C:";
 static const uint64_t spd_min_fill = 1024*8;
 
 static void show_help(const void *app)
@@ -436,6 +456,7 @@ static void show_help(const void *app)
 	printf("  -o, --out-mark=NUM\t\tOutgoing connection packet mark\n");
 	printf("  -S, --as-socks5\t\tUse as a SOCKS5 proxy server\n");
 	printf("  -T, --to-socks5=ADDR\t\tForward all traffic to a SOCKS5 server, addr:port\n");
+	printf("  -C, --socks5-dst-cauth=ADDR\tSOCKS5 server destination address for client authentication\n");
 }
 
 static int parse_addr_and_port(const char *str, struct sockaddr_in46 *out)
@@ -546,7 +567,7 @@ static size_t url_decode(char *str, size_t len)
 	return dest - str;
 }
 
-static const char *sockaddr_to_str(struct sockaddr_in46 *addr)
+static const char *sockaddr_to_str(const struct sockaddr_in46 *addr)
 {
 	static __thread char _buf[8][INET6_ADDRSTRLEN + sizeof("[]:65535")];
 	static __thread uint8_t _counter;
@@ -876,6 +897,9 @@ static int parse_args(int argc, char *argv[], struct server_cfg *cfg)
 			break;
 		case 'T':
 			cfg->socks5_target = optarg;
+			break;
+		case 'C':
+			cfg->socks5_dst_cauth = optarg;
 			break;
 		case '?':
 			return -EINVAL;
@@ -1879,15 +1903,133 @@ static void free_dns_resolver(struct server_ctx *ctx)
 	free(dr);
 }
 
-static int init_ctx(struct server_ctx *ctx)
+static int whitelist_ip_add(struct whitelisted_src *ws, const struct sockaddr_in46 *addr)
+{
+	struct ip_addr *new_ips, *ip;
+
+	pthread_mutex_lock(&ws->lock);
+	new_ips = realloc(ws->ips, (ws->nr_ips + 1) * sizeof(*new_ips));
+	if (!new_ips) {
+		pthread_mutex_unlock(&ws->lock);
+		return -ENOMEM;
+	}
+
+	ip = &new_ips[ws->nr_ips];
+	if (addr->sa.sa_family == AF_INET) {
+		ip->ver = AF_INET;
+		memcpy(&ip->ip, &addr->in4.sin_addr.s_addr, 4);
+	} else {
+		if (IN6_IS_ADDR_V4MAPPED(&addr->in6.sin6_addr)) {
+			ip->ver = AF_INET;
+			memcpy(&ip->ip, &addr->in6.sin6_addr.s6_addr[12], 4);
+		} else {
+			ip->ver = AF_INET6;
+			memcpy(&ip->ip, &addr->in6.sin6_addr.s6_addr, 16);
+		}
+	}
+
+	ws->ips = new_ips;
+	ws->nr_ips++;
+	pthread_mutex_unlock(&ws->lock);
+	return 0;
+}
+
+static int whitelist_ip_find(struct whitelisted_src *ws,
+			     const struct sockaddr_in46 *addr)
+{
+	int family = addr->sa.sa_family;
+	const void *addr_ptr;
+	size_t cmp_len;
+	size_t i;
+	int ret;
+
+	if (family == AF_INET) {
+		addr_ptr = &addr->in4.sin_addr.s_addr;
+	} else {
+		if (IN6_IS_ADDR_V4MAPPED(&addr->in6.sin6_addr)) {
+			family = AF_INET;
+			addr_ptr = &addr->in6.sin6_addr.s6_addr[12];
+		} else {
+			addr_ptr = &addr->in6.sin6_addr.s6_addr;
+		}
+	}
+
+	if (family == AF_INET)
+		cmp_len = 4;
+	else
+		cmp_len = 16;
+
+	pthread_mutex_lock(&ws->lock);
+	ret = -ENOENT;
+	for (i = 0; i < ws->nr_ips; i++) {
+		const struct ip_addr *ip = &ws->ips[i];
+		const void *to_cmp;
+
+		if (ip->ver != family)
+			continue;
+
+		if (family == AF_INET)
+			to_cmp = &ip->ip;
+		else
+			to_cmp = &ip->ip6;
+
+		if (!memcmp(to_cmp, addr_ptr, cmp_len)) {
+			ret = 0;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&ws->lock);
+	return ret;
+}
+
+static int parse_socks5_dst_cauth(struct server_ctx *ctx)
+{
+	struct server_cfg *cfg = &ctx->cfg;
+	struct whitelisted_src *ws;
+	const char *ast;
+	uint8_t *buf;
+	int ret;
+
+	if (!cfg->as_socks5 || !cfg->socks5_dst_cauth)
+		return 0;
+
+	ast = cfg->socks5_dst_cauth;
+
+	buf = (uint8_t *)&ctx->socks5_dst_cauth.ip;
+	ctx->socks5_dst_cauth.ver = AF_INET;
+	ret = inet_pton(AF_INET, ast, buf);
+	if (ret != 1) {
+		buf = (uint8_t *)&ctx->socks5_dst_cauth.ip6;
+		ctx->socks5_dst_cauth.ver = AF_INET6;
+		ret = inet_pton(AF_INET6, ast, buf);
+		if (ret != 1) {
+			pr_error("Invalid SOCKS5 destination connect for auth: %s", ast);
+			return -EINVAL;
+		}
+	}
+
+	ws = malloc(sizeof(*ws));
+	if (!ws)
+		return -ENOMEM;
+
+	ret = pthread_mutex_init(&ws->lock, NULL);
+	if (ret) {
+		free(ws);
+		return -ret;
+	}
+
+	ws->nr_ips = 0;
+	ws->ips = NULL;
+	ctx->whitelisted_src = ws;
+	ctx->has_socks5_dst_cauth = true;
+	pr_info("SOCKS5 proxy destination connect for auth: %s", ast);
+	return 0;
+}
+
+static int parse_socks5_target(struct server_ctx *ctx)
 {
 	struct server_cfg *cfg = &ctx->cfg;
 	int ret;
-
-	if ((cfg->up_limit && cfg->up_interval) || (cfg->down_limit && cfg->down_interval))
-		ctx->need_timer = true;
-	else
-		ctx->need_timer = false;
 
 	if (cfg->socks5_target) {
 		ret = parse_socks5_uri(cfg->socks5_target, &ctx->socks5_target);
@@ -1900,6 +2042,27 @@ static int init_ctx(struct server_ctx *ctx)
 		ctx->socks5_target = NULL;
 		ctx->fwd_to_socks5 = false;
 	}
+
+	return 0;
+}
+
+static int init_ctx(struct server_ctx *ctx)
+{
+	struct server_cfg *cfg = &ctx->cfg;
+	int ret;
+
+	if ((cfg->up_limit && cfg->up_interval) || (cfg->down_limit && cfg->down_interval))
+		ctx->need_timer = true;
+	else
+		ctx->need_timer = false;
+
+	ret = parse_socks5_target(ctx);
+	if (ret)
+		return ret;
+
+	ret = parse_socks5_dst_cauth(ctx);
+	if (ret)
+		return ret;
 
 	g_verbose = ctx->cfg.verbose;
 	try_increase_rlimit_nofile();
@@ -2405,6 +2568,71 @@ static int get_target_addr_socks5(struct client_state *c, struct sockaddr_in46 *
 	return 0;
 }
 
+static bool is_dst_cauth(struct ip_addr *wip, const struct sockaddr_in46 *dst_addr)
+{
+	const void *cmp_dst_ptra, *cmp_dst_ptrb;
+	int dst_family;
+	size_t cmp_len;
+
+	/*
+	 * Check whether the destination IP is the one specified
+	 * in the configuration.
+	 */
+	dst_family = dst_addr->sa.sa_family;
+	if (dst_family != wip->ver)
+		return false;
+
+	if (dst_family == AF_INET) {
+		cmp_dst_ptra = &dst_addr->in4.sin_addr.s_addr;
+		cmp_dst_ptrb = &wip->ip;
+		cmp_len = 4;
+	} else {
+		if (IN6_IS_ADDR_V4MAPPED(&dst_addr->in6.sin6_addr)) {
+			cmp_dst_ptra = &dst_addr->in6.sin6_addr.s6_addr[12];
+			cmp_dst_ptrb = &wip->ip;
+			cmp_len = 4;
+		} else {
+			cmp_dst_ptra = &dst_addr->in6.sin6_addr.s6_addr;
+			cmp_dst_ptrb = &wip->ip6;
+			cmp_len = 16;
+		}
+	}
+
+	return !memcmp(cmp_dst_ptra, cmp_dst_ptrb, cmp_len);
+}
+
+static int validate_socks5_dst_cauth(struct server_ctx *ctx, struct client_state *c,
+				     const struct sockaddr_in46 *dst_addr)
+{
+	const struct sockaddr_in46 *src_addr = &c->client_ep.addr;
+	int ret;
+
+	assert(ctx->whitelisted_src);
+
+	/*
+	 * Check whether the source IP is whitelisted. If so,
+	 * continue without checking the destination IP.
+	 */
+	if (!whitelist_ip_find(ctx->whitelisted_src, src_addr)) {
+		pr_infov("Connection from whitelisted source IP %s", sockaddr_to_str(src_addr));
+
+		if (is_dst_cauth(&ctx->socks5_dst_cauth, dst_addr))
+			return -ECONNRESET;
+
+		return 0;
+	}
+
+	if (is_dst_cauth(&ctx->socks5_dst_cauth, dst_addr)) {
+		ret = whitelist_ip_add(ctx->whitelisted_src, src_addr);
+		if (ret)
+			return ret;
+
+		pr_infov("Whitelisted source IP %s", sockaddr_to_str(src_addr));
+	}
+
+	return -ECONNRESET;
+}
+
 static int prepare_target_connect(struct server_wrk *w, struct client_state *c,
 				  bool for_socks5)
 {
@@ -2414,13 +2642,23 @@ static int prepare_target_connect(struct server_wrk *w, struct client_state *c,
 	int fd, ret;
 
 	memset(&taddr, 0, sizeof(taddr));
-	if (for_socks5)
-		ret = get_target_addr_socks5(c, &taddr);
-	else
-		ret = get_target_addr(w, c, &taddr);
+	if (for_socks5) {
+		struct server_ctx *ctx = w->ctx;
 
-	if (ret)
-		return ret;
+		ret = get_target_addr_socks5(c, &taddr);
+		if (ret)
+			return ret;
+
+		if (ctx->has_socks5_dst_cauth) {
+			ret = validate_socks5_dst_cauth(ctx, c, &taddr);
+			if (ret)
+				return ret;
+		}
+	} else {
+		ret = get_target_addr(w, c, &taddr);
+		if (ret)
+			return ret;
+	}
 
 	fd = socket(taddr.sa.sa_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
 	if (fd < 0) {
