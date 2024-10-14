@@ -1168,6 +1168,13 @@ static int init_socket(struct server_ctx *ctx)
 	setsockopt(tcp_fd, SOL_SOCKET, SO_REUSEADDR, &ret, sizeof(ret));
 #endif
 
+#ifdef TCP_DEFER_ACCEPT
+	if (ctx->cfg.as_socks5) {
+		ret = 10;
+		setsockopt(tcp_fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &ret, sizeof(ret));
+	}
+#endif
+
 	if (family == AF_INET6)
 		len = sizeof(ctx->cfg.bind_addr.in6);
 	else
