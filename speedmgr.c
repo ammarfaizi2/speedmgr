@@ -88,6 +88,7 @@
 #include <errno.h>
 
 #include <netinet/in.h>
+#include <sys/file.h>
 #include <sys/time.h>
 #include <sys/timerfd.h>
 #include <sys/resource.h>
@@ -312,12 +313,14 @@ struct server_cfg {
 	uint64_t		up_interval;
 	uint64_t		down_limit;
 	uint64_t		down_interval;
+	uint64_t		init_quota;
 	struct sockaddr_in46	bind_addr;
 	struct sockaddr_in46	target_addr;
 	const char		*socks5_user;
 	const char		*socks5_pass;
 	const char		*socks5_target;
 	const char		*socks5_dst_cauth;
+	const char		*save_quota_path;
 };
 
 struct dns_query {
@@ -388,6 +391,8 @@ struct server_ctx {
 	bool			need_timer;
 	bool			fwd_to_socks5;
 	bool			has_socks5_dst_cauth;
+	bool			has_quota_accounting;
+	bool			quota_exceeded;
 
 	int			tcp_fd;
 	struct server_wrk	*workers;
@@ -398,6 +403,9 @@ struct server_ctx {
 	struct socks5_target	*socks5_target;
 	struct whitelisted_src	*whitelisted_src;
 	struct ip_addr		socks5_dst_cauth;
+	_Atomic(long long)	quota;
+	_Atomic(unsigned long)	quota_iter;
+	FILE			*quota_fp;
 };
 
 enum {
@@ -433,9 +441,11 @@ static const struct option long_options[] = {
 	{ "as-socks5",		no_argument,		NULL,	'S' },
 	{ "to-socks5",		required_argument,	NULL,	'T' },
 	{ "socks5-dst-cauth",	required_argument,	NULL,	'C' },
+	{ "quota",		required_argument,	NULL,	'Q' },
+	{ "save-quota-path",	required_argument,	NULL,	'q' },
 	{ NULL,			0,			NULL,	0 },
 };
-static const char short_options[] = "hVw:b:t:vB:U:I:D:d:o:ST:C:";
+static const char short_options[] = "hVw:b:t:vB:U:I:D:d:o:ST:C:Q:q:";
 static const uint64_t spd_min_fill = 1024*8;
 
 static void show_help(const void *app)
@@ -457,6 +467,8 @@ static void show_help(const void *app)
 	printf("  -S, --as-socks5\t\tUse as a SOCKS5 proxy server\n");
 	printf("  -T, --to-socks5=ADDR\t\tForward all traffic to a SOCKS5 server, addr:port\n");
 	printf("  -C, --socks5-dst-cauth=ADDR\tSOCKS5 server destination address for client authentication\n");
+	printf("  -Q, --quota=NUM\t\tQuota (bytes)\n");
+	printf("  -q, --save-quota-path=PATH\tSave quota path\n");
 }
 
 static int parse_addr_and_port(const char *str, struct sockaddr_in46 *out)
@@ -771,6 +783,8 @@ static int parse_args(int argc, char *argv[], struct server_cfg *cfg)
 	cfg->backlog = 4096;
 	cfg->nr_workers = 4;
 	cfg->verbose = 0;
+	cfg->init_quota = 0;
+	cfg->save_quota_path = NULL;
 
 	memset(&p, 0, sizeof(p));
 	while (1) {
@@ -900,6 +914,24 @@ static int parse_args(int argc, char *argv[], struct server_cfg *cfg)
 			break;
 		case 'C':
 			cfg->socks5_dst_cauth = optarg;
+			break;
+		case 'Q':
+			cfg->init_quota = strtoull(optarg, &t, 10);
+			if (!t || *t == '\0') {
+				/* nothing */
+			} else if (*t == 'K' || *t == 'k') {
+				cfg->init_quota *= 1024;
+			} else if (*t == 'M' || *t == 'm') {
+				cfg->init_quota *= 1024 * 1024;
+			} else if (*t == 'G' || *t == 'g') {
+				cfg->init_quota *= 1024 * 1024 * 1024;
+			} else if (*t != '\0') {
+				pr_error("Invalid init_quota: %s", optarg);
+				return -EINVAL;
+			}
+			break;
+		case 'q':
+			cfg->save_quota_path = optarg;
 			break;
 		case '?':
 			return -EINVAL;
@@ -2053,10 +2085,78 @@ static int parse_socks5_target(struct server_ctx *ctx)
 	return 0;
 }
 
+static void write_quota(struct server_ctx *ctx, long long nbytes)
+{
+	FILE *fp = ctx->quota_fp;
+
+	if (!fp)
+		return;
+
+	if (nbytes < 0)
+		nbytes = 0;
+
+	pthread_mutex_lock(&ctx->accept_mutex);
+	flock(fileno(fp), LOCK_EX);
+	rewind(fp);
+	ftruncate64(fileno(fp), 0);
+	fprintf(fp, "%lld\n", nbytes);
+	fflush(fp);
+	flock(fileno(fp), LOCK_UN);
+	pthread_mutex_unlock(&ctx->accept_mutex);
+}
+
+static void consume_quota(struct server_ctx *ctx, uint64_t bytes)
+{
+	long long q, p = (long long)bytes;
+	unsigned long iter;
+
+	if (!ctx->has_quota_accounting)
+		return;
+
+	q = atomic_fetch_sub(&ctx->quota, p) - p;
+	if (q < 0) {
+		q = 0;
+		atomic_store(&ctx->quota, q);
+		ctx->quota_exceeded = true;
+	}
+
+	if (ctx->quota_fp) {
+		iter = atomic_fetch_add(&ctx->quota_iter, 1ul) + 1ul;
+		if ((iter % 512) == 0)
+			write_quota(ctx, q);
+	}
+}
+
 static int init_ctx(struct server_ctx *ctx)
 {
 	struct server_cfg *cfg = &ctx->cfg;
 	int ret;
+
+	if (ctx->cfg.init_quota) {
+		atomic_store(&ctx->quota, (long long)ctx->cfg.init_quota);
+		ctx->has_quota_accounting = true;
+		ctx->quota_exceeded = false;
+	}
+
+	if (ctx->cfg.save_quota_path) {
+		FILE *fp;
+
+		if (!ctx->cfg.init_quota) {
+			pr_error("Save quota path is set but initial quota is not set");
+			return -EINVAL;
+		}
+
+		fp = fopen(ctx->cfg.save_quota_path, "wb+");
+		if (!fp) {
+			pr_error("Failed to open quota file for writing: %s", strerror(errno));
+			return -errno;
+		}
+
+		write_quota(ctx, ctx->quota);
+		ctx->quota_fp = fp;
+	} else {
+		ctx->quota_fp = NULL;
+	}
 
 	if ((cfg->up_limit && cfg->up_interval) || (cfg->down_limit && cfg->down_interval))
 		ctx->need_timer = true;
@@ -2129,6 +2229,12 @@ static void free_ctx(struct server_ctx *ctx)
 
 	if (ctx->socks5_target)
 		free(ctx->socks5_target);
+
+	if (ctx->quota_fp) {
+		write_quota(ctx, atomic_load(&ctx->quota));
+		fclose(ctx->quota_fp);
+		ctx->quota_fp = NULL;
+	}
 }
 
 static inline void get_ip_ptr(const struct sockaddr_in46 *addr, const void **ptr,
@@ -2450,6 +2556,9 @@ static void __put_client_slot(struct server_wrk *w, struct client_state *c,
 	atomic_fetch_sub(&w->nr_online_clients, 1u);
 	w->handle_events_should_stop = hess;
 	(void)ret;
+
+	if (w->ctx->quota_fp)
+		write_quota(w->ctx, atomic_load(&w->ctx->quota));
 }
 
 static void put_client_slot(struct server_wrk *w, struct client_state *c)
@@ -2868,6 +2977,17 @@ do_accept:
 	if (unlikely(ret < 0))
 		return handle_accept_error(errno, w);
 
+	if (w->ctx->has_quota_accounting) {
+		if (w->ctx->quota_fp)
+			write_quota(w->ctx, atomic_load(&w->ctx->quota));
+
+		if (w->ctx->quota_exceeded) {
+			pr_infov("Quota exceeded, dropping connection");
+			close(ret);
+			return 0;
+		}
+	}
+
 	set_optional_sockopt(ret);
 	if (unlikely(len > sizeof(addr))) {
 		pr_error("accept() returned invalid address length: %u", len);
@@ -3254,8 +3374,12 @@ static ssize_t do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 		return sock_ret;
 	}
 
-	if (sock_ret > 0)
+	if (sock_ret > 0) {
 		consume_token(c, dir, (size_t)sock_ret);
+		consume_quota(w->ctx, sock_ret);
+		if (w->ctx->has_quota_accounting && w->ctx->quota_exceeded)
+			return -ECONNRESET;
+	}
 
 enable_out_dst:
 	if (src->len > 0) {
@@ -3311,8 +3435,12 @@ static ssize_t do_pipe_epoll_out(struct server_wrk *w, struct client_state *c,
 		return sock_ret;
 	}
 
-	if (sock_ret > 0)
+	if (sock_ret > 0) {
 		consume_token(c, dir, (size_t)sock_ret);
+		consume_quota(w->ctx, sock_ret);
+		if (w->ctx->has_quota_accounting && w->ctx->quota_exceeded)
+			return -ECONNRESET;
+	}
 
 	if (src->len == 0) {
 		pr_vl_dbg(3, "Disabling EPOLLOUT on dst=%s (fd=%d; psrc=%s; pdst=%s; thread=%u)",
