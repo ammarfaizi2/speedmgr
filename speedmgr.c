@@ -3250,8 +3250,13 @@ static ssize_t do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 	ssize_t sock_ret;
 	int err;
 
-	if (!check_quota(w))
+	if (!check_quota(w)) {
+		pr_infov("Quota exceeded, dropping connection: %s -> %s (thread %u)",
+			 sockaddr_to_str(psrc),
+			 sockaddr_to_str(pdst),
+			 w->idx);
 		return -ECONNRESET;
+	}
 
 	sock_ret = do_ep_recv(src);
 	if (sock_ret < 0) {
@@ -3351,8 +3356,13 @@ static ssize_t do_pipe_epoll_out(struct server_wrk *w, struct client_state *c,
 	ssize_t sock_ret;
 	int err;
 
-	if (!check_quota(w))
+	if (!check_quota(w)) {
+		pr_infov("Quota exceeded, dropping connection: %s -> %s (thread %u)",
+			 sockaddr_to_str(psrc),
+			 sockaddr_to_str(pdst),
+			 w->idx);
 		return -ECONNRESET;
+	}
 
 	if (!max_send_size)
 		return do_rate_limit(w, c, dir);
