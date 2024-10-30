@@ -3218,6 +3218,26 @@ static int do_rate_limit(struct server_wrk *w, struct client_state *c,
 	return arm_timer(w, delta_us);
 }
 
+static bool check_quota(struct server_wrk *w)
+{
+	struct server_ctx *ctx = w->ctx;
+
+	if (!ctx->qo)
+		return true;
+
+	return !qo_quota_exceeded(ctx->qo);
+}
+
+static void consume_quota(struct server_wrk *w, size_t size)
+{
+	struct server_ctx *ctx = w->ctx;
+
+	if (!ctx->qo)
+		return;
+
+	qo_quota_consume(ctx->qo, size);
+}
+
 static ssize_t do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 				struct client_endp *src, struct client_endp *dst)
 {
@@ -3229,6 +3249,9 @@ static ssize_t do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 	size_t max_send_size = get_max_send_size(c, dir);
 	ssize_t sock_ret;
 	int err;
+
+	if (!check_quota(w))
+		return -ECONNRESET;
 
 	sock_ret = do_ep_recv(src);
 	if (sock_ret < 0) {
@@ -3284,8 +3307,10 @@ static ssize_t do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 		return sock_ret;
 	}
 
-	if (sock_ret > 0)
+	if (sock_ret > 0) {
 		consume_token(c, dir, (size_t)sock_ret);
+		consume_quota(w, sock_ret);
+	}
 
 enable_out_dst:
 	if (src->len > 0) {
@@ -3326,6 +3351,9 @@ static ssize_t do_pipe_epoll_out(struct server_wrk *w, struct client_state *c,
 	ssize_t sock_ret;
 	int err;
 
+	if (!check_quota(w))
+		return -ECONNRESET;
+
 	if (!max_send_size)
 		return do_rate_limit(w, c, dir);
 
@@ -3341,8 +3369,10 @@ static ssize_t do_pipe_epoll_out(struct server_wrk *w, struct client_state *c,
 		return sock_ret;
 	}
 
-	if (sock_ret > 0)
+	if (sock_ret > 0) {
 		consume_token(c, dir, (size_t)sock_ret);
+		consume_quota(w, sock_ret);
+	}
 
 	if (src->len == 0) {
 		pr_vl_dbg(3, "Disabling EPOLLOUT on dst=%s (fd=%d; psrc=%s; pdst=%s; thread=%u)",
