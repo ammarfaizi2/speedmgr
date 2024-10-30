@@ -409,6 +409,7 @@ struct server_ctx {
 	struct socks5_target	*socks5_target;
 	struct whitelisted_src	*whitelisted_src;
 	struct ip_addr		socks5_dst_cauth;
+	struct spd_quota	*qo;
 };
 
 enum {
@@ -422,6 +423,8 @@ enum {
 	EPL_EV_TCP_TARGET_SOCKS5_CONN		= (0x0008ull << 48ull),
 	EPL_EV_DNS_RESOLUTION			= (0x0009ull << 48ull),
 	EPL_EV_TO_SOCKS5_SERVER			= (0x000aull << 48ull),
+	EPL_EV_QUOTA_UNIX_SOCK			= (0x000bull << 48ull),
+	EPL_EV_QUOTA_UNIX_SOCK_CLIENT		= (0x000cull << 48ull),
 };
 
 #define EPL_EV_MASK		(0xffffull << 48ull)
@@ -915,6 +918,12 @@ static int parse_args(int argc, char *argv[], struct server_cfg *cfg)
 			break;
 		case 'C':
 			cfg->socks5_dst_cauth = optarg;
+			break;
+		case 'Q':
+			cfg->init_quota_size = atoll(optarg);
+			break;
+		case 'z':
+			cfg->quota_unix_sock = optarg;
 			break;
 		case '?':
 			return -EINVAL;
@@ -1665,6 +1674,7 @@ static int init_worker(struct server_wrk *w, bool create_thread)
 			goto out_err;
 		}
 	} else {
+		struct server_ctx *ctx = w->ctx;
 		/*
 		 * Add the main TCP socket which accepts new connections to the
 		 * epoll instance in the main thread.
@@ -1675,6 +1685,13 @@ static int init_worker(struct server_wrk *w, bool create_thread)
 		ret = epoll_add(w->ep_fd, w->ctx->tcp_fd, EPOLLIN, data);
 		if (ret)
 			goto out_err;
+
+		if (ctx->qo && ctx->qo->unix_fd > 0) {
+			data.u64 = EPL_EV_QUOTA_UNIX_SOCK;
+			ret = epoll_add(w->ep_fd, ctx->qo->unix_fd, EPOLLIN, data);
+			if (ret)
+				goto out_err;
+		}
 	}
 
 	return 0;
@@ -2091,9 +2108,12 @@ static int init_ctx(struct server_ctx *ctx)
 	ret = install_signal_handlers(ctx);
 	if (ret)
 		return ret;
-	ret = init_socket(ctx);
+	ret = qo_init(&ctx->qo, cfg->init_quota_size, cfg->quota_unix_sock);
 	if (ret)
 		return ret;
+	ret = init_socket(ctx);
+	if (ret)
+		goto out_free_qo;
 	ret = init_dns_resolver(ctx);
 	if (ret)
 		goto out_free_socket;
@@ -2123,6 +2143,8 @@ out_free_dns:
 	free_dns_resolver(ctx);
 out_free_socket:
 	free_socket(ctx);
+out_free_qo:
+	qo_free(ctx->qo);
 	return ret;
 }
 
@@ -2133,6 +2155,7 @@ static void free_ctx(struct server_ctx *ctx)
 	free_dns_resolver(ctx);
 	free_spd_map(ctx);
 	free_socket(ctx);
+	qo_free(ctx->qo);
 
 	if (ctx->socks5_target)
 		free(ctx->socks5_target);
@@ -4583,6 +4606,57 @@ static int handle_event_to_socks5_server(struct server_wrk *w, struct epoll_even
 	}
 }
 
+static int handle_event_quota_unix_sock(struct server_wrk *w, struct epoll_event *ev)
+{
+	uint32_t events = ev->events;
+	struct spd_quota_client *c;
+	int ret;
+
+	if (unlikely(events & (EPOLLERR | EPOLLHUP))) {
+		pr_error("Quota UNIX socket hit EPOLLERR|EPOLLHUP");
+		return -ECONNRESET;
+	}
+
+	c = qo_quota_unix_accept(w->ctx->qo);
+	if (c) {
+		union epoll_data data;
+
+		data.u64 = 0;
+		data.ptr = c;
+		data.u64 |= EPL_EV_QUOTA_UNIX_SOCK_CLIENT;
+		ret = epoll_add(w->ep_fd, c->fd, EPOLLIN, data);
+		if (ret) {
+			pr_error("Failed to add quota UNIX socket to epoll: %s", strerror(-ret));
+			qo_quota_unix_client_close(w->ctx->qo, c);
+			return ret;
+		}
+
+		pr_info("Accepted a quota UNIX socket connection");
+	} else {
+		pr_error("Failed to accept quota UNIX socket connection");
+	}
+
+	return 0;
+}
+
+static int handle_event_quota_unix_sock_client(struct server_wrk *w, struct epoll_event *ev)
+{
+	struct spd_quota_client *c = GET_EPL_DT(ev->data.u64);
+	uint32_t events = ev->events;
+	int ret = 0;
+
+	if (unlikely(events & (EPOLLERR | EPOLLHUP)))
+		return -ECONNRESET;
+
+	if (events & EPOLLIN) {
+		ret = qo_quota_unix_handle(w->ctx->qo, c);
+		if (ret == -EAGAIN)
+			return 0;
+	}
+
+	return ret;
+}
+
 static int handle_event(struct server_wrk *w, struct epoll_event *ev,
 			bool *has_event_timer, bool *has_event_accept)
 {
@@ -4624,6 +4698,14 @@ static int handle_event(struct server_wrk *w, struct epoll_event *ev,
 		if (!w->handle_events_should_stop)
 			ret = handle_event_to_socks5_server(w, ev);
 		break;
+	case EPL_EV_QUOTA_UNIX_SOCK:
+		if (!w->handle_events_should_stop)
+			ret = handle_event_quota_unix_sock(w, ev);
+		break;
+	case EPL_EV_QUOTA_UNIX_SOCK_CLIENT:
+		if (!w->handle_events_should_stop)
+			ret = handle_event_quota_unix_sock_client(w, ev);
+		break;
 	default:
 		pr_error("Unknown event type: %lu (thread %u)", evt, w->idx);
 		return -EINVAL;
@@ -4639,7 +4721,10 @@ static int handle_event(struct server_wrk *w, struct epoll_event *ev,
 		case EPL_EV_DNS_RESOLUTION:
 		case EPL_EV_TO_SOCKS5_SERVER:
 			put_client_slot(w, GET_EPL_DT(ev->data.u64));
-			ret = 0;
+			break;
+		case EPL_EV_QUOTA_UNIX_SOCK_CLIENT:
+			pr_info("Closing quota UNIX socket client connection");
+			qo_quota_unix_client_close(w->ctx->qo, GET_EPL_DT(ev->data.u64));
 			break;
 		default:
 			break;

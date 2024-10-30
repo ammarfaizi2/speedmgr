@@ -52,6 +52,7 @@ int qo_init(struct spd_quota **sq_p, long long initial_quota, const char *unix_s
 	struct spd_quota *sq;
 	int ret;
 
+	*sq_p = NULL;
 	sq = calloc(1, sizeof(*sq));
 	if (!sq)
 		return -ENOMEM;
@@ -67,6 +68,10 @@ int qo_init(struct spd_quota **sq_p, long long initial_quota, const char *unix_s
 			free(sq);
 			return ret;
 		}
+
+		sq->unix_fd = ret;
+	} else {
+		sq->unix_fd = -1;
 	}
 
 	ret = pthread_mutex_init(&sq->lock, NULL);
@@ -82,6 +87,9 @@ int qo_init(struct spd_quota **sq_p, long long initial_quota, const char *unix_s
 void qo_free(struct spd_quota *sq)
 {
 	size_t i;
+
+	if (!sq)
+		return;
 
 	if (sq->unix_fd >= 0)
 		close(sq->unix_fd);
