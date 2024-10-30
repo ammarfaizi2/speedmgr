@@ -388,32 +388,6 @@ struct whitelisted_src {
 	struct ip_addr		*ips;
 };
 
-enum {
-	QUOTA_PKT_ADD		= 0,
-	QUOTA_PKT_SUB		= 1,
-	QUOTA_PKT_SET		= 2,
-	QUOTA_PKT_GET		= 3,
-	QUOTA_PKT_RES		= 4,
-};
-
-struct quota_pkt {
-	uint8_t		type;
-	union {
-		uint64_t	add;
-		uint64_t	sub;
-		uint64_t	set;
-		uint64_t	res;
-	};
-} __packed;
-
-struct quota_usock_buf {
-	size_t		len;
-	union {
-		struct quota_pkt	pkt;
-		uint8_t			buf[sizeof(struct quota_pkt)];
-	};
-};
-
 /*
  * Server context.
  */
@@ -423,12 +397,8 @@ struct server_ctx {
 	bool			need_timer;
 	bool			fwd_to_socks5;
 	bool			has_socks5_dst_cauth;
-	bool			has_quota_accounting;
-	bool			quota_exceeded;
 
 	int			tcp_fd;
-	int			quota_fd;
-	int			quota_cl_fd;
 	struct server_wrk	*workers;
 	struct server_cfg	cfg;
 	struct ip_spd_map	spd_map;
@@ -437,10 +407,6 @@ struct server_ctx {
 	struct socks5_target	*socks5_target;
 	struct whitelisted_src	*whitelisted_src;
 	struct ip_addr		socks5_dst_cauth;
-	_Atomic(long long)	quota;
-	_Atomic(unsigned long)	quota_iter;
-	FILE			*quota_fp;
-	struct quota_usock_buf	quota_buf;
 };
 
 enum {
@@ -454,8 +420,6 @@ enum {
 	EPL_EV_TCP_TARGET_SOCKS5_CONN		= (0x0008ull << 48ull),
 	EPL_EV_DNS_RESOLUTION			= (0x0009ull << 48ull),
 	EPL_EV_TO_SOCKS5_SERVER			= (0x000aull << 48ull),
-	EPL_EV_QUOTA_UNIX_SOCK			= (0x000bull << 48ull),
-	EPL_EV_QUOTA_UNIX_SOCK_CLIENT		= (0x000cull << 48ull),
 };
 
 #define EPL_EV_MASK		(0xffffull << 48ull)
@@ -822,8 +786,6 @@ static int parse_args(int argc, char *argv[], struct server_cfg *cfg)
 	cfg->backlog = 4096;
 	cfg->nr_workers = 4;
 	cfg->verbose = 0;
-	cfg->init_quota = 0;
-	cfg->save_quota_path = NULL;
 
 	memset(&p, 0, sizeof(p));
 	while (1) {
@@ -953,27 +915,6 @@ static int parse_args(int argc, char *argv[], struct server_cfg *cfg)
 			break;
 		case 'C':
 			cfg->socks5_dst_cauth = optarg;
-			break;
-		case 'Q':
-			cfg->init_quota = strtoull(optarg, &t, 10);
-			if (!t || *t == '\0') {
-				/* nothing */
-			} else if (*t == 'K' || *t == 'k') {
-				cfg->init_quota *= 1024;
-			} else if (*t == 'M' || *t == 'm') {
-				cfg->init_quota *= 1024 * 1024;
-			} else if (*t == 'G' || *t == 'g') {
-				cfg->init_quota *= 1024 * 1024 * 1024;
-			} else if (*t != '\0') {
-				pr_error("Invalid init_quota: %s", optarg);
-				return -EINVAL;
-			}
-			break;
-		case 'q':
-			cfg->save_quota_path = optarg;
-			break;
-		case 'z':
-			cfg->quota_unix_sock = optarg;
 			break;
 		case '?':
 			return -EINVAL;
@@ -1734,16 +1675,6 @@ static int init_worker(struct server_wrk *w, bool create_thread)
 		ret = epoll_add(w->ep_fd, w->ctx->tcp_fd, EPOLLIN, data);
 		if (ret)
 			goto out_err;
-
-		/*
-		 * If we have quota unix socket, add it to the main epoll instance.
-		 */
-		if (w->ctx->quota_fd >= 0) {
-			data.u64 = EPL_EV_QUOTA_UNIX_SOCK;
-			ret = epoll_add(w->ep_fd, w->ctx->quota_fd, EPOLLIN, data);
-			if (ret)
-				goto out_err;
-		}
 	}
 
 	return 0;
@@ -2137,138 +2068,6 @@ static int parse_socks5_target(struct server_ctx *ctx)
 	return 0;
 }
 
-static void write_quota(struct server_ctx *ctx, long long nbytes)
-{
-	FILE *fp = ctx->quota_fp;
-
-	if (!fp)
-		return;
-
-	if (nbytes < 0)
-		nbytes = 0;
-
-	pthread_mutex_lock(&ctx->accept_mutex);
-	flock(fileno(fp), LOCK_EX);
-	rewind(fp);
-	ftruncate64(fileno(fp), 0);
-	fprintf(fp, "%lld\n", nbytes);
-	fflush(fp);
-	flock(fileno(fp), LOCK_UN);
-	pthread_mutex_unlock(&ctx->accept_mutex);
-}
-
-static void consume_quota(struct server_ctx *ctx, uint64_t bytes)
-{
-	long long q, p = (long long)bytes;
-	unsigned long iter;
-
-	if (!ctx->has_quota_accounting)
-		return;
-
-	q = atomic_fetch_sub(&ctx->quota, p) - p;
-	if (q < 0) {
-		q = 0;
-		atomic_store(&ctx->quota, q);
-		ctx->quota_exceeded = true;
-	}
-
-	if (ctx->quota_fp) {
-		iter = atomic_fetch_add(&ctx->quota_iter, 1ul) + 1ul;
-		if ((iter % 512) == 0)
-			write_quota(ctx, q);
-	}
-}
-
-static int init_quota(struct server_ctx *ctx)
-{
-	struct server_cfg *cfg = &ctx->cfg;
-
-	if (cfg->init_quota) {
-		atomic_store(&ctx->quota, (long long)ctx->cfg.init_quota);
-		ctx->has_quota_accounting = true;
-		ctx->quota_exceeded = false;
-	}
-
-	if (cfg->save_quota_path) {
-		FILE *fp;
-
-		if (!ctx->cfg.init_quota) {
-			pr_error("Save quota path is set but initial quota is not set");
-			return -EINVAL;
-		}
-
-		fp = fopen(ctx->cfg.save_quota_path, "wb+");
-		if (!fp) {
-			pr_error("Failed to open quota file for writing: %s", strerror(errno));
-			return -errno;
-		}
-
-		write_quota(ctx, ctx->quota);
-		ctx->quota_fp = fp;
-	} else {
-		ctx->quota_fp = NULL;
-	}
-
-	if (cfg->quota_unix_sock) {
-		struct sockaddr_un addr;
-		int fd, err;
-
-		fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
-		if (fd < 0) {
-			err = -errno;
-			pr_error("Failed to create quota UNIX socket: %s", strerror(-err));
-			return err;
-		}
-
-		memset(&addr, 0, sizeof(addr));
-		addr.sun_family = AF_UNIX;
-		strncpy(addr.sun_path, cfg->quota_unix_sock, sizeof(addr.sun_path) - 1);
-		addr.sun_path[sizeof(addr.sun_path) - 1] = '\0';
-		unlink(cfg->quota_unix_sock);
-		err = bind(fd, (struct sockaddr *)&addr, sizeof(addr));
-		if (err) {
-			err = -errno;
-			pr_error("Failed to bind quota UNIX socket: %s", strerror(-err));
-			close(fd);
-			return err;
-		}
-
-		err = listen(fd, 1);
-		if (err) {
-			err = -errno;
-			pr_error("Failed to listen on quota UNIX socket: %s", strerror(-err));
-			close(fd);
-			return err;
-		}
-
-		ctx->quota_fd = fd;
-	} else {
-		ctx->quota_fd = -1;
-	}
-
-	ctx->quota_cl_fd = -1;
-	return 0;
-}
-
-static void free_quota(struct server_ctx *ctx)
-{
-	if (ctx->quota_fp) {
-		write_quota(ctx, atomic_load(&ctx->quota));
-		fclose(ctx->quota_fp);
-		ctx->quota_fp = NULL;
-	}
-
-	if (ctx->quota_fd >= 0) {
-		close(ctx->quota_fd);
-		ctx->quota_fd = -1;
-	}
-
-	if (ctx->quota_cl_fd >= 0) {
-		close(ctx->quota_cl_fd);
-		ctx->quota_cl_fd = -1;
-	}
-}
-
 static int init_ctx(struct server_ctx *ctx)
 {
 	struct server_cfg *cfg = &ctx->cfg;
@@ -2292,13 +2091,9 @@ static int init_ctx(struct server_ctx *ctx)
 	ret = install_signal_handlers(ctx);
 	if (ret)
 		return ret;
-
-	ret = init_quota(ctx);
-	if (ret)
-		return ret;
 	ret = init_socket(ctx);
 	if (ret)
-		goto out_free_quota;
+		return ret;
 	ret = init_dns_resolver(ctx);
 	if (ret)
 		goto out_free_socket;
@@ -2328,8 +2123,6 @@ out_free_dns:
 	free_dns_resolver(ctx);
 out_free_socket:
 	free_socket(ctx);
-out_free_quota:
-	free_quota(ctx);
 	return ret;
 }
 
@@ -2340,7 +2133,6 @@ static void free_ctx(struct server_ctx *ctx)
 	free_dns_resolver(ctx);
 	free_spd_map(ctx);
 	free_socket(ctx);
-	free_quota(ctx);
 
 	if (ctx->socks5_target)
 		free(ctx->socks5_target);
@@ -2665,9 +2457,6 @@ static void __put_client_slot(struct server_wrk *w, struct client_state *c,
 	atomic_fetch_sub(&w->nr_online_clients, 1u);
 	w->handle_events_should_stop = hess;
 	(void)ret;
-
-	if (w->ctx->quota_fp)
-		write_quota(w->ctx, atomic_load(&w->ctx->quota));
 }
 
 static void put_client_slot(struct server_wrk *w, struct client_state *c)
@@ -3086,17 +2875,6 @@ do_accept:
 	if (unlikely(ret < 0))
 		return handle_accept_error(errno, w);
 
-	if (w->ctx->has_quota_accounting) {
-		if (w->ctx->quota_fp)
-			write_quota(w->ctx, atomic_load(&w->ctx->quota));
-
-		if (w->ctx->quota_exceeded) {
-			pr_infov("Quota exceeded, dropping connection");
-			close(ret);
-			return 0;
-		}
-	}
-
 	set_optional_sockopt(ret);
 	if (unlikely(len > sizeof(addr))) {
 		pr_error("accept() returned invalid address length: %u", len);
@@ -3483,12 +3261,8 @@ static ssize_t do_pipe_epoll_in(struct server_wrk *w, struct client_state *c,
 		return sock_ret;
 	}
 
-	if (sock_ret > 0) {
+	if (sock_ret > 0)
 		consume_token(c, dir, (size_t)sock_ret);
-		consume_quota(w->ctx, sock_ret);
-		if (w->ctx->has_quota_accounting && w->ctx->quota_exceeded)
-			return -ECONNRESET;
-	}
 
 enable_out_dst:
 	if (src->len > 0) {
@@ -3544,12 +3318,8 @@ static ssize_t do_pipe_epoll_out(struct server_wrk *w, struct client_state *c,
 		return sock_ret;
 	}
 
-	if (sock_ret > 0) {
+	if (sock_ret > 0)
 		consume_token(c, dir, (size_t)sock_ret);
-		consume_quota(w->ctx, sock_ret);
-		if (w->ctx->has_quota_accounting && w->ctx->quota_exceeded)
-			return -ECONNRESET;
-	}
 
 	if (src->len == 0) {
 		pr_vl_dbg(3, "Disabling EPOLLOUT on dst=%s (fd=%d; psrc=%s; pdst=%s; thread=%u)",
@@ -4813,129 +4583,6 @@ static int handle_event_to_socks5_server(struct server_wrk *w, struct epoll_even
 	}
 }
 
-static int handle_event_quota_unix_sock(struct server_wrk *w)
-{
-	union epoll_data data;
-	int ret, fd;
-
-	fd = accept4(w->ctx->quota_fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
-	if (fd < 0) {
-		ret = -errno;
-		if (ret == -EAGAIN || ret == -EINTR)
-			return 0;
-
-		pr_error("Failed to accept quota UNIX socket connection: %s", strerror(-ret));
-		return ret;
-	}
-
-	epoll_del(w->ep_fd, w->ctx->quota_fd);
-	w->ctx->quota_buf.len = 0;
-	w->ctx->quota_cl_fd = fd;
-	data.u64 = EPL_EV_QUOTA_UNIX_SOCK_CLIENT;
-	return epoll_add(w->ep_fd, fd, EPOLLIN, data);
-}
-
-static void close_quota_unix_sock(struct server_wrk *w)
-{
-	if (w->ctx->quota_cl_fd >= 0) {
-		union epoll_data data;
-
-		close(w->ctx->quota_cl_fd);
-		w->ctx->quota_cl_fd = -1;
-
-		data.u64 = EPL_EV_QUOTA_UNIX_SOCK;
-		epoll_add(w->ep_fd, w->ctx->quota_fd, EPOLLIN, data);
-	}
-}
-
-static int handle_event_quota_unix_sock_client(struct server_wrk *w, struct epoll_event *ev)
-{
-	struct quota_usock_buf *qub = &w->ctx->quota_buf;
-	struct server_ctx *ctx = w->ctx;
-	uint32_t events = ev->events;
-	size_t len, expected_len;
-	struct quota_pkt resp;
-	long long last_quota;
-	uint8_t *ptr;
-	ssize_t ret;
-
-	if (unlikely(events & (EPOLLERR | EPOLLHUP))) {
-		close_quota_unix_sock(w);
-		return -ECONNRESET;
-	}
-
-	ptr = qub->buf + qub->len;
-	len = sizeof(qub->buf) - qub->len;
-	ret = recv(w->ctx->quota_cl_fd, ptr, len, MSG_DONTWAIT);
-	if (ret < 0) {
-		ret = -errno;
-		if (ret == -EAGAIN || ret == -EINTR)
-			return 0;
-
-		pr_error("Failed to receive data from quota UNIX socket client: %s", strerror(-ret));
-		close_quota_unix_sock(w);
-		return ret;
-	}
-
-	if (ret == 0) {
-		close_quota_unix_sock(w);
-		return -ECONNRESET;
-	}
-
-	qub->len += (size_t)ret;
-	switch (qub->pkt.type) {
-	case QUOTA_PKT_ADD:
-	case QUOTA_PKT_SUB:
-	case QUOTA_PKT_SET:
-		expected_len = 1 + 8;
-		if (qub->len < expected_len)
-			return 0;
-		break;
-	case QUOTA_PKT_GET:
-		expected_len = 1;
-		break;
-	default:
-		pr_error("Invalid quota packet type: %hhu", qub->pkt.type);
-		close_quota_unix_sock(w);
-		return -EINVAL;
-	}
-
-	switch (qub->pkt.type) {
-	case QUOTA_PKT_ADD:
-		last_quota = atomic_fetch_add(&ctx->quota, (long long)qub->pkt.add);
-		last_quota += (long long)qub->pkt.add;
-		pr_info("Quota added by %lld, last quota: %lld", (long long)qub->pkt.add, last_quota);
-		break;
-	case QUOTA_PKT_SUB:
-		last_quota = atomic_fetch_sub(&ctx->quota, (long long)qub->pkt.sub);
-		last_quota -= (long long)qub->pkt.sub;
-		pr_info("Quota subtracted by %lld, last quota: %lld", (long long)qub->pkt.sub, last_quota);
-		break;
-	case QUOTA_PKT_SET:
-		atomic_store(&ctx->quota, (long long)qub->pkt.set);
-		last_quota = (long long)qub->pkt.set;
-		pr_info("Quota set to %lld", (long long)qub->pkt.set);
-		break;
-	case QUOTA_PKT_GET:
-		last_quota = atomic_load(&ctx->quota);
-		pr_info("Quota data requested, last quota: %lld", last_quota);
-		break;
-	}
-
-	qub->len = 0;
-
-	resp.type = QUOTA_PKT_RES;
-	resp.res = (uint64_t)last_quota;
-	ret = send(w->ctx->quota_cl_fd, &resp, sizeof(resp), MSG_DONTWAIT);
-	if (ret != sizeof(resp)) {
-		ret = -errno;
-		pr_error("Failed to send quota response to UNIX socket client: %s", strerror(-ret));
-		close_quota_unix_sock(w);
-		return ret;
-	}
-	return 0;
-}
-
 static int handle_event(struct server_wrk *w, struct epoll_event *ev,
 			bool *has_event_timer, bool *has_event_accept)
 {
@@ -4976,14 +4623,6 @@ static int handle_event(struct server_wrk *w, struct epoll_event *ev,
 	case EPL_EV_TO_SOCKS5_SERVER:
 		if (!w->handle_events_should_stop)
 			ret = handle_event_to_socks5_server(w, ev);
-		break;
-	case EPL_EV_QUOTA_UNIX_SOCK:
-		if (!w->handle_events_should_stop)
-			ret = handle_event_quota_unix_sock(w);
-		break;
-	case EPL_EV_QUOTA_UNIX_SOCK_CLIENT:
-		if (!w->handle_events_should_stop)
-			ret = handle_event_quota_unix_sock_client(w, ev);
 		break;
 	default:
 		pr_error("Unknown event type: %lu (thread %u)", evt, w->idx);

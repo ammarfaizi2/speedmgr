@@ -22,7 +22,7 @@ endif
 
 all: $(TARGET)
 
-$(TARGET): speedmgr.o ht.o
+$(TARGET): speedmgr.o ht.o quota.o
 	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
 
 %.o: %.c
