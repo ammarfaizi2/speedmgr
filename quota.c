@@ -374,6 +374,9 @@ eval_pkt:
 		return -EINVAL;
 	}
 
+	if (res.res.ba.after)
+		sq->exceeded = false;
+
 	res.res.enabled = sq->enabled;
 	res.res.exceeded = sq->exceeded;
 	res.type = QUOTA_PKT_RESP;

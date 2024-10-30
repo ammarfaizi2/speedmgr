@@ -26,8 +26,25 @@ int main(void)
 		qo_cl_close(qc);
 		return ret;
 	}
+	printf("a enabled: %d, exceeded: %d, before: %lld, after: %lld\n",
+		res.enabled, res.exceeded, res.ba.before, res.ba.after);
 
-	printf("enabled: %d, exceeded: %d, before: %lld, after: %lld\n",
+	ret = qo_cl_do_cmd(qc, QUOTA_PKT_CMD_ENABLE, 1024 * 1024, &res);
+	if (ret < 0) {
+		printf("qo_cl_do_cmd failed: %s\n", strerror(-ret));
+		qo_cl_close(qc);
+		return ret;
+	}
+	printf("b enabled: %d, exceeded: %d, before: %lld, after: %lld\n",
+		res.enabled, res.exceeded, res.ba.before, res.ba.after);
+
+	ret = qo_cl_do_cmd(qc, QUOTA_PKT_CMD_GET, 0, &res);
+	if (ret < 0) {
+		printf("qo_cl_do_cmd failed: %s\n", strerror(-ret));
+		qo_cl_close(qc);
+		return ret;
+	}
+	printf("c enabled: %d, exceeded: %d, before: %lld, after: %lld\n",
 		res.enabled, res.exceeded, res.ba.before, res.ba.after);
 
 	qo_cl_close(qc);
