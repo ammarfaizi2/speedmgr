@@ -8,3 +8,5 @@
 *.patch
 *.diff
 /speedmgr
+*.sock
+/qc

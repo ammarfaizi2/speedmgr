@@ -4,7 +4,10 @@
 #define _GNU_SOURCE
 #endif
 
+#ifndef DONT_USE_INTERNAL_SPEEDMGR_QUOTA
 #define USE_INTERNAL_SPEEDMGR_QUOTA
+#endif
+
 #include "quota.h"
 
 #include <stdlib.h>
@@ -15,7 +18,149 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/types.h>
+#include <sys/poll.h>
 
+#ifdef USE_CLIENT_SPEEDMGR_QUOTA
+int qo_cl_init(struct qo_cl **cl_p, const char *path, int timeout)
+{
+	struct sockaddr_un addr;
+	struct pollfd pfd;
+	struct qo_cl *cl;
+	int fd, err;
+
+	fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+	if (fd < 0)
+		return -errno;
+
+	cl = calloc(1, sizeof(*cl));
+	if (!cl) {
+		close(fd);
+		return -ENOMEM;
+	}
+
+	memset(&addr, 0, sizeof(addr));
+	addr.sun_family = AF_UNIX;
+	strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+	addr.sun_path[sizeof(addr.sun_path) - 1] = '\0';
+
+	err = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
+	if (err < 0) {
+		err = -errno;
+		if (err != -EINPROGRESS && err != -EAGAIN) {
+			close(fd);
+			free(cl);
+			return err;
+		}
+	}
+
+	pfd.fd = fd;
+	pfd.events = POLLOUT;
+	pfd.revents = 0;
+	err = poll(&pfd, 1, timeout);
+	if (err < 0) {
+		err = -errno;
+		close(fd);
+		free(cl);
+		return err;
+	}
+
+	if (!err) {
+		close(fd);
+		free(cl);
+		return -ETIMEDOUT;
+	}
+
+	if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+		close(fd);
+		free(cl);
+		return -ECONNRESET;
+	}
+
+	cl->fd = fd;
+	cl->timeout = timeout;
+	*cl_p = cl;
+	return 0;
+}
+
+void qo_cl_close(struct qo_cl *cl)
+{
+	if (cl) {
+		close(cl->fd);
+		free(cl);
+	}
+}
+
+int qo_cl_do_cmd(struct qo_cl *cl, uint8_t type, long long arg, struct quota_pkt_res *res)
+{
+	struct quota_pkt pkt;
+	struct pollfd pfd;
+	ssize_t ret;
+	size_t len;
+	int err;
+
+	len = qo_get_pkt_expected_size(type);
+	if (!len)
+		return -EINVAL;
+
+	pkt.type = type;
+	switch (type) {
+	case QUOTA_PKT_CMD_ENABLE:
+	case QUOTA_PKT_CMD_DISABLE:
+		break;
+	case QUOTA_PKT_CMD_SET:
+	case QUOTA_PKT_CMD_ADD:
+	case QUOTA_PKT_CMD_SUB:
+		pkt.set = arg;
+		break;
+	case QUOTA_PKT_CMD_GET:
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	ret = send(cl->fd, &pkt, len, MSG_DONTWAIT);
+	if ((size_t)ret != len) {
+		err = -errno;
+		if (err == -EINTR || err == -EAGAIN)
+			err = -ECONNRESET;
+
+		return err;
+	}
+
+	pfd.fd = cl->fd;
+	pfd.events = POLLIN;
+	pfd.revents = 0;
+	err = poll(&pfd, 1, cl->timeout);
+	if (err < 0) {
+		err = -errno;
+		return err;
+	}
+
+	if (!err)
+		return -ETIMEDOUT;
+
+	if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
+		return -ECONNRESET;
+
+	len = qo_get_pkt_expected_size(QUOTA_PKT_RESP);
+	ret = recv(cl->fd, &pkt, len, MSG_DONTWAIT);
+	if ((size_t)ret != len) {
+		err = -errno;
+		if (err == -EINTR || err == -EAGAIN)
+			err = -ECONNRESET;
+
+		return err;
+	}
+
+	if (pkt.type != QUOTA_PKT_RESP)
+		return -EINVAL;
+
+	memcpy(res, &pkt.res, sizeof(*res));
+	return 0;
+}
+#endif /* #ifdef USE_CLIENT_SPEEDMGR_QUOTA */
+
+#ifdef USE_INTERNAL_SPEEDMGR_QUOTA
 static int create_unix_sock_server(const char *path)
 {
 	struct sockaddr_un addr;
@@ -28,6 +173,7 @@ static int create_unix_sock_server(const char *path)
 	memset(&addr, 0, sizeof(addr));
 	addr.sun_family = AF_UNIX;
 	strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+	addr.sun_path[sizeof(addr.sun_path) - 1] = '\0';
 
 	unlink(path);
 	err = bind(fd, (struct sockaddr *)&addr, sizeof(addr));
@@ -197,37 +343,39 @@ eval_pkt:
 	switch (c->pkt.type) {
 	case QUOTA_PKT_CMD_ENABLE:
 		sq->enabled = true;
-		res.resp.before = atomic_load(&sq->quota);
-		res.resp.after = res.resp.before;
+		res.res.ba.before = atomic_load(&sq->quota);
+		res.res.ba.after = res.res.ba.before;
 		break;
 	case QUOTA_PKT_CMD_DISABLE:
 		sq->enabled = false;
+		res.res.ba.before = atomic_load(&sq->quota);
+		res.res.ba.after = res.res.ba.before;
 		break;
 	case QUOTA_PKT_CMD_SET:
 		qf = atomic_exchange(&sq->quota, c->pkt.get);
-		res.resp.before = qf;
-		res.resp.after = c->pkt.get;
+		res.res.ba.before = qf;
+		res.res.ba.after = c->pkt.get;
 		break;
 	case QUOTA_PKT_CMD_ADD:
 		qf = atomic_fetch_add(&sq->quota, c->pkt.get);
-		res.resp.before = qf;
-		res.resp.after = qf + c->pkt.get;
+		res.res.ba.before = qf;
+		res.res.ba.after = qf + c->pkt.get;
 		break;
 	case QUOTA_PKT_CMD_SUB:
 		qf = atomic_fetch_sub(&sq->quota, c->pkt.get);
-		res.resp.before = qf;
-		res.resp.after = qf - c->pkt.get;
+		res.res.ba.before = qf;
+		res.res.ba.after = qf - c->pkt.get;
 		break;
 	case QUOTA_PKT_CMD_GET:
-		res.resp.before = atomic_load(&sq->quota);
-		res.resp.after = res.resp.before;
+		res.res.ba.before = atomic_load(&sq->quota);
+		res.res.ba.after = res.res.ba.before;
 		break;
 	default:
 		return -EINVAL;
 	}
 
-	res.exceeded = sq->exceeded;
-	res.enabled = sq->enabled;
+	res.res.enabled = sq->enabled;
+	res.res.exceeded = sq->exceeded;
 	res.type = QUOTA_PKT_RESP;
 	memset(res.__pad, 0, sizeof(res.__pad));
 	len = qo_get_pkt_expected_size(res.type);
@@ -258,3 +406,4 @@ void qo_quota_unix_client_close(struct spd_quota *sq, struct spd_quota_client *c
 	c->len = 0;
 	pthread_mutex_unlock(&sq->lock);
 }
+#endif /* #ifdef USE_INTERNAL_SPEEDMGR_QUOTA */

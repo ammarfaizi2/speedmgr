@@ -29,6 +29,12 @@ struct quota_pkt_ba {
 	long long	after;
 } __packed;
 
+struct quota_pkt_res {
+	struct quota_pkt_ba	ba;
+	bool			exceeded;
+	bool			enabled;
+} __packed;
+
 struct quota_pkt {
 	uint8_t		type;
 	uint8_t		__pad[7];
@@ -37,11 +43,7 @@ struct quota_pkt {
 		long long		sub;
 		long long		set;
 		long long		get;
-		struct {
-			struct quota_pkt_ba	resp;
-			bool			exceeded;
-			bool			enabled;
-		} __packed;
+		struct quota_pkt_res	res;
 	};
 } __packed;
 
@@ -50,7 +52,7 @@ static inline size_t qo_get_pkt_expected_size(uint8_t type)
 	switch (type) {
 	case QUOTA_PKT_CMD_ENABLE:
 	case QUOTA_PKT_CMD_DISABLE:
-		return 8 + sizeof(struct quota_pkt_ba);
+		return 1;
 	case QUOTA_PKT_CMD_SET:
 	case QUOTA_PKT_CMD_ADD:
 	case QUOTA_PKT_CMD_SUB:
@@ -58,11 +60,21 @@ static inline size_t qo_get_pkt_expected_size(uint8_t type)
 	case QUOTA_PKT_CMD_GET:
 		return 1;
 	case QUOTA_PKT_RESP:
-		return 8 + sizeof(struct quota_pkt_ba) + 2;
+		return 8 + sizeof(struct quota_pkt_res);
 	default:
 		return 0;
 	}
 }
+
+#ifdef USE_CLIENT_SPEEDMGR_QUOTA
+struct qo_cl {
+	int fd;
+	int timeout;
+};
+int qo_cl_init(struct qo_cl **cl_p, const char *path, int timeout);
+void qo_cl_close(struct qo_cl *cl);
+int qo_cl_do_cmd(struct qo_cl *cl, uint8_t type, long long arg, struct quota_pkt_res *res);
+#endif /* #ifdef USE_CLIENT_SPEEDMGR_QUOTA */
 
 #ifdef USE_INTERNAL_SPEEDMGR_QUOTA
 
