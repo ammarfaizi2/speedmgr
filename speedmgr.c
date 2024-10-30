@@ -114,6 +114,9 @@
 
 #include "ht.h"
 
+#define USE_INTERNAL_SPEEDMGR_QUOTA
+#include "quota.h"
+
 #ifndef SO_ORIGINAL_DST
 #define SO_ORIGINAL_DST 80
 #endif
@@ -318,14 +321,13 @@ struct server_cfg {
 	uint64_t		up_interval;
 	uint64_t		down_limit;
 	uint64_t		down_interval;
-	uint64_t		init_quota;
+	long long		init_quota_size;
 	struct sockaddr_in46	bind_addr;
 	struct sockaddr_in46	target_addr;
 	const char		*socks5_user;
 	const char		*socks5_pass;
 	const char		*socks5_target;
 	const char		*socks5_dst_cauth;
-	const char		*save_quota_path;
 	const char		*quota_unix_sock;
 };
 
@@ -442,12 +444,11 @@ static const struct option long_options[] = {
 	{ "as-socks5",		no_argument,		NULL,	'S' },
 	{ "to-socks5",		required_argument,	NULL,	'T' },
 	{ "socks5-dst-cauth",	required_argument,	NULL,	'C' },
-	{ "quota",		required_argument,	NULL,	'Q' },
-	{ "save-quota-path",	required_argument,	NULL,	'q' },
+	{ "init-quota-size",	required_argument,	NULL,	'Q' },
 	{ "quota-unix-sock",	required_argument,	NULL,	'z' },
 	{ NULL,			0,			NULL,	0 },
 };
-static const char short_options[] = "hVw:b:t:vB:U:I:D:d:o:ST:C:Q:q:z:";
+static const char short_options[] = "hVw:b:t:vB:U:I:D:d:o:ST:C:Q:z:";
 static const uint64_t spd_min_fill = 1024*8;
 
 static void show_help(const void *app)
@@ -469,8 +470,7 @@ static void show_help(const void *app)
 	printf("  -S, --as-socks5\t\tUse as a SOCKS5 proxy server\n");
 	printf("  -T, --to-socks5=ADDR\t\tForward all traffic to a SOCKS5 server, addr:port\n");
 	printf("  -C, --socks5-dst-cauth=ADDR\tSOCKS5 server destination address for client authentication\n");
-	printf("  -Q, --quota=NUM\t\tQuota (bytes)\n");
-	printf("  -q, --save-quota-path=PATH\tSave quota path\n");
+	printf("  -Q, --init-quota-size=NUM\tInitial quota size (quota is disabled if not specified)\n");
 	printf("  -z, --quota-unix-sock=PATH\tQuota unix socket path\n");
 }
 
